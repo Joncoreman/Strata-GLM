@@ -2047,6 +2047,23 @@ int main(int argc, char** argv) {
         }
         if (native_pack) skip.insert("token_embd.weight");
     }
+    if (stage_mode) {   // MULTINODE: a stage engine keeps only its own layers' weights in VRAM
+        std::ifstream idx(o.pack + "/index.txt");
+        std::string line;
+        size_t before = skip.size();
+        while (std::getline(idx, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            const std::string name = line.substr(0, line.find(' '));
+            if (name.rfind("blk.", 0) == 0) {
+                const long long l = std::atoll(name.c_str() + 4);
+                if (l < g_stage_lb || l >= g_stage_le) skip.insert(name);
+            } else {   // the head, embedding and output mixers (output.weight's row still gives n_vocab)
+                skip.insert(name);
+            }
+        }
+        std::fprintf(stderr, "strata stage: %zu more tensors left out (layers outside %lld-%lld, the head)\n",
+                     skip.size() - before, (long long) g_stage_lb, (long long) (g_stage_le - 1));
+    }
     uint64_t pool_bytes = 0;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -2078,7 +2095,8 @@ int main(int argc, char** argv) {
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
-        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
+        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key, stage_mode ? g_stage_lb : 0,
+                               stage_mode ? g_stage_le : -1)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
         }
@@ -2655,12 +2673,13 @@ int main(int argc, char** argv) {
     // fixed in llama.cpp: allocation sized by the whole model instead of the device's own work.
     {
         const strata::core::OnDevice on0(0);
-        const int64_t hi0 = multi_gpu ? split_at[0] : -1;
-        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
+        const int64_t hi0 = multi_gpu ? split_at[0] : stage_mode ? g_stage_le : -1;
+        const int64_t lo0 = stage_mode ? g_stage_lb : 0;   // MULTINODE: a stage carves only its own layers
+        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, lo0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
         }
-        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
+        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, lo0, hi0) == 0) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
@@ -2678,7 +2697,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: zeroing the session state failed\n");
             return 1;
         }
-        if (!o.ple_gguf.empty()) {
+        if (!o.ple_gguf.empty() && !(stage_mode && g_stage_lb > 1)) {   // a stage without layer 1 runs no PLE
             if (!ss.ple.ready()) {
                 std::fprintf(stderr, "strata generate: the PLE run is not ready after construction\n");
                 return 1;
@@ -2890,7 +2909,7 @@ int main(int argc, char** argv) {
     if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
     strata::core::NativeHead native_head;
-    if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
+    if (!o.native_head_gguf.empty() && !multi_gpu && !stage_mode) {   // a split's head is on its last stage
         if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -4770,6 +4789,8 @@ int main(int argc, char** argv) {
                             ms_win = 0;
                             if (!s.send(strata::core::StageMsg::Ok, nullptr, 0, nullptr, 0, err)) break;
                         }
+                    } else if (type == strata::core::StageMsg::Ping) {
+                        if (!s.send(strata::core::StageMsg::Ok, msg.data(), msg.size(), nullptr, 0, err)) break;
                     } else if (type == strata::core::StageMsg::Quit) {
                         break;
                     } else {

@@ -23,7 +23,8 @@
 
 namespace strata::core {
 
-enum class StageMsg : uint32_t { Hello = 1, Window = 2, Commit = 3, Reset = 4, Quit = 5, Ok = 100, Err = 101 };
+/// Ping = any bytes -> Ok (the same bytes): the link's own round trip, nothing computed (mn-test/ping.py)
+enum class StageMsg : uint32_t { Hello = 1, Window = 2, Commit = 3, Reset = 4, Quit = 5, Ping = 6, Ok = 100, Err = 101 };
 
 struct StageHello {
     int64_t lb = 0, le = 0, hf = 0, max_t = 0;

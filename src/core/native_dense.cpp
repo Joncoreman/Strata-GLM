@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <climits>
 #include <exception>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <set>
@@ -69,7 +70,7 @@ NativeDense::~NativeDense() {
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-                       bool include_ple_key) {
+                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi) {
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
@@ -139,6 +140,10 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             }
             for (const auto& tensor : gguf.tensors()) {
                 if (!eligible(tensor, include_ple_key)) continue;
+                if (layer_hi > 0) {   // MULTINODE: a stage engine uploads only its own layers
+                    const long long l = std::atoll(tensor.name.c_str() + 4);   // "blk.<L>."
+                    if (l < layer_lo || l >= layer_hi) continue;
+                }
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name; return false;
                 }
