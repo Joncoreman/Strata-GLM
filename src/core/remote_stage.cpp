@@ -4,8 +4,10 @@
 #include <chrono>
 #include <cstdio>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
+#include <thread>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -113,7 +115,16 @@ bool StageSocket::connect(const std::string& host_port, std::string& err) {
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     addrinfo* res = nullptr;
-    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || res == nullptr) {
+    // a LAN name can fail to resolve for a while (right after the network adapter restarts): try again for ~20 s,
+    // and the mDNS spelling (HOST.local) as well
+    for (int attempt = 0; attempt < 20 && res == nullptr; ++attempt) {
+        if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0) res = nullptr;
+        if (res == nullptr && host.find('.') == std::string::npos &&
+            getaddrinfo((host + ".local").c_str(), port.c_str(), &hints, &res) != 0)
+            res = nullptr;
+        if (res == nullptr) std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    if (res == nullptr) {
         err = "stage link: cannot resolve " + host_port;
         return false;
     }
@@ -161,6 +172,18 @@ bool StageSocket::recv(StageMsg& type, std::vector<uint8_t>& payload, std::strin
     uint8_t hdr[16];
     const sock_t s = (sock_t) fd_;
     const auto t0 = std::chrono::steady_clock::now();
+    // STRATA_MN_SPIN=1: poll for the reply instead of sleeping in recv() (a sleeping thread wakes late on some PCs)
+    static const bool spin = [] { const char* e = std::getenv("STRATA_MN_SPIN"); return e != nullptr && e[0] == '1'; }();
+    if (spin) {
+        for (;;) {
+            fd_set rd;
+            FD_ZERO(&rd);
+            FD_SET(s, &rd);
+            timeval tv{0, 0};
+            const int r = ::select((int) s + 1, &rd, nullptr, nullptr, &tv);
+            if (r != 0) break;   // readable, or an error recv() reports below
+        }
+    }
     if (!recv_all(s, hdr, sizeof hdr)) {
         err = "stage link: the other end closed the connection";
         close();
