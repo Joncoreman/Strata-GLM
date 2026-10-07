@@ -283,26 +283,31 @@ bool StageLink::connect(const std::string& host_port, const StageHello& want, st
 bool StageLink::window(int T, int64_t pos0, const int32_t* tokens, const float* hand_in, float* hand_out,
                        std::string& err) {
     const auto t0 = std::chrono::steady_clock::now();
-    std::vector<uint8_t> head(sizeof(int32_t) + sizeof(int64_t) + sizeof(int32_t) * (size_t) T);
+    std::vector<uint8_t> head(16 + sizeof(int32_t) * (size_t) T);
     std::memcpy(head.data(), &T, 4);
     std::memcpy(head.data() + 4, &pos0, 8);
-    std::memcpy(head.data() + 12, tokens, sizeof(int32_t) * (size_t) T);
+    std::memcpy(head.data() + 12, &pending_commit_, 4);   // the previous window's commit, applied first
+    std::memcpy(head.data() + 16, tokens, sizeof(int32_t) * (size_t) T);
     const size_t hb = sizeof(float) * (size_t) T * (size_t) h_.hf;
     std::vector<uint8_t> r;
     if (!call(StageMsg::Window, head.data(), head.size(), hand_in, hb, r, err)) return false;
     if (r.size() != hb) { err = "stage link: a Window reply of the wrong size"; return false; }
     std::memcpy(hand_out, r.data(), hb);
+    pending_commit_ = 0;
     ms_net += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     ++windows;
     return true;
 }
 
 bool StageLink::commit(int n_keep, std::string& err) {
-    std::vector<uint8_t> r;
-    return call(StageMsg::Commit, &n_keep, sizeof n_keep, nullptr, 0, r, err);
+    (void) err;
+    pending_commit_ = n_keep;   // sent with the next Window: nothing reads the stage's state before that
+    ++commits;
+    return true;
 }
 
 bool StageLink::reset(std::string& err) {
+    pending_commit_ = 0;   // the session starts empty: a pending commit no longer applies
     std::vector<uint8_t> r;
     return call(StageMsg::Reset, nullptr, 0, nullptr, 0, r, err);
 }

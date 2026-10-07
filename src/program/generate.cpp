@@ -856,7 +856,9 @@ void mem_mark(const char* where) {
     if (!on) return;
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
-    std::fprintf(stderr, "strata trace: %lld MiB free after %s\n", (long long) (free_b >> 20), where);
+    const MemSample m = mem_sample();   // multinode: the host side too (the stage PC keeps its RAM for nothing big)
+    std::fprintf(stderr, "strata trace: %lld MiB free after %s (host: rss %llu MiB, commit %llu MiB)\n",
+                 (long long) (free_b >> 20), where, m.rss_mib, m.commit_mib);
 }
 
 /// #463's A/B: STRATA_ADAPT_NOWAIT=1 lets a verify window start before the adaptive tier's copies have landed (0.1.37)
@@ -4719,19 +4721,22 @@ int main(int argc, char** argv) {
                         if (msg.size() != sizeof h) fail = "a malformed Hello";
                         if (fail.empty() && !s.send(strata::core::StageMsg::Ok, &mine, sizeof mine, nullptr, 0, err)) break;
                     } else if (type == strata::core::StageMsg::Window) {
-                        int32_t T = 0;
+                        int32_t T = 0, commit_first = 0;
                         int64_t pos0 = 0;
-                        if (msg.size() >= 12) {
+                        if (msg.size() >= 16) {
                             std::memcpy(&T, msg.data(), 4);
                             std::memcpy(&pos0, msg.data() + 4, 8);
+                            std::memcpy(&commit_first, msg.data() + 12, 4);
                         }
                         const size_t hbytes = sizeof(float) * (size_t) T * (size_t) hf;
-                        if (T < 1 || T > o.spec || msg.size() != 12 + 4 * (size_t) T + hbytes) {
+                        if (T < 1 || T > o.spec || msg.size() != 16 + 4 * (size_t) T + hbytes) {
                             fail = "a malformed Window";
+                        } else if (commit_first > 0 && !ver.commit(commit_first, err)) {
+                            fail = err;   // the previous window's commit (same stream: the window below follows it)
                         } else {
                             const auto t0 = Clock::now();
-                            const int32_t* toks = (const int32_t*) (msg.data() + 12);
-                            std::memcpy(stage_in_host, msg.data() + 12 + 4 * (size_t) T, hbytes);
+                            const int32_t* toks = (const int32_t*) (msg.data() + 16);
+                            std::memcpy(stage_in_host, msg.data() + 16 + 4 * (size_t) T, hbytes);
                             std::atomic_thread_fence(std::memory_order_seq_cst);
                             drive.d.layers = 0;
                             drive.d.experts = 0;
@@ -5559,6 +5564,16 @@ int main(int argc, char** argv) {
             if (resume == 0) {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
+                if (remote_head && !remote_local && stage_link.windows > 0) {   // MULTINODE: the last request's link time
+                    std::fprintf(stderr, "strata serve: multinode link: %lld windows %.2f ms each (stage compute "
+                                         "included), %lld commits %.2f ms each, %.1f MB out / %.1f MB in\n",
+                                 (long long) stage_link.windows, stage_link.ms_net / (double) stage_link.windows,
+                                 (long long) stage_link.commits,
+                                 stage_link.commits ? stage_link.ms_commit / (double) stage_link.commits : 0.0,
+                                 stage_link.socket().bytes_out / 1e6, stage_link.socket().bytes_in / 1e6);
+                    stage_link.windows = stage_link.commits = 0;
+                    stage_link.ms_net = stage_link.ms_commit = 0;
+                }
                 if (remote_head && !remote_local && !stage_link.reset(err)) {   // MULTINODE: the stage's layers start empty too
                     std::printf("ERR the remote stage: %s\n", err.c_str());
                     std::fflush(stdout);

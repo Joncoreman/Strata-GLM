@@ -7,7 +7,9 @@
 //
 //   frame   = magic u32 | type u32 | payload bytes u64 | payload
 //   Hello   = lb i64 | le i64 | handoff floats per token i64 | max T i64      -> Ok (the stage's own four) / Err
-//   Window  = T i32 | pos0 i64 | tokens i32[T] | hand-off f32[T * hf]       -> Ok (hand-off f32[T * hf]) / Err
+//   Window  = T i32 | pos0 i64 | commit first i32 (0: none) | tokens i32[T] | hand-off f32[T * hf]
+//                                                                         -> Ok (hand-off f32[T * hf]) / Err
+//   (the head's commit of the previous window rides in the next Window: one round trip per window)
 //   Commit  = n_keep i32                                                      -> Ok / Err
 //   Reset   = (empty): the stage zeroes its session (a request read from token 0) -> Ok / Err
 //   Quit    = (empty): the stage closes the connection, no reply
@@ -81,6 +83,8 @@ public:
 
     double ms_net = 0;     ///< wall time of the Window calls (the stage's compute included)
     int64_t windows = 0;
+    double ms_commit = 0;  ///< wall time of the Commit calls (one round trip each)
+    int64_t commits = 0;
     const StageSocket& socket() const { return s_; }
 
 private:
@@ -88,6 +92,7 @@ private:
               std::string& err);
     StageSocket s_;
     StageHello h_;
+    int32_t pending_commit_ = 0;   ///< commit() keeps it for the next Window (reset drops it)
 };
 
 }  // namespace strata::core
