@@ -1,5 +1,6 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/verify.hpp"
+#include "strata/core/remote_stage.hpp"
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -1022,6 +1023,14 @@ bool Verifier::capture_commit(std::string& err) {
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
     using namespace strata::kernels;
+    if (remote_ != nullptr) {   // MULTINODE: the stage runs in another engine; its hand-off comes back over the link
+        if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+        if (!remote_->window(T, pos0, tokens, rin_, rout_, err)) return false;
+        last_t_ = T;
+        last_pos0_ = pos0;
+        ++windows;
+        return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
+    }
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
@@ -1324,6 +1333,11 @@ namespace { bool g_commit_async = false; }
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
 
 bool Verifier::commit(int n_keep, std::string& err) {
+    if (remote_ != nullptr) {   // MULTINODE: the stage commits its own layers' state
+        if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
+        if (!remote_->commit(n_keep, err)) return false;
+        return next_ == nullptr || next_->commit(n_keep, err);
+    }
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     const Clock::time_point t0 = Clock::now();

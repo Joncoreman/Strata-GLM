@@ -38,6 +38,7 @@
 namespace strata::core {
 
 class NativeHead;
+class StageLink;
 
 /// The CPU pool for a window: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd), hit rows zeroed.
 using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
@@ -116,6 +117,13 @@ public:
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
+    /// MULTINODE: this verifier is a proxy for a stage in another engine (remote_stage.hpp).  `run` sends the
+    /// window and `hand_in_host` over `link` and writes the stage's reply to `hand_out_host`, then continues into
+    /// the next stage; `commit` forwards too.  Set after `set_stage` and INSTEAD of `init` (no GPU work here).  The
+    /// two pointers are the host side of the mapped hand-off buffers `set_stage` got.
+    void set_remote(StageLink* link, const ModelGeometry* g, const float* hand_in_host, float* hand_out_host, int max_t) {
+        remote_ = link; g_ = g; rin_ = hand_in_host; rout_ = hand_out_host; max_t_ = max_t;
+    }
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
@@ -181,6 +189,9 @@ private:
     float* hand_out_ = nullptr;
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
+    StageLink* remote_ = nullptr;        ///< set_remote: a proxy for a stage in another engine
+    const float* rin_ = nullptr;
+    float* rout_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
