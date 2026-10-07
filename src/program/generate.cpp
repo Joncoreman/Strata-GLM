@@ -4145,7 +4145,7 @@ int main(int argc, char** argv) {
         }
     }
     if (o.serve) {
-        if (o.spec < 2 || o.mtp.empty() || o.prefill_chunk <= 0 ||
+        if (o.spec < 2 || (o.mtp.empty() && !stage_mode) || o.prefill_chunk <= 0 ||   // a stage has no drafter
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
             std::fprintf(stderr, "strata serve: needs --spec T, --mtp DIR and --prefill CHUNK (and a fillable "
                                  "--expert-cache; the graphed hit path additionally needs --expert-profile P)\n");
@@ -4527,6 +4527,9 @@ int main(int argc, char** argv) {
         // MULTINODE --remote-stage: stage 1 is a proxy for the stage engine, stage 2 is `ver_same` on CUDA0
         strata::core::Verifier ver_remote;
         strata::core::StageLink stage_link;
+        // --remote-stage local: the middle stage in THIS engine on CUDA0 (sharing everything) - the A/B that tells the
+        // three-stage chain apart from the stage engine
+        const bool remote_local = o.remote_stage == "local";
         SplitDrive split_drive;
         auto stage_ver = [&](int st) -> strata::core::Verifier& {
             if (remote_head && st > 0) return st == 1 ? ver_remote : ver_same;
@@ -4549,7 +4552,10 @@ int main(int argc, char** argv) {
                 std::memset(hh, 0, hb);
                 hand_host[i] = hh;
             }
-            if (remote_head) {
+            if (remote_head && remote_local) {
+                if (split_at[1] >= g.n_layers) return 2;
+                std::fprintf(stderr, "strata serve: multinode: --remote-stage local (the middle stage in this engine)\n");
+            } else if (remote_head) {
                 if (split_at[1] >= g.n_layers) {
                     std::fprintf(stderr, "strata serve: --remote-stage: K2 must be below %lld\n", (long long) g.n_layers);
                     return 2;
@@ -4578,7 +4584,9 @@ int main(int argc, char** argv) {
             }
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
-                if (remote_head && st == 1) {
+                if (remote_head && st == 1 && remote_local) {
+                    ok_s = ver_remote.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err);
+                } else if (remote_head && st == 1) {
                     ver_remote.set_remote(&stage_link, &g, hand_host[0], hand_host[1], o.spec);
                     ok_s = true;
                 } else if (split_same) {
@@ -4634,7 +4642,8 @@ int main(int argc, char** argv) {
             ver.set_stage(g_stage_lb, g_stage_le, dev_in, dev_out);
         }
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err) ||
-            !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err)) {
+            (!(stage_mode && o.mtp.empty()) &&
+             !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
@@ -4658,6 +4667,10 @@ int main(int argc, char** argv) {
         if (stage_mode) {
             // ---- MULTINODE: the stage engine.  Every expert of [K1, K2) must sit in the VRAM cache: this engine never
             // computes an expert on the CPU (the user's rule for the stage PC: VRAM only, no RAM for experts).
+            // The pool publishes each layer's GPU plan (its VRAM hits) into the verifier's sink - the serve loop below
+            // wires it the same way; without it every layer's plan is empty and the resident experts are skipped.
+            drive.d.plan = ver.plan_sink();
+            drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
             int64_t missing = 0;
             for (int64_t l = g_stage_lb; l < g_stage_le; ++l)
                 for (int64_t e = 0; e < g.n_expert; ++e) missing += xcache.slot_of(l, e) < 0;
@@ -5546,7 +5559,7 @@ int main(int argc, char** argv) {
             if (resume == 0) {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
-                if (remote_head && !stage_link.reset(err)) {   // MULTINODE: the stage's layers start empty too
+                if (remote_head && !remote_local && !stage_link.reset(err)) {   // MULTINODE: the stage's layers start empty too
                     std::printf("ERR the remote stage: %s\n", err.c_str());
                     std::fflush(stdout);
                     return 1;
