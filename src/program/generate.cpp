@@ -1397,6 +1397,10 @@ int main(int argc, char** argv) {
         o.conversation_cache_mib = 0;
         o.short_read = INT64_MAX / 4;
         o.adapt_swaps = 0;
+        if (stage_mode) {   // every expert of a stage is on its GPU: the CPU pool has nothing to do, so keep it small
+            if (o.pool_workers <= 0) o.pool_workers = 1;   // and asleep (its spinning only heats the stage PC's CPU)
+            if (std::getenv("STRATA_POOL_SPIN_US") == nullptr) _putenv("STRATA_POOL_SPIN_US=0");
+        }
         std::fprintf(stderr, "strata serve: multinode %s: prompts read through the verify windows, no prompt cache, "
                              "no adaptive swaps\n", remote_head ? "head" : "stage");
     }

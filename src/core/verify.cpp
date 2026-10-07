@@ -1025,6 +1025,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     using namespace strata::kernels;
     if (remote_ != nullptr) {   // MULTINODE: the stage runs in another engine; its hand-off comes back over the link
         if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+        // STRATA_MN_GAP_MS=N (a test knob): wait N ms before each window, to see what an idle gap does to the stage
+        static const int gap_ms = [] { const char* e = std::getenv("STRATA_MN_GAP_MS"); return e ? std::atoi(e) : 0; }();
+        if (gap_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(gap_ms));
         if (!remote_->window(T, pos0, tokens, rin_, rout_, err)) return false;
         last_t_ = T;
         last_pos0_ = pos0;
