@@ -45,6 +45,7 @@ public:
     bool recv(StageMsg& type, std::vector<uint8_t>& payload, std::string& err);
 
     uint64_t bytes_out = 0, bytes_in = 0;
+    double ms_send = 0, ms_wait = 0, ms_recv = 0;   ///< time in send(), before the reply's first byte, reading it
 
 private:
     friend class StageListener;

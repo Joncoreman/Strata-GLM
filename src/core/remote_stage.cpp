@@ -145,12 +145,14 @@ bool StageSocket::send(StageMsg type, const void* a, size_t an, const void* b, s
     std::memcpy(hdr + 4, &t, 4);
     std::memcpy(hdr + 8, &n, 8);
     const sock_t s = (sock_t) fd_;
+    const auto t0 = std::chrono::steady_clock::now();
     if (!send_all(s, hdr, sizeof hdr) || (an && !send_all(s, a, an)) || (bn && !send_all(s, b, bn))) {
         err = net_error("stage link: send failed");
         close();
         return false;
     }
     bytes_out += sizeof hdr + n;
+    ms_send += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return true;
 }
 
@@ -158,6 +160,7 @@ bool StageSocket::recv(StageMsg& type, std::vector<uint8_t>& payload, std::strin
     if (!open()) { err = "stage link: not connected"; return false; }
     uint8_t hdr[16];
     const sock_t s = (sock_t) fd_;
+    const auto t0 = std::chrono::steady_clock::now();
     if (!recv_all(s, hdr, sizeof hdr)) {
         err = "stage link: the other end closed the connection";
         close();
@@ -174,12 +177,15 @@ bool StageSocket::recv(StageMsg& type, std::vector<uint8_t>& payload, std::strin
         return false;
     }
     payload.resize((size_t) n);
+    const auto t1 = std::chrono::steady_clock::now();
+    ms_wait += std::chrono::duration<double, std::milli>(t1 - t0).count();
     if (n && !recv_all(s, payload.data(), (size_t) n)) {
         err = "stage link: the connection broke inside a frame";
         close();
         return false;
     }
     bytes_in += sizeof hdr + n;
+    ms_recv += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
     type = (StageMsg) t;
     return true;
 }

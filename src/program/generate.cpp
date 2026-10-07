@@ -4761,8 +4761,11 @@ int main(int argc, char** argv) {
                             strata::core::session_zero(ss, g, nullptr, main_cs);
                             cudaStreamSynchronize(main_stream);
                             if (n_win > 0)
-                                std::fprintf(stderr, "strata stage: %lld windows, %.2f ms each on this GPU\n",
-                                             (long long) n_win, ms_win / (double) n_win);
+                                std::fprintf(stderr, "strata stage: %lld windows, %.2f ms each on this GPU; per window: "
+                                             "waiting for the next %.2f ms, reading it %.2f ms, sending %.2f ms\n",
+                                             (long long) n_win, ms_win / (double) n_win, s.ms_wait / (double) n_win,
+                                             s.ms_recv / (double) n_win, s.ms_send / (double) n_win);
+                            s.ms_wait = s.ms_recv = s.ms_send = 0;
                             n_win = 0;
                             ms_win = 0;
                             if (!s.send(strata::core::StageMsg::Ok, nullptr, 0, nullptr, 0, err)) break;
@@ -5571,6 +5574,14 @@ int main(int argc, char** argv) {
                                  (long long) stage_link.commits,
                                  stage_link.commits ? stage_link.ms_commit / (double) stage_link.commits : 0.0,
                                  stage_link.socket().bytes_out / 1e6, stage_link.socket().bytes_in / 1e6);
+                    std::fprintf(stderr, "strata serve: multinode link per window: send %.2f ms, waiting for the "
+                                         "reply %.2f ms, reading it %.2f ms\n",
+                                 stage_link.socket().ms_send / (double) stage_link.windows,
+                                 stage_link.socket().ms_wait / (double) stage_link.windows,
+                                 stage_link.socket().ms_recv / (double) stage_link.windows);
+                    const_cast<strata::core::StageSocket&>(stage_link.socket()).ms_send = 0;
+                    const_cast<strata::core::StageSocket&>(stage_link.socket()).ms_wait = 0;
+                    const_cast<strata::core::StageSocket&>(stage_link.socket()).ms_recv = 0;
                     stage_link.windows = stage_link.commits = 0;
                     stage_link.ms_net = stage_link.ms_commit = 0;
                 }
