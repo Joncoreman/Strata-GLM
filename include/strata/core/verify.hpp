@@ -116,7 +116,11 @@ public:
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
     /// floats per token in a hand-off buffer
-    static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
+    /// (glm5-next: R | the last FFN's output | its post (hc) and comb (hc x hc) - the next stage folds them in, as
+    /// one engine's next layer does, so a split is bit for bit the whole trunk)
+    static int64_t handoff_floats(const ModelGeometry& g) {
+        return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc + (g.is_glm5_next() ? (int64_t) g.hc * g.hc : 0);
+    }
     /// MULTINODE: this verifier is a proxy for a stage in another engine (remote_stage.hpp).  `run` sends the
     /// window and `hand_in_host` over `link` and writes the stage's reply to `hand_out_host`, then continues into
     /// the next stage; `commit` forwards too.  Set after `set_stage` and INSTEAD of `init` (no GPU work here).  The

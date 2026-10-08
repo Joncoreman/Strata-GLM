@@ -1462,7 +1462,9 @@ int main(int argc, char** argv) {
         o.prompt_cache = 0;
         o.conversation_cache_mib = 0;
         o.short_read = INT64_MAX / 4;
-        o.adapt_swaps = 0;
+        // STRATA_MN_ADAPT=1 (2026-10-08, glm5-next): the head keeps the adaptive tier over its own layers (measured:
+        // without it one PC drops 12.8 -> 9.7 tok/s; the stage's layers are never routed here, so never swapped)
+        if (std::getenv("STRATA_MN_ADAPT") == nullptr) o.adapt_swaps = 0;
         if (stage_mode) {   // every expert of a stage is on its GPU: the CPU pool has nothing to do, so keep it small
             if (o.pool_workers <= 0) o.pool_workers = 1;   // and asleep (its spinning only heats the stage PC's CPU)
             if (std::getenv("STRATA_POOL_SPIN_US") == nullptr) _putenv("STRATA_POOL_SPIN_US=0");
@@ -1564,7 +1566,9 @@ int main(int argc, char** argv) {
         o.resident_cpu_experts = o.resident_pin = o.resident_soft = false;
         o.resident_headroom = 8ull << 30;
     }
-    if (o.resident_cpu_experts && (!o.layer_split.empty() || remote_caches)) {
+    // MULTINODE head (2026-10-08, glm5-next): its local stages share CUDA0's one cache and one RAM tier, so the RAM
+    // tier holds the head's layers (the profile is cut to them below) - the split the check is about is across GPUs
+    if (o.resident_cpu_experts && ((!o.layer_split.empty() && !remote_head) || remote_caches)) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
         return 2;
     }
@@ -2600,6 +2604,18 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: profile %s: %zu ranked pairs, built for %lld slots\n",
                      o.expert_profile.c_str(), profile.size(), (long long) pslots);
+        // MULTINODE glm5-next (2026-10-08): each engine's VRAM cache and RAM tier hold only the layers it runs - the
+        // stage [K1, K2), the head the rest (its remote range is the stage engines')
+        if (glm5_model && (stage_mode || (remote_head && !split_at.empty()))) {
+            const int64_t lo = stage_mode ? g_stage_lb : split_at.front(), hi = stage_mode ? g_stage_le : split_at.back();
+            std::vector<std::pair<int32_t, int32_t>> mine;
+            for (const auto& pr : profile)
+                if ((pr.first >= lo && pr.first < hi) == stage_mode) mine.push_back(pr);
+            std::fprintf(stderr, "strata generate: multinode: the profile cut to this engine's layers (%s %lld-%lld): "
+                                 "%zu of %zu pairs\n", stage_mode ? "only" : "all but", (long long) lo, (long long) (hi - 1),
+                         mine.size(), profile.size());
+            profile.swap(mine);
+        }
     }
     // #477: the whole ranking as loaded, the prior of --expert-profile-save's order (a layer split keeps only
     // CUDA0's pairs in `profile` below).  Empty without --expert-profile-save.
@@ -6844,10 +6860,102 @@ int main(int argc, char** argv) {
         vh.blob = thits.blob;
         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
         vh.n_slots = xcache.slots();
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+        // ---- MULTINODE glm5-next (2026-10-08).  The head (--remote-stage A[,B..] --layer-split K1,..,Kn+1) runs
+        // [0, K1) in `ver` and [Kn+1, end) with the head in `ver_tail`, both on CUDA0 with its one cache and RAM tier;
+        // a proxy per stage engine between them.  A stage engine (--stage-listen --stage-layers K1,K2) runs [K1, K2)
+        // in `ver` from the hand-off the head sends (the streams R) and sends back its own.  Its CPU pool computes the
+        // experts its VRAM does not hold, from its RAM tier (the Qwen stage's VRAM-only rule is not this path's).
+        strata::core::Verifier ver_tail;
+        std::vector<std::unique_ptr<strata::core::Verifier>> gl_remotes;
+        std::vector<std::unique_ptr<strata::core::StageLink>> gl_links;
+        std::vector<strata::core::Verifier*> gl_chain;   // the head's stages in order
+        SplitDrive gl_split;
+        float* gl_stage_in = nullptr;    // the stage engine's hand-offs (host side, mapped)
+        float* gl_stage_out = nullptr;
+        if (glm5_model && (remote_head || stage_mode)) {
+            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+                              (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+            auto mapped = [&](float*& host, float*& dev) -> bool {
+                if (cudaHostAlloc((void**) &host, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                    cudaHostGetDevicePointer((void**) &dev, host, 0) != cudaSuccess) return false;
+                std::memset(host, 0, hb);
+                return true;
+            };
+            if (stage_mode) {
+                float* din = nullptr;
+                float* dout = nullptr;
+                if (g_stage_le >= g.n_layers || !mapped(gl_stage_in, din) || !mapped(gl_stage_out, dout)) {
+                    std::fprintf(stderr, "strata stage: K2 must be below %lld, and the hand-offs must allocate\n",
+                                 (long long) g.n_layers);
+                    return 1;
+                }
+                ver.set_stage(g_stage_lb, g_stage_le, din, dout);
+            } else {
+                std::vector<std::string> addrs;
+                for (size_t a = 0; a <= o.remote_stage.size();) {
+                    const size_t b = std::min(o.remote_stage.find(',', a), o.remote_stage.size());
+                    addrs.push_back(o.remote_stage.substr(a, b - a));
+                    a = b + 1;
+                }
+                const size_t nr = addrs.size();
+                if (split_at.size() != nr + 1 || split_at.back() >= g.n_layers) {
+                    std::fprintf(stderr, "strata serve: --remote-stage: %zu stage engines need --layer-split with %zu "
+                                         "rising K below %lld\n", nr, nr + 1, (long long) g.n_layers);
+                    return 2;
+                }
+                std::vector<float*> hh(nr + 1, nullptr), hd(nr + 1, nullptr);
+                for (size_t i = 0; i <= nr; ++i)
+                    if (!mapped(hh[i], hd[i])) { std::fprintf(stderr, "strata serve: the hand-off allocation failed\n"); return 1; }
+                ver.set_stage(0, split_at[0], nullptr, hd[0]);
+                gl_chain.push_back(&ver);
+                for (size_t r = 0; r < nr; ++r) {
+                    gl_links.push_back(std::make_unique<strata::core::StageLink>());
+                    gl_remotes.push_back(std::make_unique<strata::core::Verifier>());
+                    strata::core::StageHello want;
+                    want.lb = split_at[r];
+                    want.le = split_at[r + 1];
+                    want.hf = strata::core::Verifier::handoff_floats(g);
+                    want.max_t = o.spec;
+                    if (!gl_links.back()->connect(addrs[r], want, err)) {
+                        std::fprintf(stderr, "strata serve: --remote-stage %s: %s\n", addrs[r].c_str(), err.c_str());
+                        return 1;
+                    }
+                    gl_remotes.back()->set_remote(gl_links.back().get(), &g, hh[r], hh[r + 1], o.spec);
+                    gl_chain.push_back(gl_remotes.back().get());
+                    std::fprintf(stderr, "strata serve: multinode: the stage engine at %s runs layers %lld-%lld\n",
+                                 addrs[r].c_str(), (long long) want.lb, (long long) (want.le - 1));
+                }
+                ver_tail.set_stage(split_at.back(), -1, hd[nr], nullptr);
+                gl_chain.push_back(&ver_tail);
+            }
+        }
+        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err) ||
+            (!gl_chain.empty() &&
+             !ver_tail.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err))) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        if (!gl_chain.empty()) {
+            const int ns = (int) gl_chain.size();
+            gl_split.base = &drive;
+            gl_split.n = ns;
+            for (int st = 0; st < ns; ++st) {
+                gl_split.end[st] = st + 1 < ns ? split_at[(size_t) st] : g.n_layers;
+                gl_split.plan[st] = gl_chain[(size_t) st]->plan_sink();
+                gl_split.cache_base[st] = drive.d.cache_base;
+                gl_split.cache_slot_off[st] = drive.d.cache_slot_off;
+                gl_split.pcie_num[st] = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+                if (st + 1 < ns) gl_chain[(size_t) st]->set_next(gl_chain[(size_t) st + 1], &gl_split);
+            }
+            ver_tail.set_split(o.spec_split);
+            ver_tail.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+            std::fprintf(stderr, "strata serve: multinode: layers 0-%lld and %lld-%lld here, one hand-off per stage and "
+                                 "window\n", (long long) (split_at.front() - 1), (long long) split_at.back(),
+                         (long long) (g.n_layers - 1));
+        }
+        // the pool the verify windows call (a split: the wrapper that gives each layer its stage's GPU plan)
+        const strata::core::PoolMultiFn gl_pool = gl_chain.empty() ? &drive_pool_multi : &drive_pool_split;
+        void* const gl_user = gl_chain.empty() ? (void*) &drive : (void*) &gl_split;
         const bool use_mtp = !o.mtp.empty();
         if (use_mtp && !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -6990,6 +7098,107 @@ int main(int argc, char** argv) {
         // it (prompt + what was generated), else the snapshot taken after the previous prompt when it starts with
         // that prompt (a chat client re-renders the assistant turn), else a zeroed sequence.  Greedy; one-token
         // windows (and the suffix lookup's) as in the one-shot loop.
+        if (glm5_model && stage_mode) {
+            // ---- MULTINODE glm5-next: the stage engine's loop (the Qwen stage's protocol: Hello, Window with the
+            // previous window's commit folded in, Commit, Reset, Ping, Quit)
+            const int64_t hf = strata::core::Verifier::handoff_floats(g);
+            strata::core::StageListener lis;
+            if (!lis.listen(o.stage_listen, o.stage_allow, err)) {
+                std::fprintf(stderr, "strata stage: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata stage: glm5-next layers %lld-%lld; listening on port %d (from %s)\n",
+                         (long long) g_stage_lb, (long long) (g_stage_le - 1), o.stage_listen, o.stage_allow.c_str());
+            std::fflush(stderr);
+            std::vector<int32_t> outw((size_t) strata::kernels::kVerifyMaxT);
+            std::vector<uint8_t> msg;
+            for (;;) {
+                strata::core::StageSocket s;
+                std::string peer;
+                if (!lis.accept(s, peer, err)) {
+                    std::fprintf(stderr, "strata stage: %s\n", err.c_str());
+                    return 1;
+                }
+                std::fprintf(stderr, "strata stage: a head connected from %s\n", peer.c_str());
+                if (!ver.glm5_state_zero(err)) { std::fprintf(stderr, "strata stage: %s\n", err.c_str()); return 1; }
+                int64_t n_win = 0;
+                double ms_win = 0;
+                for (;;) {
+                    strata::core::StageMsg type;
+                    if (!s.recv(type, msg, err)) break;
+                    std::string fail;
+                    if (type == strata::core::StageMsg::Hello) {
+                        strata::core::StageHello h, mine;
+                        mine.lb = g_stage_lb;
+                        mine.le = g_stage_le;
+                        mine.hf = hf;
+                        mine.max_t = o.spec;
+                        if (msg.size() != sizeof h) fail = "a malformed Hello";
+                        if (fail.empty() && !s.send(strata::core::StageMsg::Ok, &mine, sizeof mine, nullptr, 0, err)) break;
+                    } else if (type == strata::core::StageMsg::Window) {
+                        int32_t T = 0, commit_first = 0;
+                        int64_t pos0 = 0;
+                        if (msg.size() >= 16) {
+                            std::memcpy(&T, msg.data(), 4);
+                            std::memcpy(&pos0, msg.data() + 4, 8);
+                            std::memcpy(&commit_first, msg.data() + 12, 4);
+                        }
+                        const size_t hbytes = sizeof(float) * (size_t) T * (size_t) hf;
+                        if (T < 1 || T > o.spec || msg.size() != 16 + 4 * (size_t) T + hbytes) {
+                            fail = "a malformed Window";
+                        } else if (commit_first > 0 && !ver.commit(commit_first, err)) {
+                            fail = err;
+                        } else {
+                            const auto t0 = Clock::now();
+                            const int32_t* toks = (const int32_t*) (msg.data() + 16);
+                            std::memcpy(gl_stage_in, msg.data() + 16 + 4 * (size_t) T, hbytes);
+                            std::atomic_thread_fence(std::memory_order_seq_cst);
+                            drive.d.layers = 0;
+                            drive.d.experts = 0;
+                            drive.d.failed = false;
+                            if (!ver.run(T, toks, pos0, &drive_pool_multi, &drive, outw.data(), err) || drive.d.failed) {
+                                fail = drive.d.failed && drive.d.fail ? std::string(drive.d.fail) : err;
+                            } else {
+                                ms_win += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                                ++n_win;
+                                if (!s.send(strata::core::StageMsg::Ok, gl_stage_out, hbytes, nullptr, 0, err)) break;
+                            }
+                        }
+                    } else if (type == strata::core::StageMsg::Commit) {
+                        int32_t n_keep = 0;
+                        if (msg.size() == 4) std::memcpy(&n_keep, msg.data(), 4);
+                        if (!ver.commit(n_keep, err) || !ver.wait_commit(err)) fail = err;
+                        else if (!s.send(strata::core::StageMsg::Ok, nullptr, 0, nullptr, 0, err)) break;
+                    } else if (type == strata::core::StageMsg::Reset) {
+                        if (!ver.wait_commit(err) || !ver.glm5_state_zero(err)) {
+                            fail = err;
+                        } else {
+                            if (n_win > 0)
+                                std::fprintf(stderr, "strata stage: %lld windows, %.2f ms each here; per window: waiting "
+                                             "for the next %.2f ms, reading it %.2f ms, sending %.2f ms\n",
+                                             (long long) n_win, ms_win / (double) n_win, s.ms_wait / (double) n_win,
+                                             s.ms_recv / (double) n_win, s.ms_send / (double) n_win);
+                            s.ms_wait = s.ms_recv = s.ms_send = 0;
+                            n_win = 0;
+                            ms_win = 0;
+                            if (!s.send(strata::core::StageMsg::Ok, nullptr, 0, nullptr, 0, err)) break;
+                        }
+                    } else if (type == strata::core::StageMsg::Ping) {
+                        if (!s.send(strata::core::StageMsg::Ok, msg.data(), msg.size(), nullptr, 0, err)) break;
+                    } else if (type == strata::core::StageMsg::Quit) {
+                        break;
+                    } else {
+                        fail = "an unknown message";
+                    }
+                    if (!fail.empty()) {
+                        std::fprintf(stderr, "strata stage: %s\n", fail.c_str());
+                        if (!s.send(strata::core::StageMsg::Err, fail.data(), fail.size(), nullptr, 0, err)) break;
+                    }
+                }
+                std::fprintf(stderr, "strata stage: the head at %s left (%s)\n", peer.c_str(), err.c_str());
+                std::fflush(stderr);
+            }
+        }
         if (glm5_model && o.serve) {
             std::mutex in_mu;
             std::condition_variable in_cv;
@@ -7007,7 +7216,8 @@ int main(int argc, char** argv) {
                 in_eof.store(true);
                 in_cv.notify_one();
             }).detach();
-            const int pf_chunk = [] { const char* v = std::getenv("STRATA_GLM5_PREFILL"); return v ? std::atoi(v) : 1024; }();
+            // multinode: the prompt as verify windows (the chunked path runs one engine's layers only)
+            const int pf_chunk = !gl_chain.empty() ? 0 : [] { const char* v = std::getenv("STRATA_GLM5_PREFILL"); return v ? std::atoi(v) : 1024; }();
             strata::core::Verifier::Glm5Fetch pf;
             pf.host_res = host_res.empty() ? nullptr : host_res.data();
             pf.cache_base = thits.cache_base;
@@ -7095,7 +7305,7 @@ int main(int argc, char** argv) {
                         const int T = (int) std::min<int64_t>(o.spec, np - q);
                         for (int t = 0; t < T; ++t) pw[(size_t) t] = prompt[(size_t) (q + t)];
                         drive.d.layers = 0; drive.d.experts = 0; drive.d.failed = false;
-                        if (!ver.run(T, pw.data(), q, &drive_pool_multi, &drive, po.data(), err) || !ver.commit(T, err) ||
+                        if (!ver.run(T, pw.data(), q, gl_pool, gl_user, po.data(), err) || !ver.commit(T, err) ||
                             !ver.wait_commit(err)) {
                             std::printf("ERR %s\n", err.c_str());
                             std::fflush(stdout);
@@ -7107,8 +7317,11 @@ int main(int argc, char** argv) {
                 }
                 const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp).count();
                 live.assign(prompt.begin(), prompt.begin() + np);
-                if (!ver.glm5_state_save(snap, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
-                snap_toks = live;
+                // multinode: no snapshot (a stage engine's state cannot be read back) - the live sequence only
+                if (gl_chain.empty()) {
+                    if (!ver.glm5_state_save(snap, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
+                    snap_toks = live;
+                }
                 std::printf("PP %lld %lld %.1f %.1f\n", (long long) np, (long long) n, prompt_ms,
                             prompt_ms > 0 ? 1000.0 * (double) (np - reused) / prompt_ms : 0.0);
                 std::fflush(stdout);
@@ -7131,7 +7344,7 @@ int main(int argc, char** argv) {
                     if (pos + T > o.max_context) { finish = "length"; break; }
                     drive.d.layers = 0; drive.d.experts = 0; drive.d.failed = false;
                     apply_pending(!adapt_nowait());
-                    if (!ver.run(T, win.data(), pos, &drive_pool_multi, &drive, outw.data(), err) || drive.d.failed) {
+                    if (!ver.run(T, win.data(), pos, gl_pool, gl_user, outw.data(), err) || drive.d.failed) {
                         std::printf("ERR %s\n", err.empty() ? "the expert pool failed" : err.c_str());
                         std::fflush(stdout);
                         return 1;

@@ -17,6 +17,7 @@
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/remote_stage.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/fused_gr.hpp"
@@ -127,8 +128,8 @@ bool Verifier::init_glm5(std::string& err) {
     m.cap = cap_;
     m.n_slices = fused_mhc_slices(m.N);
     if (!fused_mhc_supported(m.N, g.hc, (2 + g.hc) * g.hc) || m.S != 128 || m.NH % 16 != 0 || m.KVR != 512 ||
-        m.ID != 128 || m.IH != 32 || lb_ != 0 || le_ != g.n_layers) {
-        err = "verify glm5: unsupported geometry or a layer split (the window runs the whole trunk)";
+        m.ID != 128 || m.IH != 32 || lb_ < 0 || le_ > g.n_layers || lb_ >= le_) {
+        err = "verify glm5: unsupported geometry or layer range";
         return false;
     }
     // the layers by kind, and their ordinals
@@ -150,7 +151,7 @@ bool Verifier::init_glm5(std::string& err) {
     m.raw_g = m.dev<float>((size_t) nD * MT * m.ID);
     m.page_table = m.dev<int32_t>((size_t) (m.max_cells / 4 + 1));
     // the KDA conv weights: GGUF ssm_conv1d_{q,k,v} [4, 1, DI] each (channel-major, tap fastest) -> q|k|v [C][4]
-    for (int64_t l = 0; l < g.n_layers; ++l) {
+    for (int64_t l = lb_; l < le_; ++l) {   // this verifier's layers (a stage engine loads only its own)
         const int64_t gi = m.kda_index[(size_t) l];
         if (gi < 0) continue;
         const char* names[3] = {"ssm_conv1d_q.weight", "ssm_conv1d_k.weight", "ssm_conv1d_v.weight"};
@@ -182,12 +183,25 @@ bool Verifier::init_glm5(std::string& err) {
     m.q8 = m.dev<uint8_t>((size_t) (m.NH * T) * (m.KVR / 32) * 36 + (size_t) T * (m.NFFD / 32) * 36);
     for (void* p : m.allocs) if (p == nullptr) { err = "verify glm5: a device buffer does not fit"; return false; }
     // the small tensors are read as F32 straight from the arena: refuse a pack that stored them narrower
-    for (const char* nm : {"blk.0.attn_norm.weight", "blk.0.ssm_dt.bias", "blk.3.ffn_gate_inp.weight", "blk.3.indexer.proj.weight",
-                           "blk.0.hc_attn_scale.weight", "output_norm.weight"}) {
-        const WeightRef* r = wt.find(nm);
-        if (r == nullptr || r->data == nullptr || r->bytes < (uint64_t) r->elements * 4) {
-            err = std::string("verify glm5: ") + nm + " is not an F32 tensor in the arena";
-            return false;
+    {   // one of each kind in this verifier's layers (a layer split: a stage holds only its own)
+        int64_t lk = -1, ld = -1, lm = -1;
+        for (int64_t l = lb_; l < le_; ++l) {
+            if (lk < 0 && m.kda_index[(size_t) l] >= 0) lk = l;
+            if (ld < 0 && m.dsa_index[(size_t) l] >= 0) ld = l;
+            if (lm < 0 && l >= g.n_dense_layers) lm = l;
+        }
+        std::vector<std::string> names = {"blk." + std::to_string(lb_) + ".attn_norm.weight",
+                                          "blk." + std::to_string(lb_) + ".hc_attn_scale.weight"};
+        if (lk >= 0) names.push_back("blk." + std::to_string(lk) + ".ssm_dt.bias");
+        if (ld >= 0) names.push_back("blk." + std::to_string(ld) + ".indexer.proj.weight");
+        if (lm >= 0) names.push_back("blk." + std::to_string(lm) + ".ffn_gate_inp.weight");
+        if (le_ == g.n_layers) names.push_back("output_norm.weight");
+        for (const std::string& nm : names) {
+            const WeightRef* r = wt.find(nm);
+            if (r == nullptr || r->data == nullptr || r->bytes < (uint64_t) r->elements * 4) {
+                err = "verify glm5: " + nm + " is not an F32 tensor in the arena";
+                return false;
+            }
         }
     }
     std::fprintf(stderr, "strata verify: glm5 geometry N %lld H %lld S %lld C %lld DI %lld NH %lld QLR %lld KVR %lld QK %lld "
@@ -218,7 +232,23 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
 
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
-    if (const NativeEmbed* ne = native_embed()) {
+    // a layer split (2026-10-08): a stage after the first starts from the hand-off - the streams R before the stage
+    // before folded its last FFN in, that FFN's output and its post / comb - and its first hyper-connection read
+    // folds them in exactly as the whole trunk's would (so the split is bit for bit the one engine)
+    const int64_t HF = handoff_floats(g);
+    auto hand_rows = [&](float* dst_base, const float* src_base, bool out) {
+        for (int t = 0; t < T; ++t) {
+            float* h = (float*) (out ? dst_base : src_base) + (size_t) t * HF;
+            float* parts[4] = {Rt(t), bo_ + (size_t) t * N, m.postF + (size_t) t * HC, m.combF + (size_t) t * HC * HC};
+            const int64_t at[4] = {0, HC * N, HC * N + N, HC * N + N + HC}, cnt[4] = {HC * N, N, HC, HC * HC};
+            for (int i = 0; i < 4; ++i)
+                out ? copy_from_mapped(h + at[i], parts[i], cnt[i], cs) : copy_from_mapped(parts[i], h + at[i], cnt[i], cs);
+        }
+    };
+    if (lb_ > 0) {
+        if (hand_in_ == nullptr) { err = "verify glm5: a stage without its hand-off"; return false; }
+        hand_rows(nullptr, hand_in_, false);
+    } else if (const NativeEmbed* ne = native_embed()) {
         ne->gather_dev(tok_, T, emb_, cs);
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
     } else { err = "verify glm5: needs the native token embedding"; return false; }
@@ -371,7 +401,7 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
     // ---- post(l): the routed experts (the Qwen path's machinery), the combine into bo_
     auto post = [&](int64_t l) -> bool {
         if (l < g.n_dense_layers) return true;   // the dense FFN's output is already in bo_
-        const uint32_t ring = (uint32_t) (l + 1);
+        const uint32_t ring = (uint32_t) (l - lb_ + 1);   // the host counts this stage's layers from 1 (run())
         const int64_t cap = (int64_t) n * K, capx = (int64_t) MT * K;
         int32_t* pl = plan_;
         wait_flag_ge(m_flagA_, ring, cs);
@@ -404,15 +434,21 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
     };
 
     try {
-        for (int64_t l = 0; l < g.n_layers; ++l) {
+        for (int64_t l = lb_; l < le_; ++l) {
             if (!pre(l)) return false;
             if (!post(l)) return false;
         }
-        // the last layer's FFN write (nothing follows to fold it into), the mean of the streams, output_norm, the head
+        if (le_ < g.n_layers) {   // an earlier stage: R, the last FFN's output and its post / comb go on, no head
+            if (hand_out_ == nullptr) { err = "verify glm5: a stage without its hand-off"; return false; }
+            hand_rows(hand_out_, nullptr, true);
+            return true;
+        }
+        // the last layer's FFN write (nothing follows to fold it into)
         MhcMulti w;
         w.n_tok = n; w.n_embd = (int) N; w.apply = true; w.post_prev = m.postF; w.comb_prev = m.combF;
         for (int t = 0; t < n; ++t) { w.R[t] = Rt(t); w.R_out[t] = Rt(t); w.out_prev[t] = bo_ + (size_t) t * N; w.y[t] = head_mixed_ + (size_t) t * N; }
         fused_mhc_write_multi(w, cs);
+        // the mean of the streams, output_norm, the head
         fused_mhc_exit_mean(w, cs);
         const WeightRef* on = wfind(wt, -1, "output_norm.weight", err);
         if (!on) return false;
@@ -445,7 +481,7 @@ bool Verifier::capture_commit_glm5(std::string& err) {
     bool ok = true;
     try {
         copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
-        for (int64_t l = 0; l < g.n_layers && ok; ++l) {
+        for (int64_t l = lb_; l < le_ && ok; ++l) {   // this stage's layers
             const int64_t gi = m.kda_index[(size_t) l], qi = m.dsa_index[(size_t) l];
             if (gi >= 0) {
                 const WeightRef* wnm = wfind(*wt_, l, "ssm_norm.weight", err);
@@ -503,7 +539,7 @@ static StateSpans glm5_spans(const ModelGeometry& g, SessionState& ss, float* ta
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     s.gdn = ss.gdn_state;
-    s.gdn_n = (size_t) g.n_gdn_layers() * gdn_floats;
+    s.gdn_n = (size_t) ss.gdn_alloc * gdn_floats;   // the session's own rows (a stage engine carves its layers only)
     s.tail = tail;
     s.tail_n = (size_t) n_dsa * 3 * 2 * id;
     return s;
@@ -538,6 +574,8 @@ bool Verifier::glm5_state_restore(const std::vector<float>& host, std::string& e
 }
 
 bool Verifier::glm5_state_zero(std::string& err) {
+    // a layer split (2026-10-08): every stage starts empty - a stage in another engine through its link's Reset
+    if (remote_ != nullptr) return remote_->reset(err) && (next_ == nullptr || next_->glm5_state_zero(err));
     if (glm_ == nullptr) { err = "glm5 state: no glm5 window"; return false; }
     const OnDevice on_device(device_);
     const StateSpans s = glm5_spans(*g_, *ss_, glm_->tail, g_->n_qsa_layers(), glm_->ID);
@@ -546,7 +584,7 @@ bool Verifier::glm5_state_zero(std::string& err) {
         err = "glm5 state: zero failed";
         return false;
     }
-    return true;
+    return next_ == nullptr || next_->glm5_state_zero(err);
 }
 
 // ================================ THE PROMPT PATH (2026-10-08) ================================
