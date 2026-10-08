@@ -929,9 +929,21 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         hand_copy(postF, hin, hout, HC * N + N, HC, T);
         hand_copy(combF, hin, hout, HC * N + N + HC, HC * HC, T);
     };
+    // STRATA_GLM5_PF_PROF=1 (2026-10-09): sync between the parts and print where a prompt's time goes
+    static const bool prof = std::getenv("STRATA_GLM5_PF_PROF") != nullptr;
+    double ms_attn = 0, ms_norm = 0, ms_ffn = 0;
+    const double copy0 = prefill_ms_copy;
+    auto lap = [&](double& acc, std::chrono::steady_clock::time_point& t0) {
+        if (!prof) return;
+        cudaStreamSynchronize(cs);
+        const auto t1 = std::chrono::steady_clock::now();
+        acc += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        t0 = t1;
+    };
     try {
         for (int64_t c0 = 0; c0 < n_all; c0 += C) {
             const int64_t T = std::min<int64_t>(C, n_all - c0);
+            auto tp = std::chrono::steady_clock::now();
             for (int64_t t = 0; t < T; ++t) qsa_step_fill(h_steps.data() + (size_t) t * kStepCount, pos0 + c0 + t, s);
             cudaMemcpyAsync(tokc, tokens + c0, (size_t) T * 4, cudaMemcpyHostToDevice, cs);
             cudaMemcpyAsync(stepc, h_steps.data(), (size_t) T * kStepCount * 4, cudaMemcpyHostToDevice, cs);
@@ -943,15 +955,18 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                 ne->gather_dev(tokc, T, embc, cs);
                 broadcast_streams(embc, Rc, N, (int) HC, (int) T, cs);
             }
+            lap(ms_ffn, tp);
             for (int64_t l = lb; l < le; ++l) {
                 for (int64_t s0 = 0; s0 < T; s0 += SL) {
                     const int n = (int) std::min<int64_t>(SL, T - s0);
                     if (!mhc_read(l, "attn", l > 0, s0, n, "attn_norm.weight") || !attn(l, s0, n)) return false;
                 }
+                lap(ms_attn, tp);
                 for (int64_t s0 = 0; s0 < T; s0 += SL) {
                     const int n = (int) std::min<int64_t>(SL, T - s0);
                     if (!mhc_read(l, "ffn", true, s0, n, "ffn_norm.weight")) return false;
                 }
+                lap(ms_norm, tp);
                 if (l < g.n_dense_layers) {
                     const WeightRef *wg = wfind(wt, l, "ffn_gate.weight", err), *wu = wfind(wt, l, "ffn_up.weight", err),
                                     *wd = wfind(wt, l, "ffn_down.weight", err);
@@ -967,6 +982,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                 } else if (!moe(l, T)) {
                     return false;
                 }
+                lap(ms_ffn, tp);
             }
             if (le < g.n_layers) hand_parts(nullptr, hand_out, T);   // synced below, before the caller sends it
         }
@@ -977,6 +993,11 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     const cudaError_t se = cudaStreamSynchronize(cs);
     if (se != cudaSuccess) { err = std::string("verify glm5 prefill: ") + cudaGetErrorString(se); return false; }
     prefill_ms_total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+    if (prof)
+        std::fprintf(stderr, "strata glm5 prefill prof: %lld tokens, layers %lld-%lld: attention %.0f ms, mHC/norm %.0f ms, "
+                             "FFN/experts %.0f ms (host blob copies %.0f ms of it); streamed %lld, resident %lld so far\n",
+                     (long long) n_all, (long long) lb, (long long) le - 1, ms_attn, ms_norm, ms_ffn,
+                     prefill_ms_copy - copy0, (long long) prefill_streamed, (long long) prefill_resident);
     return true;
 }
 

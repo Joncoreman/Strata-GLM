@@ -23,7 +23,7 @@ ids = subprocess.run([sys.executable, str(Path(__file__).parent / "tok_chat.py")
 print("prompt tokens:", ids.count(",") + 1, flush=True)
 args = ["--serve", "--pack", PACK, "--native", NATIVE, "--prefill", "auto", "--spec", "6", "--max-context", "32768",
         "--pcie-frac", "0", "--short-read", "1000000000", "--prompt-cache", "0", "--pool-workers", os.environ.get("WORKERS", "16"),
-        "--vram-reserve-mib", os.environ.get("VRES", "2200"), "--mmap-experts", "--resident-budget-gib", "105",
+        "--vram-reserve-mib", os.environ.get("VRES", "2200"), "--mmap-experts", "--resident-budget-gib", os.environ.get("RES", "105"),
         "--expert-profile", PACK + "/expert-profile-learned-2026-10-08b.bin", "--expert-cache", "0",
         "--adapt-every", "1", "--adapt-swaps", os.environ.get("ADAPT", "64")]
 if mode == "mn":
