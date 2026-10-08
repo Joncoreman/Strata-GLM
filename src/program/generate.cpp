@@ -6844,6 +6844,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: cannot create the refill stream\n");
             return 1;
         }
+        // #477 in a one-shot run (2026-10-08, for glm5-next's first measured profile): what the adaptive tier learned
+        std::vector<double> heat1;
+        if (!o.expert_profile_save.empty() && !drive.d.usage.empty()) heat1.assign(drive.d.usage.size(), 0.0);
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
         cudaEvent_t adapt_ev = nullptr;
@@ -6931,6 +6934,7 @@ int main(int argc, char** argv) {
             if (trace_adapt)
                 std::fprintf(stderr, "strata: ADAPT round=%lld swapped %zu of %d slots, usage decayed\n",
                              (long long) adapt_rounds, swaps.size(), o.adapt_swaps);
+            for (size_t i = 0; i < heat1.size(); ++i) heat1[i] += (double) drive.d.usage[i];   // --expert-profile-save
             for (float& v : drive.d.usage) v *= o.adapt_decay;
             swaps_total += (int64_t) swaps.size();
             ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
@@ -6991,6 +6995,7 @@ int main(int argc, char** argv) {
                 while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
             }
             if (first_window) T = 1;
+            if (glm5_model && !use_mtp) T = 1;   // glm5-next without a drafter: wider windows would only verify zeros
             bool from_sfx = false;
             int sfx_match = 0;
             if (o.suffix_draft > 0 && !first_window) {
@@ -7096,6 +7101,17 @@ int main(int argc, char** argv) {
         if (!ver.wait_commit(err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
+        }
+        if (!heat1.empty()) {
+            apply_pending(true);
+            std::vector<uint8_t> resident(host_res.size(), 0);
+            for (size_t i = 0; i < host_res.size(); ++i) resident[i] = host_res[i] >= 0;
+            std::string e;
+            const auto ranked = strata::core::rank_learned_profile(g.n_layers, g.n_expert, resident, heat1, profile_loaded);
+            if (strata::core::write_expert_profile(o.expert_profile_save, g.n_layers, g.n_expert, ranked, e))
+                std::fprintf(stderr, "strata generate: expert profile saved to %s\n", o.expert_profile_save.c_str());
+            else
+                std::fprintf(stderr, "strata generate: the expert profile was not saved: %s\n", e.c_str());
         }
         std::printf("%-24s %lld rounds of %d, drafts accepted %lld of %lld (%.3f), %.2f tokens per round\n",
                     "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,
