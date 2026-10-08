@@ -484,6 +484,65 @@ bool Verifier::capture_commit_glm5(std::string& err) {
     return true;
 }
 
+// ================================ SERVE: THE SEQUENCE STATE (2026-10-08) ================================
+namespace {
+struct StateSpans {
+    float* gdn = nullptr; size_t gdn_n = 0;     // ss.gdn_state for the KDA layers (state + conv history each)
+    float* tail = nullptr; size_t tail_n = 0;   // the indexer tails of the DSA layers
+};
+}  // namespace
+
+static StateSpans glm5_spans(const ModelGeometry& g, SessionState& ss, float* tail, int64_t n_dsa, int64_t id) {
+    StateSpans s;
+    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    s.gdn = ss.gdn_state;
+    s.gdn_n = (size_t) g.n_gdn_layers() * gdn_floats;
+    s.tail = tail;
+    s.tail_n = (size_t) n_dsa * 3 * 2 * id;
+    return s;
+}
+
+bool Verifier::glm5_state_save(std::vector<float>& host, std::string& err) {
+    if (glm_ == nullptr) { err = "glm5 state: no glm5 window"; return false; }
+    const OnDevice on_device(device_);
+    const StateSpans s = glm5_spans(*g_, *ss_, glm_->tail, g_->n_qsa_layers(), glm_->ID);
+    host.resize(s.gdn_n + s.tail_n);
+    cudaStreamSynchronize(cs_);
+    if (cudaMemcpy(host.data(), s.gdn, s.gdn_n * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(host.data() + s.gdn_n, s.tail, s.tail_n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        err = "glm5 state: save failed";
+        return false;
+    }
+    return true;
+}
+
+bool Verifier::glm5_state_restore(const std::vector<float>& host, std::string& err) {
+    if (glm_ == nullptr) { err = "glm5 state: no glm5 window"; return false; }
+    const OnDevice on_device(device_);
+    const StateSpans s = glm5_spans(*g_, *ss_, glm_->tail, g_->n_qsa_layers(), glm_->ID);
+    if (host.size() != s.gdn_n + s.tail_n) { err = "glm5 state: a snapshot of another size"; return false; }
+    cudaStreamSynchronize(cs_);
+    if (cudaMemcpy(s.gdn, host.data(), s.gdn_n * 4, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(s.tail, host.data() + s.gdn_n, s.tail_n * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        err = "glm5 state: restore failed";
+        return false;
+    }
+    return true;
+}
+
+bool Verifier::glm5_state_zero(std::string& err) {
+    if (glm_ == nullptr) { err = "glm5 state: no glm5 window"; return false; }
+    const OnDevice on_device(device_);
+    const StateSpans s = glm5_spans(*g_, *ss_, glm_->tail, g_->n_qsa_layers(), glm_->ID);
+    cudaStreamSynchronize(cs_);
+    if (cudaMemset(s.gdn, 0, s.gdn_n * 4) != cudaSuccess || cudaMemset(s.tail, 0, s.tail_n * 4) != cudaSuccess) {
+        err = "glm5 state: zero failed";
+        return false;
+    }
+    return true;
+}
+
 // ================================ THE PROMPT PATH (2026-10-08) ================================
 //
 // Layer by layer over a chunk of C tokens.  The attention runs in slices of 8 with the window's kernels and the

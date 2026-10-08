@@ -1736,6 +1736,8 @@ int main(int argc, char** argv) {
                 strata::GgufFile head(o.native_shards.front());
                 if (const strata::MetaValue* v = head.get("general.architecture")) glm5_model = v->s == "glm5-next";
                 if (glm5_model) o.no_ple = true;   // GLM has no per-layer token embeddings
+                // GLM's turn ends: <|endoftext|>, <|user|>, <|observation|> (unless --eos-ids chose its own)
+                if (glm5_model && o.eos_ids == std::vector<int64_t>{248044, 248046}) o.eos_ids = {154820, 154827, 154829};
             }
             // --ple-gguf defaults to the shard that holds the PLE table, found by name: shard 2 of the ISTA files
             // and of Unsloth's UD-Q4_K_XL, shard 1 of Swift's
@@ -4308,7 +4310,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (o.serve) {
+    if (o.serve && !glm5_model) {   // glm5-next: its own request loop in the speculative section below
         if (o.spec < 2 || (o.mtp.empty() && !stage_mode) || o.prefill_chunk <= 0 ||   // a stage has no drafter
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
             std::fprintf(stderr, "strata serve: needs --spec T, --mtp DIR and --prefill CHUNK (and a fillable "
@@ -6981,6 +6983,192 @@ int main(int argc, char** argv) {
         if (gmtp_on && !gmtp.init(wt, g, native_head.loaded() ? &native_head : nullptr, o.max_context, o.spec, o.native_preset, o.pack, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
+        }
+        // ================================ glm5-next --serve (2026-10-08) ================================
+        // The request protocol of the persistent engine above (GEN / T / PP / RESUME / DONE, STOP, QUIT), on this
+        // path's verify windows and prompt chunks.  A request continues the live sequence when its prompt starts with
+        // it (prompt + what was generated), else the snapshot taken after the previous prompt when it starts with
+        // that prompt (a chat client re-renders the assistant turn), else a zeroed sequence.  Greedy; one-token
+        // windows (and the suffix lookup's) as in the one-shot loop.
+        if (glm5_model && o.serve) {
+            std::mutex in_mu;
+            std::condition_variable in_cv;
+            std::deque<std::string> in_lines;
+            std::atomic<bool> stop_req{false}, in_eof{false};
+            std::thread([&] {
+                std::string l;
+                while (std::getline(std::cin, l)) {
+                    while (!l.empty() && (l.back() == '\r' || l.back() == '\n')) l.pop_back();
+                    if (l == "STOP") { stop_req.store(true); continue; }
+                    std::lock_guard<std::mutex> lk(in_mu);
+                    in_lines.push_back(l);
+                    in_cv.notify_one();
+                }
+                in_eof.store(true);
+                in_cv.notify_one();
+            }).detach();
+            const int pf_chunk = [] { const char* v = std::getenv("STRATA_GLM5_PREFILL"); return v ? std::atoi(v) : 1024; }();
+            strata::core::Verifier::Glm5Fetch pf;
+            pf.host_res = host_res.empty() ? nullptr : host_res.data();
+            pf.cache_base = thits.cache_base;
+            pf.slot_off = xcache.slot_offsets();
+            pf.cache_blob = (uint64_t) thits.blob;
+            pf.ctx = srcp;
+            pf.blob = [](void* c, int64_t l, int64_t e) -> const uint8_t* { return ((strata::core::ExpertSource*) c)->blob(l, e); };
+            std::vector<int32_t> live, snap_toks;   // live: the cells whose state is committed; snap: the last prompt
+            std::vector<float> snap;
+            if (!ver.glm5_state_zero(err)) { std::fprintf(stderr, "strata serve: %s\n", err.c_str()); return 1; }
+            std::printf("INFO engine=glm5 model=glm5-next\n");
+            std::printf("READY %lld stop\n", (long long) o.max_context);
+            std::fflush(stdout);
+            std::fprintf(stderr, "strata serve: glm5-next ready (context %lld, prompt chunks of %d)\n",
+                         (long long) o.max_context, pf_chunk);
+            int64_t rounds_all = 0;
+            for (;;) {
+                std::string line;
+                {
+                    std::unique_lock<std::mutex> lk(in_mu);
+                    in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof.load(); });
+                    if (in_lines.empty()) break;   // stdin closed
+                    line = in_lines.front();
+                    in_lines.pop_front();
+                }
+                if (line == "QUIT") break;
+                if (line.empty()) continue;
+                stop_req.store(false);
+                if (line.rfind("GEN ", 0) != 0) {
+                    std::printf("ERR this engine takes GEN requests only (glm5-next)\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                // GEN <max_new>[ key=value ...] <id,id,...>
+                std::istringstream is(line.substr(4));
+                std::vector<std::string> f;
+                for (std::string w; is >> w;) f.push_back(w);
+                std::vector<int64_t> ids64;
+                std::string perr;
+                const int64_t max_new = f.size() >= 2 ? std::atoll(f[0].c_str()) : 0;
+                if (f.size() < 2 || max_new < 1 || !parse_i64_list(f.back().c_str(), ids64, perr) || ids64.empty()) {
+                    std::printf("ERR malformed request\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                const int64_t n = (int64_t) ids64.size();
+                if (n + max_new > o.max_context) {
+                    std::printf("ERR the prompt (%lld tokens) and max_new (%lld) exceed the context (%lld)\n", (long long) n,
+                                (long long) max_new, (long long) o.max_context);
+                    std::fflush(stdout);
+                    continue;
+                }
+                std::vector<int32_t> prompt((size_t) n);
+                for (int64_t i = 0; i < n; ++i) prompt[(size_t) i] = (int32_t) ids64[(size_t) i];
+                const Clock::time_point tp = Clock::now();
+                auto starts_with = [&](const std::vector<int32_t>& pre) {
+                    return (int64_t) pre.size() <= n - 1 && std::equal(pre.begin(), pre.end(), prompt.begin());
+                };
+                if (!live.empty() && starts_with(live)) {
+                    // the live sequence goes on
+                } else if (!snap_toks.empty() && starts_with(snap_toks)) {
+                    if (!ver.glm5_state_restore(snap, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
+                    live = snap_toks;
+                } else {
+                    if (!ver.glm5_state_zero(err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
+                    live.clear();
+                }
+                const int64_t reused = (int64_t) live.size(), np = n - 1;
+                std::printf("RESUME %lld\n", (long long) reused);
+                std::fflush(stdout);
+                // the prompt's cells [reused, n - 1)
+                bool cancelled = false;
+                if (np - reused >= 16 && pf_chunk > 0) {
+                    ver.prefill_ms_total = 0;
+                    if (!ver.prefill_glm5(prompt.data() + reused, np - reused, reused, pf_chunk, pf, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        std::fflush(stdout);
+                        if (err.find("do not fit") == std::string::npos && err.find("page-locked") == std::string::npos) return 1;
+                        err.clear();
+                        continue;
+                    }
+                } else {
+                    std::vector<int32_t> pw((size_t) o.spec), po((size_t) o.spec);
+                    for (int64_t q = reused; q < np && !cancelled;) {
+                        const int T = (int) std::min<int64_t>(o.spec, np - q);
+                        for (int t = 0; t < T; ++t) pw[(size_t) t] = prompt[(size_t) (q + t)];
+                        drive.d.layers = 0; drive.d.experts = 0; drive.d.failed = false;
+                        if (!ver.run(T, pw.data(), q, &drive_pool_multi, &drive, po.data(), err) || !ver.commit(T, err) ||
+                            !ver.wait_commit(err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            std::fflush(stdout);
+                            return 1;
+                        }
+                        q += T;
+                        cancelled = stop_req.load();
+                    }
+                }
+                const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp).count();
+                live.assign(prompt.begin(), prompt.begin() + np);
+                if (!ver.glm5_state_save(snap, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
+                snap_toks = live;
+                std::printf("PP %lld %lld %.1f %.1f\n", (long long) np, (long long) n, prompt_ms,
+                            prompt_ms > 0 ? 1000.0 * (double) (np - reused) / prompt_ms : 0.0);
+                std::fflush(stdout);
+                // decode: windows of one token (and the suffix lookup's drafts)
+                const Clock::time_point td = Clock::now();
+                int64_t produced_n = 0, acc_n = 0, off_n = 0, pos = np;
+                int32_t xt = prompt[(size_t) np];
+                const char* finish = "length";
+                strata::spec::SuffixDrafter sd(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+                if (o.suffix_draft > 0) for (int32_t t : prompt) sd.append(t);
+                std::vector<int32_t> win((size_t) o.spec), outw((size_t) o.spec), sb((size_t) o.spec);
+                while (produced_n < max_new && !cancelled) {
+                    if (stop_req.load()) { finish = "cancel"; break; }
+                    int T = 1;
+                    win[0] = xt;
+                    if (o.suffix_draft > 0) {
+                        const int k = sd.propose(o.spec - 1, sb.data());
+                        if (k > 0) { T = std::min<int>(k + 1, o.spec); for (int i = 1; i < T; ++i) win[(size_t) i] = sb[(size_t) i - 1]; }
+                    }
+                    if (pos + T > o.max_context) { finish = "length"; break; }
+                    drive.d.layers = 0; drive.d.experts = 0; drive.d.failed = false;
+                    apply_pending(!adapt_nowait());
+                    if (!ver.run(T, win.data(), pos, &drive_pool_multi, &drive, outw.data(), err) || drive.d.failed) {
+                        std::printf("ERR %s\n", err.empty() ? "the expert pool failed" : err.c_str());
+                        std::fflush(stdout);
+                        return 1;
+                    }
+                    int a = 0;
+                    while (a < T - 1 && win[(size_t) a + 1] == outw[(size_t) a]) ++a;
+                    if (!ver.commit(a + 1, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
+                    off_n += T - 1;
+                    acc_n += a;
+                    ++rounds_all;
+                    for (int i = 0; i <= a; ++i) live.push_back(win[(size_t) i]);
+                    bool eos = false;
+                    for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
+                        const int32_t t = outw[(size_t) i];
+                        std::printf("T %d\n", t);
+                        ++produced_n;
+                        if (o.suffix_draft > 0) sd.append(t);
+                        eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) t) != o.eos_ids.end();
+                    }
+                    std::fflush(stdout);
+                    if (!drive.d.usage.empty() && (rounds_all % o.adapt_every) == 0 && !adapt()) return 1;
+                    if (eos) { finish = "stop"; break; }
+                    xt = outw[(size_t) a];
+                    pos += a + 1;
+                }
+                if (!ver.wait_commit(err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
+                const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - td).count();
+                std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld 0 0 0 0 0.0 %lld\n", (long long) produced_n,
+                            (long long) n, prompt_ms, decode_ms, cancelled ? "cancel" : finish, (long long) acc_n,
+                            (long long) off_n, (long long) reused, (long long) (n - reused));
+                std::fflush(stdout);
+                std::fprintf(stderr, "strata serve: request: prompt %lld (reused %lld) in %.0f ms, %lld tokens in %.0f ms "
+                                     "(%.2f tok/s), %s\n", (long long) n, (long long) reused, prompt_ms,
+                             (long long) produced_n, decode_ms, decode_ms > 0 ? 1000.0 * (double) produced_n / decode_ms : 0.0,
+                             cancelled ? "cancel" : finish);
+            }
+            return 0;
         }
         if (prompt_windows) {   // glm5-next: no prompt path yet - the prompt's positions [0, n_prompt - 1) as verify windows
             const int64_t np = n_prompt - 1;

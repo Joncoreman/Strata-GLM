@@ -990,8 +990,14 @@ class Service:
         self.before_load = None
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        # the end-of-turn tokens of the model's template, each only when it is ONE token in this vocabulary (Qwen:
+        # <|im_end|>, <|endoftext|>; glm5-next: <|endoftext|>, <|user|>, <|observation|> - <|im_end|> is not special
+        # there and would split into ordinary pieces such as "<" and "|", 2026-10-08)
+        self.stop_ids = set()
+        for s in (IM_END, "<|endoftext|>", "<|user|>", "<|observation|>"):
+            ids = tokenizer.encode(s, parse_special=True)
+            if len(ids) == 1:
+                self.stop_ids.add(ids[0])
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -2887,9 +2893,19 @@ def main() -> int:
         tokens = [None] * len(vocab)
         for t, i in vocab.items():
             tokens[i] = t
-        merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
+        merges = [m for m in (tpath / "merges.txt").read_text(encoding="utf-8").split("\n") if m]
+        if merges and merges[0].startswith("#version"):
+            merges = merges[1:]
         types = json.loads((tpath / "token_type.json").read_text())
         tok = ST.Tokenizer(tokens, merges, types)
+        # glm5-next (2026-10-08): the pack records its pre-tokenizer split (glm4); the class defaults to Qwen's
+        meta_path = tpath / "tokenizer.json"
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if meta.get("pre_pattern") and meta.get("pre") not in (None, "qwen35"):
+                import regex
+                tok._re = regex.compile(meta["pre_pattern"])
+                print(f"[strata] pre-tokenizer: {meta['pre']} (from {meta_path})", flush=True)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:

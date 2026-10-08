@@ -331,10 +331,67 @@ def call_end(text: str) -> int:
             return text.find(CALL_END, pos)
 
 
+GLM_KEY, GLM_KEY_END, GLM_VAL, GLM_VAL_END = "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>"
+
+
+def tool_call_name(body: str) -> str:
+    """The function name of a call body in either format: Qwen's `<function=NAME>...` or glm5-next's
+    `NAME<arg_key>...` (2026-10-08)."""
+    s = body.strip()
+    if s.startswith("<function="):
+        return s[len("<function="):].split(">", 1)[0]
+    return s.split(GLM_KEY, 1)[0].strip()
+
+
+def _decode_value(value: str, declared) -> object:
+    if declared == "string":
+        return value
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
+def parse_glm_tool_call(body: str, schema: dict | None = None) -> ToolCall:
+    """glm5-next (GLM-5.3) chat template: `NAME<arg_key>K</arg_key><arg_value>V</arg_value>...` -> ToolCall.  The
+    template writes a string value verbatim and anything else as JSON (`tojson`), so values decode as in Qwen's
+    format.  A value ends at the `</arg_value>` followed by the next `<arg_key>` or the end of the body, so the tag
+    inside a value (a file documenting the format) stays part of it."""
+    body = body.strip()
+    name = body.split(GLM_KEY, 1)[0].strip()
+    if not name or "<" in name:
+        raise ValueError("malformed tool call: " + body[:80])
+    props = ((schema or {}).get("parameters") or {}).get("properties") or {}
+    args = {}
+    rest = body[len(name):] if body.startswith(name) else body[body.index(GLM_KEY):]
+    while GLM_KEY in rest:
+        rest = rest[rest.index(GLM_KEY) + len(GLM_KEY):]
+        if GLM_KEY_END not in rest:
+            break
+        key = rest[:rest.index(GLM_KEY_END)].strip()
+        rest = rest[rest.index(GLM_KEY_END) + len(GLM_KEY_END):].lstrip()
+        if not rest.startswith(GLM_VAL):
+            args[key] = ""
+            continue
+        rest = rest[len(GLM_VAL):]
+        at = rest.find(GLM_VAL_END)
+        while at >= 0:
+            after = rest[at + len(GLM_VAL_END):].lstrip()
+            if not after or after.startswith(GLM_KEY):
+                break
+            at = rest.find(GLM_VAL_END, at + 1)
+        value = rest[:at] if at >= 0 else rest
+        rest = rest[at + len(GLM_VAL_END):] if at >= 0 else ""
+        args[key] = _decode_value(value, (props.get(key) or {}).get("type"))
+    return ToolCall(name=name, arguments=args)
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
-    objects/arrays/numbers/booleans)."""
+    objects/arrays/numbers/booleans).  glm5-next's `NAME<arg_key>...` bodies go to parse_glm_tool_call."""
+    if not body.strip().startswith("<function=") and (GLM_KEY in body or "<" not in body.strip()):
+        return parse_glm_tool_call(body, schema)
     body = body.strip()
     if not body.startswith("<function=") or ">" not in body:
         raise ValueError("malformed tool call: " + body[:80])
@@ -552,7 +609,7 @@ class OutputParser:
                     return out
                 body = self.buf[:i]
                 self.buf = self.buf[i + len(CALL_END):]
-                name = body.strip()[len("<function="):].split(">", 1)[0]
+                name = tool_call_name(body)
                 call = parse_tool_call(body, self.schemas.get(name))
                 if self.scall is not None:
                     call.id = self.scall.id

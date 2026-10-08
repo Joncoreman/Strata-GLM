@@ -165,6 +165,12 @@ public:
     /// and conv history, the latent cache, the indexer pool).  Per layer the attention runs in slices of 8 tokens (the
     /// window's kernels), the routed experts once per chunk on the GPU, each expert's blob read once.
     bool prefill_glm5(const int32_t* tokens, int64_t n, int64_t pos0, int chunk, const Glm5Fetch& f, std::string& err);
+    /// glm5 serve (2026-10-08): the sequence state that a later request continuing the same prompt needs - the KDA
+    /// states with their conv histories and the indexer tails (the latents and completed indexer blocks of earlier
+    /// cells are never rewritten) - copied to `host`, back from it, or zeroed (a new sequence).
+    bool glm5_state_save(std::vector<float>& host, std::string& err);
+    bool glm5_state_restore(const std::vector<float>& host, std::string& err);
+    bool glm5_state_zero(std::string& err);
     double prefill_ms_copy = 0, prefill_ms_total = 0;
     int64_t prefill_streamed = 0, prefill_resident = 0;
 
