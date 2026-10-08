@@ -233,6 +233,9 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     }
     uint64_t at = 0;
     for (int64_t l = 0; l < n_layers; ++l) {
+        // v5 (glm5-next): a layer without a line is a dense layer (layers 0-2: an FFN, no experts) - zero bytes,
+        // fmt.gu_type -1; callers skip it.  Older tables must list every layer.
+        if (L.version >= 5 && L.offset[(size_t) l] == ~0ull) { L.offset[(size_t) l] = at; continue; }
         if (L.offset[(size_t) l] != at) {
             err = "native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous";
             return false;
