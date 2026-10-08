@@ -206,7 +206,167 @@ __global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict_
     attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
+// ================================ glm5-next: MLA (absorbed) sparse attention, decode ==============================
+// The same split-K flash-decode as attn_chunk_kernel (chunks of 64 selected cells -> per-chunk max / exp-sum / acc ->
+// merge), for GLM-5.3-Flash's DSA: ONE 512-value latent per cell serves as K and V for all 64 query heads (MQA 64:1,
+// llama.cpp b11461 glm5-next.cpp:917-950).  64 heads x 512 floats of q do not fit in shared memory, so a block takes
+// a group of MGH heads (grid.y = head group); the latent rows are re-read per group from L2.  Pool: fp16 rows of 512
+// at (page * 1 + 0) * page_size + slot (n_kv_heads = 1).  `scale` is the caller's (GLM: 1/sqrt(256), not 1/sqrt(512)).
+constexpr int MHD = 512;            // latent dim
+constexpr int MGH = 16;             // query heads per block
+constexpr int MPL = MHD / 32;       // latent values per lane in the score pass (16)
+
+__global__ void __launch_bounds__(THREADS) mla_chunk_kernel(const float* __restrict__ q, const uint16_t* __restrict__ pool,
+                                                            const int32_t* __restrict__ page_table,
+                                                            const int32_t* __restrict__ ids,
+                                                            const int32_t* __restrict__ step, int n_head, int page_size,
+                                                            float scale, float* __restrict__ part_acc,
+                                                            float* __restrict__ part_m, float* __restrict__ part_l,
+                                                            int n_chunks, int cap, long long scratch_stride) {
+    q += (size_t) blockIdx.z * (size_t) n_head * MHD;
+    ids += (size_t) blockIdx.z * (size_t) cap;
+    step += (size_t) blockIdx.z * kStepCount;
+    part_acc += (size_t) blockIdx.z * (size_t) scratch_stride;
+    part_m += (size_t) blockIdx.z * (size_t) scratch_stride;
+    part_l += (size_t) blockIdx.z * (size_t) scratch_stride;
+    __shared__ __align__(16) float sq[MGH][MHD];  // 32 KB: this group's query heads
+    __shared__ float sp[MGH][CHUNK];              // scores, then probabilities
+    __shared__ long long srow[CHUNK];
+    const int n_ids = __ldg(step + kStepWidth);
+    const int chunk = blockIdx.x, hg = blockIdx.y;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int c0 = chunk * CHUNK;
+    const int n_here = min(CHUNK, n_ids - c0);
+    const int h0 = hg * MGH;
+    if (n_here <= 0) {
+        if (t < MGH) { part_m[(size_t) chunk * n_head + h0 + t] = -FLT_MAX; part_l[(size_t) chunk * n_head + h0 + t] = 0.0f; }
+        return;
+    }
+    for (int i = t; i < MGH * MHD; i += THREADS) sq[i / MHD][i % MHD] = q[(size_t) h0 * MHD + i];
+    if (t < CHUNK) {
+        long long r = -1;
+        if (t < n_here) {
+            const int cell = ids[c0 + t];
+            const long long page = (long long) page_table[cell / page_size];
+            if (page >= 0) r = page * page_size + (cell % page_size);
+        }
+        srow[t] = r;
+    }
+    __syncthreads();
+    // scores: a warp per cell, each lane 16 of the 512 latent values (two 8-wide fp16 loads), used for MGH heads
+    for (int c = warp; c < CHUNK; c += WARPS) {
+        if (c >= n_here || srow[c] < 0) {
+            if (lane < MGH) sp[lane][c] = -FLT_MAX;
+            continue;
+        }
+        float k16[MPL];
+        const uint16_t* row = pool + srow[c] * MHD + lane * 8;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {   // dims lane*8 + [0,8) and 256 + lane*8 + [0,8)
+            const uint4 raw = *reinterpret_cast<const uint4*>(row + half * 256);
+            const __half2* h2 = reinterpret_cast<const __half2*>(&raw);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { const float2 f = __half22float2(h2[j]); k16[half * 8 + 2 * j] = f.x; k16[half * 8 + 2 * j + 1] = f.y; }
+        }
+#pragma unroll
+        for (int h = 0; h < MGH; ++h) {
+            float s = 0.f;
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const float4 qa = *reinterpret_cast<const float4*>(&sq[h][half * 256 + lane * 8]);
+                const float4 qb = *reinterpret_cast<const float4*>(&sq[h][half * 256 + lane * 8 + 4]);
+                const float* k8 = k16 + half * 8;
+                s += k8[0] * qa.x + k8[1] * qa.y + k8[2] * qa.z + k8[3] * qa.w +
+                     k8[4] * qb.x + k8[5] * qb.y + k8[6] * qb.z + k8[7] * qb.w;
+            }
+            s = warp_sum(s);
+            if (lane == 0) sp[h][c] = s * scale;
+        }
+    }
+    __syncthreads();
+    for (int h = warp; h < MGH; h += WARPS) {
+        const float a = sp[h][lane], b = sp[h][lane + 32];
+        const float m = warp_max(fmaxf(a, b));
+        const float ea = (lane < n_here && srow[lane] >= 0) ? __expf(a - m) : 0.0f;
+        const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0) ? __expf(b - m) : 0.0f;
+        sp[h][lane] = ea;
+        sp[h][lane + 32] = eb;
+        const float l = warp_sum(ea + eb);
+        if (lane == 0) { part_m[(size_t) chunk * n_head + h0 + h] = m; part_l[(size_t) chunk * n_head + h0 + h] = l; }
+    }
+    __syncthreads();
+    // values (= the same latent): thread t owns dims t and t + 256 for the MGH heads
+    float acc0[MGH], acc1[MGH];
+#pragma unroll
+    for (int h = 0; h < MGH; ++h) { acc0[h] = 0.0f; acc1[h] = 0.0f; }
+    for (int c = 0; c < n_here; ++c) {
+        if (srow[c] < 0) continue;
+        const float v0 = __half2float(__ushort_as_half(pool[srow[c] * MHD + t]));
+        const float v1 = __half2float(__ushort_as_half(pool[srow[c] * MHD + 256 + t]));
+#pragma unroll
+        for (int h = 0; h < MGH; ++h) { acc0[h] = fmaf(sp[h][c], v0, acc0[h]); acc1[h] = fmaf(sp[h][c], v1, acc1[h]); }
+    }
+#pragma unroll
+    for (int h = 0; h < MGH; ++h) {
+        float* a = part_acc + ((size_t) chunk * n_head + h0 + h) * MHD;
+        a[t] = acc0[h];
+        a[256 + t] = acc1[h];
+    }
+}
+
+__global__ void __launch_bounds__(MHD) mla_merge_kernel(const float* __restrict__ part_acc, const float* __restrict__ part_m,
+                                                        const float* __restrict__ part_l, int n_chunks, int n_head,
+                                                        float* __restrict__ out, long long scratch_stride) {
+    part_acc += (size_t) blockIdx.y * (size_t) scratch_stride;
+    part_m += (size_t) blockIdx.y * (size_t) scratch_stride;
+    part_l += (size_t) blockIdx.y * (size_t) scratch_stride;
+    out += (size_t) blockIdx.y * (size_t) n_head * MHD;
+    const int h = blockIdx.x, d = threadIdx.x;
+    float M = -FLT_MAX;
+    for (int c = 0; c < n_chunks; ++c) M = fmaxf(M, part_m[(size_t) c * n_head + h]);
+    float L = 0.0f, acc = 0.0f;
+    for (int c = 0; c < n_chunks; ++c) {
+        const float m = part_m[(size_t) c * n_head + h];
+        if (m == -FLT_MAX) continue;
+        const float w = __expf(m - M);
+        L = fmaf(part_l[(size_t) c * n_head + h], w, L);
+        acc = fmaf(part_acc[((size_t) c * n_head + h) * MHD + d], w, acc);
+    }
+    out[(size_t) h * MHD + d] = L > 0.0f ? acc / L : 0.0f;
+}
+
 }  // namespace
+
+uint64_t mla_decode_attn_scratch_floats(int64_t cap, int64_t n_head) {
+    const int64_t chunks = (cap + CHUNK - 1) / CHUNK;
+    return (uint64_t) chunks * (uint64_t) n_head * (MHD + 2) + 64;
+}
+
+void mla_decode_attn_batch(const float* q_abs, const uint16_t* latent_pool, const int32_t* page_table, int page_size,
+                           const int32_t* ids, const int32_t* steps, int64_t cap, int n_head, float scale,
+                           float* scratch, float* out, int64_t n_q, void* stream) {
+    if (n_q <= 0) return;
+    if (n_head % MGH != 0 || cap <= 0 || !scratch || !ids || !steps || !page_table || !latent_pool || n_q > 65535) {
+        std::fprintf(stderr, "mla_decode_attn_batch: unsupported geometry or missing buffers\n");
+        std::exit(1);
+    }
+    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
+    const long long stride = (long long) mla_decode_attn_scratch_floats(cap, n_head);
+    float* part_acc = scratch;
+    float* part_m = scratch + (size_t) n_chunks * n_head * MHD;
+    float* part_l = part_m + (size_t) n_chunks * n_head;
+    cudaStream_t st = (cudaStream_t) stream;
+    mla_chunk_kernel<<<dim3((unsigned) n_chunks, (unsigned) (n_head / MGH), (unsigned) n_q), THREADS, 0, st>>>(
+        q_abs, latent_pool, page_table, ids, steps, n_head, page_size, scale, part_acc, part_m, part_l, n_chunks,
+        (int) cap, stride);
+    mla_merge_kernel<<<dim3((unsigned) n_head, (unsigned) n_q), MHD, 0, st>>>(part_acc, part_m, part_l, n_chunks, n_head,
+                                                                            out, stride);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "mla_decode_attn_batch: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
 
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {

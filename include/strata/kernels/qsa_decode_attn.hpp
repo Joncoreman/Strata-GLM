@@ -43,4 +43,13 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
+/// glm5-next DSA: MLA absorbed attention over the selected cells.  q_abs [n_q, n_head, 512] (wk_b already applied),
+/// latent_pool fp16 [page][page_size][512] (one latent per cell, K = V), ids/steps as above, out [n_q, n_head, 512]
+/// (the caller applies wv_b per head, then wo).  n_head must be a multiple of 16; `scale` is the model's (GLM:
+/// 1/sqrt(256)).  Scratch: `n_q` x mla_decode_attn_scratch_floats(cap, n_head).
+uint64_t mla_decode_attn_scratch_floats(int64_t cap, int64_t n_head);
+void mla_decode_attn_batch(const float* q_abs, const uint16_t* latent_pool, const int32_t* page_table, int page_size,
+                           const int32_t* ids, const int32_t* steps, int64_t cap, int n_head, float scale,
+                           float* scratch, float* out, int64_t n_q, void* stream);
+
 }  // namespace strata::kernels
