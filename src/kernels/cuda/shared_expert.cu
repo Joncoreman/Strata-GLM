@@ -59,13 +59,16 @@ __global__ void swiglu_kernel(const float* __restrict__ gate, const float* __res
     out[i] = (float) (x / (1.0 + exp(-x))) * up[i];
 }
 
-__global__ void native_swiglu_kernel(const float* gate, const float* up, float* out, int n) {
+__global__ void native_swiglu_kernel(const float* gate, const float* up, float* out, int n, float limit = 0.f) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     // Pinned CUDA unary.cuh op_silu, then unary_gated_op_kernel's multiply.
     // Explicit intrinsics reproduce its --use_fast_math operations without
     // changing compilation of the default legacy arithmetic in this file.
-    out[i] = __fdividef(gate[i], 1.0f + __expf(-gate[i])) * up[i];
+    // glm5-next: the clamp of llama.cpp unary.cuh:118-123 first (limit 0 = Qwen, unchanged).
+    float g = gate[i], u = up[i];
+    if (limit > 0.f) { g = fminf(g, limit); u = fmaxf(fminf(u, limit), -limit); }
+    out[i] = __fdividef(g, 1.0f + __expf(-g)) * u;
 }
 
 __global__ void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict__ out, int n) {
@@ -168,7 +171,7 @@ __global__ void scale_rows_kernel(float* __restrict__ out, const float* __restri
 
 void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
-                         int64_t n_ff, void* stream) {
+                         int64_t n_ff, void* stream, float swiglu_limit) {
     if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
     cudaStream_t cs = (cudaStream_t) stream;
@@ -176,9 +179,14 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     native_mmvq(nw.gate_type, nw.gate_data, nw.q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
     native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
     const int n = (int) (n_ff * n_tok);
-    native_swiglu_kernel<<<(unsigned) ((n + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate, up, gate, n);
+    native_swiglu_kernel<<<(unsigned) ((n + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate, up, gate, n, swiglu_limit);
     native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
+    if (!gate_inp_bf16) {   // glm5-next: the shared expert (and the dense FFN of layers 0-2) has no scalar gate
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) throw std::runtime_error(std::string("shared_expert_multi: ") + cudaGetErrorString(e));
+        return;
+    }
     static const bool batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), one sigmoid launch
         bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);

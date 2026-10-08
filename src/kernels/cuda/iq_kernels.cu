@@ -955,12 +955,19 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
     }
 }
 
+// glm5-next's clamp (llama.cpp ggml-cuda/unary.cuh:118-123: gate = fminf(gate, L), up = clamp(up, -L, L)) before
+// the same SwiGLU; limit 0 leaves the Qwen arithmetic untouched.
+__device__ __forceinline__ void swiglu_clamp_in(float& g, float& u, float limit) {
+    if (limit > 0.f) { g = fminf(g, limit); u = fmaxf(fminf(u, limit), -limit); }
+}
+
 __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
-                                      long long n) {
+                                      long long n, float limit) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float g = gate[i];
-    h[i] = (g / (1.0f + __expf(-g))) * up[i];
+    float g = gate[i], u = up[i];
+    swiglu_clamp_in(g, u, limit);
+    h[i] = (g / (1.0f + __expf(-g))) * u;
 }
 
 template<int TD>
@@ -1050,18 +1057,19 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
                                                                   const float* __restrict__ up,
                                                                   const int32_t* __restrict__ grp_start,
                                                                   const int32_t* __restrict__ n_groups, int n_ff,
-                                                                  block_q8_1* __restrict__ hq) {
+                                                                  block_q8_1* __restrict__ hq, float limit) {
 #if defined(__HIPCC__)
 #pragma clang fp contract(off)
 #endif
     const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
     for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
          i += (long long) gridDim.x * blockDim.x) {
-        const float g = gate[i];
+        float g = gate[i], u = up[i];
+        swiglu_clamp_in(g, u, limit);
 #if defined(__HIPCC__)
-        const float h = (g / (1.0f + __expf(-g))) * up[i];
+        const float h = (g / (1.0f + __expf(-g))) * u;
 #else
-        const float h = __fmul_rn(g / (1.0f + __expf(-g)), up[i]);
+        const float h = __fmul_rn(g / (1.0f + __expf(-g)), u);
 #endif
         q8_1_store(h, hq, i);
     }
@@ -1563,11 +1571,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
     if (v1) {
-        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh, L.swiglu_limit);
         quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     } else {
         swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups,
-                                                                                (int) L.n_ff, hq);
+                                                                                (int) L.n_ff, hq, L.swiglu_limit);
     }
     check("native_expert_grouped/swiglu");
     const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) gy);

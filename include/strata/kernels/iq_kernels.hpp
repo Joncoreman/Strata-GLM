@@ -44,6 +44,7 @@ struct NativeExpertLayout {
     size_t gu_row = 0, d_row = 0;       // bytes per row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob
+    float swiglu_limit = 0.f;           // glm5-next: SwiGLU clamp (gate <= L, |up| <= L); 0 = plain SwiGLU (Qwen)
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// Whether `native_expert_grouped` has kernels for this gate/up and down type pair at these dimensions, and the
