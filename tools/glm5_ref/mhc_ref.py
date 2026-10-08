@@ -50,10 +50,22 @@ def coeffs(mixes, scale, base, hc_eps, iters):
     return pre, post, c
 
 
-def hc_pre(x, hc_fn, scale, base, hc_eps, iters):
-    """x [nt, 4, 4096] -> (block input [nt, 4096], mixes, pre, post, comb)"""
+def q8_1(x):
+    """ggml-cuda quantize_q8_1 per 32 values: d = amax/127, q = round(x/d) (round half away from zero)."""
+    xb = x.reshape(-1, 32)
+    amax = np.abs(xb).max(axis=1, keepdims=True)
+    d = amax / 127.0
+    q = np.where(amax > 0, np.sign(xb) * np.floor(np.abs(xb) / np.where(d > 0, d, 1) + 0.5), 0)
+    return (q * d).reshape(x.shape)
+
+
+def hc_pre(x, hc_fn, scale, base, hc_eps, iters, quantize=True):
+    """x [nt, 4, 4096] -> (block input [nt, 4096], mixes, pre, post, comb).  quantize: the projection's activation
+    goes through q8_1 as in llama.cpp's CUDA mmvq (Strata's fused_mhc does the same)."""
     nt = x.shape[0]
     flat = rms_norm(x.reshape(nt, -1), RMS_EPS)
+    if quantize:
+        flat = q8_1(flat.astype(np.float32).astype(np.float64))
     mixes = flat @ hc_fn.T
     pre, post, comb = coeffs(mixes, scale, base, hc_eps, iters)
     inp = np.einsum("th,the->te", pre, x)

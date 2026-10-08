@@ -13,9 +13,18 @@ call :one glm5_ffn_test "%K%\shared_expert.cu" "%K%\native_mmvq.cu" "%K%\iq_kern
 call :one glm5_kda_test "%K%\verify_kernels.cu" || exit /b 1
 call :one glm5_mla_test "%K%\qsa_decode_attn.cu" || exit /b 1
 call :one glm5_kpool_test "%K%\native_qsa_indexer.cu" "%K%\native_rope.cu" || exit /b 1
+call :one glm5_layer_test "%K%\fused_mhc.cu" "%K%\verify_kernels.cu" "%K%\shared_expert.cu" "%K%\native_mmvq.cu" "%K%\iq_kernels.cu" "%K%\native_bf16.cu" "%K%\quantize_act.cu" "%K%\s_gemv.cu" "%K%\s2_gemv_q8.cu" || exit /b 1
 exit /b 0
 
 :one
-echo [build] %1
-%NVCC% -O3 -std=c++17 -arch=sm_120 -I"%R%include" -I"%R%third_party\ggml" "%R%tests\cuda\%1.cu" %2 %3 %4 %5 %6 %7 %8 -o "%R%build-glm-gpu\%1.exe" || exit /b 1
+set NAME=%~1
+set FILES=
+:more
+shift
+if "%~1"=="" goto go
+set FILES=%FILES% "%~1"
+goto more
+:go
+echo [build] %NAME%
+%NVCC% -O3 -std=c++17 -arch=sm_120 -I"%R%include" -I"%R%third_party\ggml" "%R%tests\cuda\%NAME%.cu" %FILES% -o "%R%build-glm-gpu\%NAME%.exe" || exit /b 1
 exit /b 0

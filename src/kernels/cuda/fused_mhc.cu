@@ -2,13 +2,15 @@
 //
 // GLM-5.3-Flash's hyper-connection (mHC) in the shape of Strata's GR read (fused_gr.cu): the previous half's write
 // folded into the read, the weights read once for every token of a verify window, and the projection split over
-// many blocks that write UNSCALED partial dots (the v3 idea: rms is one scalar per token here, applied afterwards).
+// many blocks that write partial dots (the v3 idea).  The projection is llama.cpp's arithmetic (rms_norm, then a
+// Q8_0 x Q8_1 dot of the normalised activation), so the coefficients match its CUDA backend, not just the maths.
 //
 //   mhc_down (grid SL slices of the 4*n_embd vector):
 //       R'   = apply ? out_prev*post_prev[d] + sum_s comb_prev[d,s]*R[s]  : R      (computed on the fly, not stored)
-//       part[t][slice][r] = hc_fn[r, slice] . R'[slice]      ss[t][slice] = |R'[slice]|^2
+//       inv  = rsqrt(mean(R'^2) + eps) over all 4*n_embd (each block reduces it)
+//       part[t][slice][r] = hc_fn[r, slice] . q8_1(R'[slice] * inv)
 //   mhc_up (one block per token):
-//       mixes = (sum_slices part) / rms(R'),  pre/post/comb (Sinkhorn) as llama.cpp b11461 glm5-next.cpp:445-501
+//       mixes = sum_slices part,  pre/post/comb (Sinkhorn) as llama.cpp b11461 glm5-next.cpp:445-501
 //       R_out <- R' (when apply),  block = sum_h pre[h]*R'[h],  y = rms_norm(block) * w_norm   (attn_norm / ffn_norm)
 //
 // R' cannot be written by mhc_down (comb mixes the four streams: another block may still read the old R), so
@@ -51,42 +53,59 @@ __device__ __forceinline__ float fold(const MhcMulti& m, int t, int d, int i) {
 }
 
 __global__ void __launch_bounds__(DOWN_THREADS) mhc_down_kernel(MhcMulti m) {
+    // llama.cpp's arithmetic for hc_fn: rms_norm over all 4*n_embd values, then a Q8_0 x Q8_1 dot (the normalised
+    // activation quantised per 32 values: d = amax / 127, q = round(x / d), as ggml-cuda's quantize_q8_1).  Every
+    // block needs the token's whole sum of squares first, so each block reduces it itself (16 blocks x 64 KB per
+    // token from L2) instead of a third launch.
     __shared__ float xs[kFusedGrMaxT][SLICE];
-    __shared__ float red[kFusedGrMaxT][DOWN_THREADS / 32];
+    __shared__ float red[DOWN_THREADS / 32];
+    __shared__ float inv_rms[kFusedGrMaxT];
     const int slice = blockIdx.x;
     const int base = slice * SLICE;          // offset in the 4*n_embd vector
     const int d = base / m.n_embd, i0 = base % m.n_embd;
     const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    const int D = HC * m.n_embd;
 
     for (int t = 0; t < m.n_tok; ++t) {
         float ss = 0.f;
-        for (int j = threadIdx.x; j < SLICE; j += DOWN_THREADS) {
-            const float v = fold(m, t, d, i0 + j);
-            xs[t][j] = v;
+        for (int j = threadIdx.x; j < D; j += DOWN_THREADS) {
+            const float v = fold(m, t, j / m.n_embd, j % m.n_embd);
             ss += v * v;
         }
         ss = warp_sum(ss);
-        if (lane == 0) red[t][wid] = ss;
+        if (lane == 0) red[wid] = ss;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float s = 0.f;
+            for (int w = 0; w < DOWN_THREADS / 32; ++w) s += red[w];
+            inv_rms[t] = rsqrtf(s / (float)D + m.rms_eps);
+            if (slice == 0) m.ss_part[t * m.n_slices] = s;
+        }
+        __syncthreads();
+        for (int j = threadIdx.x; j < SLICE; j += DOWN_THREADS) xs[t][j] = fold(m, t, d, i0 + j) * inv_rms[t];
     }
     __syncthreads();
-    if (threadIdx.x < m.n_tok) {
-        float s = 0.f;
-        for (int w = 0; w < DOWN_THREADS / 32; ++w) s += red[threadIdx.x][w];
-        m.ss_part[threadIdx.x * m.n_slices + slice] = s;
-    }
 
-    // 3 rows per warp; lane = one Q8_0 block of the slice (1024 / 32 = 32 blocks); each weight block read once
-    // and used for every token.
+    // 3 rows per warp; lane = one 32-value block of the slice (1024 / 32 = 32 blocks); each weight block read once
+    // and used for every token.  The activation block is quantised here exactly once per (token, block) per row
+    // pass - the same codes for every row.
     const int nb_row = HC * m.n_embd / QK;
     for (int r = wid; r < MIX; r += DOWN_THREADS / 32) {
         const Q8_0 blk = static_cast<const Q8_0*>(m.fn)[(size_t)r * nb_row + base / QK + lane];
-        const float sc = __half2float(blk.d);
+        const float dw = __half2float(blk.d);
         for (int t = 0; t < m.n_tok; ++t) {
             const float* x = xs[t] + lane * QK;
-            float acc = 0.f;
+            float amax = 0.f;
 #pragma unroll
-            for (int k = 0; k < QK; ++k) acc = fmaf((float)blk.qs[k], x[k], acc);
-            acc = warp_sum(acc * sc);
+            for (int k = 0; k < QK; ++k) amax = fmaxf(amax, fabsf(x[k]));
+            const float dx = amax / 127.0f;
+            int sumi = 0;
+            if (amax != 0.0f) {
+#pragma unroll
+                for (int k = 0; k < QK; ++k) sumi += (int)blk.qs[k] * (int)roundf(x[k] / dx);
+            }
+            float acc = dw * (dx * (float)sumi);
+            acc = warp_sum(acc);
             if (lane == 0) m.part[((size_t)t * m.n_slices + slice) * MIX + r] = acc;
         }
     }
@@ -102,18 +121,11 @@ __global__ void __launch_bounds__(UP_THREADS) mhc_up_kernel(MhcMulti m) {
 
     __shared__ float mixes[MIX + 1];   // [MIX] = sum of squares
     // the slice partials: one thread per row (and one for the squares), each summed in slice order
-    if (threadIdx.x <= MIX) {
+    if (threadIdx.x < MIX) {   // the slices' partial dots (already of the normalised activation), in slice order
         float v = 0.f;
-        if (threadIdx.x < MIX)
-            for (int s = 0; s < m.n_slices; ++s) v += m.part[((size_t)t * m.n_slices + s) * MIX + threadIdx.x];
-        else
-            for (int s = 0; s < m.n_slices; ++s) v += m.ss_part[t * m.n_slices + s];
+        for (int s = 0; s < m.n_slices; ++s) v += m.part[((size_t)t * m.n_slices + s) * MIX + threadIdx.x];
         mixes[threadIdx.x] = v;
-    }
-    __syncthreads();
-    if (threadIdx.x < MIX) {
-        mixes[threadIdx.x] *= rsqrtf(mixes[MIX] / (float)(HC * n) + m.rms_eps);
-        if (m.mixes_out) m.mixes_out[t * MIX + threadIdx.x] = mixes[threadIdx.x];
+        if (m.mixes_out) m.mixes_out[t * MIX + threadIdx.x] = v;
     }
     __syncthreads();
     // pre/post and the Sinkhorn on warp 0: lane k < 16 holds comb element k = dst + 4*src (llama.cpp's layout).
