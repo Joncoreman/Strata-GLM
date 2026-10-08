@@ -159,6 +159,11 @@ public:
     /// `routers[l]`: layer l's ffn_gate_inp as BF16 bits, n_expert rows of n_embd.
     bool start(std::vector<std::vector<uint16_t>> routers, int64_t n_embd, int64_t n_expert, int k, ExpertSource* src,
                std::string& err);
+    /// glm5-next (2026-10-08): F32 routers (empty for the dense layers) chosen as llama.cpp does, by sigmoid(logit) +
+    /// exp_probs_b; the predicted experts are READ into the source's stage buffers (`prefetch`, which works with the
+    /// unbuffered reads) when the source does not warm pages.
+    bool start_f32(std::vector<std::vector<float>> routers, std::vector<std::vector<float>> bias, int64_t n_embd,
+                   int64_t n_expert, int k, ExpertSource* src, std::string& err);
     /// Layer `layer`'s MoE input for `n_tok` tokens (host floats): predict and warm layer + 1.  Never waits: a
     /// prediction still running for an earlier layer makes this one skip.
     void submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res);
@@ -169,6 +174,15 @@ public:
 private:
     void run();
     std::vector<std::vector<uint16_t>> routers_;
+    std::vector<std::vector<float>> bias_f_;   ///< start_f32 (glm5); an empty routers_[l] = a dense layer
+    int64_t n_layers_ = 0;
+    void read_loop();                          ///< start_f32 on unbuffered reads: prefetch on its own thread
+    std::thread reader_;
+    std::mutex rd_mu_;
+    std::condition_variable rd_cv_;
+    bool rd_pending_ = false;
+    int64_t rd_layer_ = -1;
+    std::vector<int64_t> rd_want_;
     int64_t n_embd_ = 0, n_expert_ = 0;
     int k_ = 10;
     ExpertSource* src_ = nullptr;

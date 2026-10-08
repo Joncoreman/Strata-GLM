@@ -3478,7 +3478,36 @@ int main(int argc, char** argv) {
     // input predicts its experts and their pages are warmed meanwhile.  It only warms pages; STRATA_LOOKAHEAD=0 is
     // the A/B arm, STRATA_LOOKAHEAD_K the experts per token (default 10).
     strata::core::RouterLookahead lookahead;
-    if (srcp == &src && src.warms() && [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
+    // glm5-next: F32 routers (none on the dense layers 0-2), sigmoid + exp_probs_b; the predicted file-tier experts are
+    // read into the stage buffers ahead of the CPU (the unbuffered reads cannot warm pages).  Opt-in, STRATA_LOOKAHEAD=1:
+    // measured neutral (2026-10-08, 5090 + 100 GiB RAM tier, 3 runs each: 9.60 on / 9.73 off tok/s) - a layer's CPU
+    // share takes ~1.2 ms, the next layer's misses take several ms to read, so the reads only add SSD traffic.
+    // STRATA_LOOKAHEAD_K: experts predicted per token (default 12 = top-8 and a margin)
+    if (glm5_model && srcp == &src && [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v != nullptr && std::atoi(v) != 0; }()) {
+        std::vector<std::vector<float>> routers((size_t) g.n_layers), bias((size_t) g.n_layers);
+        bool ok = true;
+        for (int64_t l = g.n_dense_layers; l < g.n_layers && ok; ++l) {
+            const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
+            const strata::core::WeightRef* b = wt.find("blk." + std::to_string(l) + ".exp_probs_b.bias");
+            ok = w != nullptr && b != nullptr && w->data != nullptr && b->data != nullptr &&
+                 w->bytes >= (uint64_t) (g.n_expert * g.n_embd) * 4 && b->bytes >= (uint64_t) g.n_expert * 4;
+            if (!ok) break;
+            routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
+            bias[(size_t) l].resize((size_t) g.n_expert);
+            ok = cudaMemcpy(routers[(size_t) l].data(), w->data, routers[(size_t) l].size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                 cudaMemcpy(bias[(size_t) l].data(), b->data, bias[(size_t) l].size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+        }
+        const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
+        if (ok && lookahead.start_f32(std::move(routers), std::move(bias), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 12, &src, err)) {
+            drive.d.lookahead = &lookahead;
+            std::fprintf(stderr, "strata generate: glm5 routing-aware prefetch of the file tier on (the next layer's router, %s)\n",
+                         src.warms() ? "warming pages" : "reading into the stage buffers");
+        } else {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "strata generate: glm5 routing-aware prefetch off (%s)\n", ok ? err.c_str() : "a router is missing");
+            err.clear();
+        }
+    } else if (srcp == &src && src.warms() && [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
         for (int64_t l = 0; l < g.n_layers && ok; ++l) {

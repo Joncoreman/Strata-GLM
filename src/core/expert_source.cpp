@@ -1076,6 +1076,12 @@ RouterLookahead::~RouterLookahead() {
     }
     cv_.notify_all();
     if (thread_.joinable()) thread_.join();
+    {
+        std::lock_guard<std::mutex> lk(rd_mu_);
+        quit_ = true;
+    }
+    rd_cv_.notify_all();
+    if (reader_.joinable()) reader_.join();
 }
 
 bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t n_embd, int64_t n_expert, int k,
@@ -1085,6 +1091,7 @@ bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t 
     for (const auto& r : routers)
         if (r.size() != (size_t) (n_embd * n_expert)) { err = "RouterLookahead: a router of another shape"; return false; }
     routers_ = std::move(routers);
+    n_layers_ = (int64_t) routers_.size();
     n_embd_ = n_embd;
     n_expert_ = n_expert;
     k_ = k < 1 ? 1 : k > (int) n_expert ? (int) n_expert : k;
@@ -1094,8 +1101,56 @@ bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t 
     return true;
 }
 
+bool RouterLookahead::start_f32(std::vector<std::vector<float>> routers, std::vector<std::vector<float>> bias,
+                                int64_t n_embd, int64_t n_expert, int k, ExpertSource* src, std::string& err) {
+    if (src == nullptr) { err = "RouterLookahead: no expert source"; return false; }
+    if (routers.size() != bias.size()) { err = "RouterLookahead: routers and biases differ in count"; return false; }
+    for (size_t l = 0; l < routers.size(); ++l)
+        if (!routers[l].empty() && (routers[l].size() != (size_t) (n_embd * n_expert) || bias[l].size() != (size_t) n_expert)) {
+            err = "RouterLookahead: a router of another shape";
+            return false;
+        }
+    // the prediction only ranks experts: BF16 copies of the F32 routers take the fast multi-token BF16 dot
+    routers_.assign(routers.size(), {});
+    for (size_t l = 0; l < routers.size(); ++l) {
+        routers_[l].resize(routers[l].size());
+        for (size_t i = 0; i < routers[l].size(); ++i) {
+            uint32_t u;
+            std::memcpy(&u, &routers[l][i], 4);
+            routers_[l][i] = (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);   // round to nearest even
+        }
+    }
+    bias_f_ = std::move(bias);
+    n_layers_ = (int64_t) routers_.size();
+    n_embd_ = n_embd;
+    n_expert_ = n_expert;
+    k_ = k < 1 ? 1 : k > (int) n_expert ? (int) n_expert : k;
+    src_ = src;
+    x_.assign((size_t) (8 * n_embd), 0.f);
+    if (!src->warms()) reader_ = std::thread([this] { read_loop(); });
+    thread_ = std::thread([this] { run(); });
+    return true;
+}
+
+void RouterLookahead::read_loop() {
+    std::vector<int64_t> want;
+    for (;;) {
+        int64_t layer;
+        {
+            std::unique_lock<std::mutex> lk(rd_mu_);
+            rd_cv_.wait(lk, [&] { return quit_ || rd_pending_; });
+            if (quit_) return;
+            rd_pending_ = false;
+            layer = rd_layer_;
+            want.swap(rd_want_);
+        }
+        src_->prefetch(layer, want.data(), (int64_t) want.size());
+    }
+}
+
 void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res) {
-    if (layer + 1 >= (int64_t) routers_.size() || n_tok <= 0 || x == nullptr) return;
+    if (layer + 1 >= n_layers_ || n_tok <= 0 || x == nullptr) return;
+    if (routers_[(size_t) (layer + 1)].empty()) return;   // glm5: a dense layer has no router
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (busy_ || pending_) { skipped_.fetch_add(1, std::memory_order_relaxed); return; }
@@ -1129,6 +1184,14 @@ void RouterLookahead::run() {
         want.clear();
         strata::kernels::cpu::bf16_rows_dot_multi(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
                                                   x_.data(), (int) nt, logits.data());
+        if (!bias_f_.empty()) {   // glm5: the selection score sigmoid(logit) + exp_probs_b
+            const float* b = bias_f_[(size_t) layer].data();
+            for (int64_t t = 0; t < nt; ++t)
+                for (int64_t e = 0; e < n_expert_; ++e) {
+                    float& v = logits[(size_t) (t * n_expert_ + e)];
+                    v = 1.0f / (1.0f + std::exp(-v)) + b[e];
+                }
+        }
         for (int64_t t = 0; t < nt; ++t) {
             const float* lt = logits.data() + (size_t) (t * n_expert_);
             for (int64_t e = 0; e < n_expert_; ++e) order[(size_t) e] = (int32_t) e;
@@ -1140,7 +1203,17 @@ void RouterLookahead::run() {
                 if (std::find(want.begin(), want.end(), e) == want.end()) want.push_back(e);
             }
         }
-        src_->warm(layer, want.data(), (int64_t) want.size());
+        if (src_->warms()) {
+            src_->warm(layer, want.data(), (int64_t) want.size());
+        } else {   // start_f32 on unbuffered reads: the reader thread reads them (the newest layer replaces a waiting one)
+            {
+                std::lock_guard<std::mutex> lk(rd_mu_);
+                rd_layer_ = layer;
+                rd_want_ = want;
+                rd_pending_ = true;
+            }
+            rd_cv_.notify_one();
+        }
         predicted_.fetch_add((int64_t) want.size(), std::memory_order_relaxed);
         busy_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
                            std::memory_order_relaxed);
