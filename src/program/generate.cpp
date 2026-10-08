@@ -6459,7 +6459,7 @@ int main(int argc, char** argv) {
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
     std::vector<std::pair<int32_t, int32_t>> lent;     // (residency index, slot) lent to the prompt path
     const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
-    if (o.prefill_chunk > 0 && n_prompt > 1) {
+    if (o.prefill_chunk > 0 && n_prompt > 1 && !glm5_model) {   // glm5-next: the prompt runs as verify windows below
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
@@ -6785,7 +6785,7 @@ int main(int argc, char** argv) {
     // round emits (accepted drafts + 1) tokens.  `commit` keeps the state of the tokens that were emitted.
     const bool ended = o.stop_eos && !produced.empty() &&
                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) produced.back()) != o.eos_ids.end();
-    if (spec_pos > 0 && (int64_t) produced.size() < o.max_new && !ended) {
+    if ((spec_pos > 0 || (glm5_model && native_pack)) && (int64_t) produced.size() < o.max_new && !ended) {
         std::vector<int64_t> oracle;
         if (!o.spec_oracle.empty()) {
             std::ifstream in(o.spec_oracle);
@@ -6938,6 +6938,25 @@ int main(int argc, char** argv) {
         };
         int64_t p = spec_pos;
         int32_t x = (int32_t) tok;
+        if (glm5_model) {   // glm5-next: no prompt path yet - the prompt's positions [0, n_prompt - 1) as verify windows
+            const int64_t np = n_prompt - 1;
+            std::vector<int32_t> pw((size_t) o.spec), po((size_t) o.spec);
+            const Clock::time_point tg = Clock::now();
+            for (int64_t q = 0; q < np;) {
+                const int T = (int) std::min<int64_t>(o.spec, np - q);
+                for (int t = 0; t < T; ++t) pw[(size_t) t] = (int32_t) o.tokens[(size_t) (q + t)];
+                if (!ver.run(T, pw.data(), q, &drive_pool_multi, &drive, po.data(), err) || !ver.commit(T, err) ||
+                    !ver.wait_commit(err)) {
+                    std::fprintf(stderr, "strata generate: glm5 prompt window at %lld: %s\n", (long long) q, err.c_str());
+                    return 1;
+                }
+                q += T;
+            }
+            std::fprintf(stderr, "strata generate: glm5 prompt %lld tokens as verify windows, %.1f ms\n", (long long) np,
+                         std::chrono::duration<double, std::milli>(Clock::now() - tg).count());
+            p = np;
+            x = (int32_t) o.tokens[(size_t) np];
+        }
         std::vector<int32_t> drafts((size_t) o.spec, 0);
         std::vector<float> dprob((size_t) o.spec, 1.0f);
         std::vector<int64_t> window_hist((size_t) o.spec + 1, 0);

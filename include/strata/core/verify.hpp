@@ -195,6 +195,14 @@ private:
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
+    // glm5-next (GLM-5.3-Flash): src/core/verify_glm5.cpp.  Its own per-layer state and scratch, the shared
+    // staging / doorbell / expert plan / head machinery of this class.
+    struct Glm5;
+    Glm5* glm_ = nullptr;
+    bool init_glm5(std::string& err);
+    bool record_window_glm5(int T, cudaStream_t cs, std::string& err);
+    bool capture_commit_glm5(std::string& err);
+    void free_glm5();
     static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second
                                       // half's up-stamp at slot 32 = the next layer's slot 0: D8)
     bool prof_on_ = false;
