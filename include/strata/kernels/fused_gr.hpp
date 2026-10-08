@@ -62,4 +62,42 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
 void fused_gr_check();
 int fused_gr_variant();
 
+// ---- glm5-next (GLM-5.3-Flash) mHC: src/kernels/cuda/fused_mhc.cu ------------------------------------------------
+// The same read/write contract as above for GLM's hyper-connection: one RMS over the 4 concatenated streams, a Q8_0
+// [24 x 4*n_embd] projection, pre/post (sigmoid) and comb (Sinkhorn), block input = sum_h pre[h] * R'[h], then the
+// block's own RMSNorm (attn_norm / ffn_norm).  The previous half's write R' = out*post[d] + sum_s comb[d,s]*R[s] is
+// folded in (apply).  Weights are read once for all n_tok (<= kFusedGrMaxT) tokens.  `post_out`/`comb_out` are the
+// coefficients the NEXT read folds: ping-pong them like `inject` (the next read's *_prev must not be this *_out).
+struct MhcMulti {
+    const float* R[kFusedGrMaxT] = {};   ///< token t's streams [4][n_embd]
+    float* R_out[kFusedGrMaxT] = {};     ///< R' (when apply); may equal R
+    bool apply = false;
+    const float* out_prev[kFusedGrMaxT] = {};   ///< previous half's block output [n_embd]
+    const float* post_prev = nullptr;    ///< [n_tok][4]
+    const float* comb_prev = nullptr;    ///< [n_tok][dst*4 + src]
+    const void* fn = nullptr;            ///< hc_*_fn, Q8_0 rows of 4*n_embd; device
+    const float* scale = nullptr;        ///< hc_*_scale [3]
+    const float* base = nullptr;         ///< hc_*_base [24]
+    const float* w_norm = nullptr;       ///< attn_norm / ffn_norm [n_embd]
+    float* y[kFusedGrMaxT] = {};         ///< out: normed block input [n_embd]
+    float* post_out = nullptr;           ///< out [n_tok][4]
+    float* comb_out = nullptr;           ///< out [n_tok][16]
+    float* part = nullptr;               ///< workspace [n_tok][n_slices][24]
+    float* ss_part = nullptr;            ///< workspace [n_tok][n_slices]
+    float* pre_out = nullptr;            ///< optional [n_tok][4] (tests)
+    float* mixes_out = nullptr;          ///< optional [n_tok][24] (tests)
+    int n_tok = 0, n_embd = 0, n_slices = 0;   ///< n_slices = fused_mhc_slices(n_embd)
+    float rms_eps = 1e-5f, hc_eps = 1e-6f;     ///< from the GGUF: layer_norm_rms_epsilon, hyper_connection.epsilon
+    int iters = 20;                            ///< hyper_connection.sinkhorn_iterations
+};
+
+bool fused_mhc_supported(int64_t n_embd, int64_t hc, int64_t mix_rows);
+int fused_mhc_slices(int64_t n_embd);
+/// Two kernels: the split projection (+ folded write) and the per-token epilogue (Sinkhorn, R', block norm).
+void fused_mhc_read_multi(const MhcMulti& m, void* stream);
+/// The last layer's write (nothing to fold it into): R_out = R'.  Uses R, R_out, out_prev, post_prev, comb_prev.
+void fused_mhc_write_multi(const MhcMulti& m, void* stream);
+/// The exit: y = mean of the 4 streams of R (then output_norm).
+void fused_mhc_exit_mean(const MhcMulti& m, void* stream);
+
 }  // namespace strata::kernels
