@@ -7,6 +7,7 @@ set NVCC="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\nvcc.exe"
 set R=%~dp0
 if not exist "%R%build-glm-gpu" mkdir "%R%build-glm-gpu"
 call :one glm5_mhc_test fused_mhc || exit /b 1
+call :one glm5_router_test router_top10 || exit /b 1
 exit /b 0
 
 :one

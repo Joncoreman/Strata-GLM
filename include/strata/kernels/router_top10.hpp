@@ -23,4 +23,10 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
 bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
                           void* stream, int variant);
 
+/// glm5-next (GLM-5.3-Flash): sigmoid gating, `bias` (exp_probs_b, n_expert f32 or null) added for the CHOICE only,
+/// weights = the chosen unbiased sigmoids / their sum (clamped at 2^-14) * w_scale (expert_weights_scale).  Same
+/// selection rule as router_top10 (descending, ties to the lower index).  Never synchronises (graph-capturable).
+void router_sigmoid_topk(const float* logits, const float* bias, int n_tokens, int n_expert, int k, float w_scale,
+                         int* ids, float* weights, void* stream);
+
 }  // namespace strata::kernels

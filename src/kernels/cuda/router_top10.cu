@@ -326,7 +326,100 @@ void launch_generic(const float* logits, int n_tokens, int n_expert, int k, int*
 }
 #endif
 
+// ---- glm5-next (GLM-5.3-Flash): sigmoid gating with a selection-only bias (DeepSeek-V3 style), llama.cpp b11461
+// llama-graph.cpp:2096-2201: p = sigmoid(logit); choose the top k of p + exp_probs_b; the weights are the chosen
+// UNBIASED p, divided by their sum (clamped at 2^-14), times w_scale (expert_weights_scale, 2.5).  The selection is
+// router_top10_kernel's: k passes of a block argmax, ties to the lower index.
+__global__ void router_sigmoid_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int n_tokens,
+                                      int n_expert, int k, float w_scale, int* __restrict__ ids,
+                                      float* __restrict__ weights) {
+    extern __shared__ unsigned char s_raw[];
+    const size_t taken_bytes = ((size_t) n_expert + 15u) & ~(size_t) 15u;
+    unsigned char* s_taken = s_raw;
+    float* s_p = (float*) (s_raw + taken_bytes);      // unbiased sigmoid
+    float* s_sel = s_p + n_expert;                    // p + bias: what is ranked
+    __shared__ float s_red[RT_MAX_THREADS / 32];
+    __shared__ int s_rid[RT_MAX_THREADS / 32];
+
+    const int t = blockIdx.x;
+    if (t >= n_tokens) return;
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    const float* l = logits + (size_t) t * n_expert;
+    for (int e = tid; e < n_expert; e += nt) {
+        const float p = 1.0f / (1.0f + expf(-l[e]));   // ggml's sigmoid
+        s_p[e] = p;
+        s_sel[e] = bias ? p + bias[e] : p;
+        s_taken[e] = 0;
+    }
+    __syncthreads();
+
+    for (int i = 0; i < k; ++i) {
+        float bv = -INFINITY;
+        int bi = n_expert;
+        for (int e = tid; e < n_expert; e += nt) {
+            if (s_taken[e]) continue;
+            const float pe = s_sel[e];
+            if (pe > bv) { bv = pe; bi = e; }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+            const int oi = __shfl_down_sync(0xffffffffu, bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if ((tid & 31) == 0) { s_red[tid >> 5] = bv; s_rid[tid >> 5] = bi; }
+        __syncthreads();
+        if (tid < 32) {
+            const int nw = (nt + 31) >> 5;
+            float v = (tid < nw) ? s_red[tid] : -INFINITY;
+            int ix = (tid < nw) ? s_rid[tid] : n_expert;
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_down_sync(0xffffffffu, v, off);
+                const int oi = __shfl_down_sync(0xffffffffu, ix, off);
+                if (ov > v || (ov == v && oi < ix)) { v = ov; ix = oi; }
+            }
+            if (tid == 0 && ix < n_expert) {
+                ids[(size_t) t * k + i] = ix;
+                weights[(size_t) t * k + i] = s_p[ix];
+                s_taken[ix] = 1;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {   // ggml: sum_rows (float), clamp, div, scale
+        float s = 0.f;
+        for (int i = 0; i < k; ++i) s += weights[(size_t) t * k + i];
+        const float sc = fmaxf(s, 6.103515625e-05f);
+        for (int i = 0; i < k; ++i) {
+            float w = weights[(size_t) t * k + i] / sc;
+            if (w_scale != 0.f && w_scale != 1.f) w *= w_scale;
+            weights[(size_t) t * k + i] = w;
+        }
+    }
+}
+
 }  // namespace
+
+void router_sigmoid_topk(const float* logits, const float* bias, int n_tokens, int n_expert, int k, float w_scale,
+                         int* ids, float* weights, void* stream) {
+    if (n_tokens <= 0 || n_expert <= 0 || k <= 0) return;
+    if (k > 64 || n_expert > RT_MAX_THREADS * 64) {
+        std::fprintf(stderr, "router_sigmoid_topk: n_expert %d / k %d out of range\n", n_expert, k);
+        std::exit(1);
+    }
+    int threads = n_expert < RT_MAX_THREADS ? n_expert : RT_MAX_THREADS;
+    threads = (threads + 31) & ~31;
+    const size_t taken_bytes = ((size_t) n_expert + 15u) & ~(size_t) 15u;
+    const size_t smem = taken_bytes + 2 * (size_t) n_expert * sizeof(float);
+    router_sigmoid_kernel<<<(unsigned) n_tokens, threads, smem, (cudaStream_t) stream>>>(
+        logits, bias, n_tokens, n_expert, k, w_scale, ids, weights);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "router_sigmoid_topk launch: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
 
 bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
                           void* stream, int variant) {
