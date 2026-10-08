@@ -48,6 +48,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/glm5_mtp.hpp"
 #include "strata/core/remote_stage.hpp"
 #include <memory>
 #include "strata/core/mtp.hpp"
@@ -6974,9 +6975,16 @@ int main(int argc, char** argv) {
         };
         int64_t p = spec_pos;
         int32_t x = (int32_t) tok;
+        // glm5-next MTP (STRATA_GLM5_MTP=1, 2026-10-08): the NextN layer drafts o.spec - 1 tokens per round
+        strata::core::Glm5Mtp gmtp;
+        const bool gmtp_on = glm5_model && std::getenv("STRATA_GLM5_MTP") != nullptr && std::atoi(std::getenv("STRATA_GLM5_MTP")) != 0;
+        if (gmtp_on && !gmtp.init(wt, g, native_head.loaded() ? &native_head : nullptr, o.max_context, o.spec, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
         if (prompt_windows) {   // glm5-next: no prompt path yet - the prompt's positions [0, n_prompt - 1) as verify windows
             const int64_t np = n_prompt - 1;
-            std::vector<int32_t> pw((size_t) o.spec), po((size_t) o.spec);
+            std::vector<int32_t> pw((size_t) o.spec), po((size_t) o.spec), nx((size_t) o.spec);
             const Clock::time_point tg = Clock::now();
             for (int64_t q = 0; q < np;) {
                 const int T = (int) std::min<int64_t>(o.spec, np - q);
@@ -6985,6 +6993,13 @@ int main(int argc, char** argv) {
                     !ver.wait_commit(err)) {
                     std::fprintf(stderr, "strata generate: glm5 prompt window at %lld: %s\n", (long long) q, err.c_str());
                     return 1;
+                }
+                if (gmtp_on) {   // the drafter's cache over these cells: h at q + t with the token at q + t + 1
+                    for (int t = 0; t < T; ++t) nx[(size_t) t] = (int32_t) o.tokens[(size_t) (q + t + 1)];
+                    if (!gmtp.catchup(ver.glm5_h(), nx.data(), T, q, -1, nullptr, err)) {
+                        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                        return 1;
+                    }
                 }
                 q += T;
             }
@@ -7027,7 +7042,7 @@ int main(int argc, char** argv) {
                 while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
             }
             if (first_window) T = 1;
-            if (prompt_windows && !use_mtp) T = 1;   // glm5-next without a drafter: wider windows would only verify zeros
+            if (prompt_windows && !use_mtp && !gmtp_on) T = 1;   // glm5-next without a drafter: wider windows would only verify zeros
             bool from_sfx = false;
             int sfx_match = 0;
             if (o.suffix_draft > 0 && !first_window) {
@@ -7047,7 +7062,7 @@ int main(int argc, char** argv) {
             window[0] = x;
             for (int i = 1; i < T; ++i) {
                 const size_t at = produced.size() - 1 + (size_t) i;
-                int32_t d = from_sfx ? sbuf[(size_t) i - 1] : use_mtp ? drafts[(size_t) i - 1]
+                int32_t d = from_sfx ? sbuf[(size_t) i - 1] : (use_mtp || gmtp_on) ? drafts[(size_t) i - 1]
                                                     : at < oracle.size() ? (int32_t) oracle[at] : 0;
                 if (o.spec_corrupt > 0 && (++corrupt_counter % o.spec_corrupt) == 0) d = (d + 1) % (int32_t) n_vocab;
                 window[(size_t) i] = d;
@@ -7112,8 +7127,15 @@ int main(int argc, char** argv) {
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
-            const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
-                                 mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+            bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
+                           mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+            if (gmtp_on && drafted && (int64_t) produced.size() < o.max_new) {
+                // the accepted rows 0..a (h at p + t, the token at p + t + 1) into the drafter's cache; row a drafts
+                int32_t d1 = 0;
+                drafted = gmtp.catchup(ver.glm5_h(), outv.data(), a + 1, p, a, &d1, err) &&
+                          gmtp.chain(d1, p + a, o.spec - 2, drafts.data() + 1, err);
+                drafts[0] = d1;
+            }
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
             if (!drafted) {
@@ -7149,6 +7171,9 @@ int main(int argc, char** argv) {
                     "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,
                     drafts_total > 0 ? (double) drafts_ok / (double) drafts_total : 0.0,
                     rounds > 0 ? (double) (drafts_ok + rounds) / (double) rounds : 0.0);
+        if (gmtp_on && rounds > 0)
+            std::printf("%-24s %.3f ms/round drafting (catch-up + chain, %lld chains)\n", "glm5 mtp",
+                        gmtp.ms_draft / (double) rounds, (long long) gmtp.rounds);
         if (o.spec_min_p > 0.0) {
             std::printf("%-24s", "window sizes");
             for (size_t i = 1; i < window_hist.size(); ++i) std::printf(" T%zu:%lld", i, (long long) window_hist[i]);
