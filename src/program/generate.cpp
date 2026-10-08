@@ -6453,13 +6453,16 @@ int main(int argc, char** argv) {
     // then starts at the last prompt position, whose prediction is the first generated token.
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
+    // glm5-next (no prompt path yet), or STRATA_PROMPT_WINDOWS=1 (any native pack, a comparison knob): the prompt runs
+    // as teacher-forced verify windows and a window without a drafter is one token wide
+    const bool prompt_windows = native_pack && (glm5_model || std::getenv("STRATA_PROMPT_WINDOWS") != nullptr);
     strata::prefill::Prefill prefill;
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
     std::vector<std::pair<int32_t, int32_t>> lent;     // (residency index, slot) lent to the prompt path
     const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
-    if (o.prefill_chunk > 0 && n_prompt > 1 && !glm5_model) {   // glm5-next: the prompt runs as verify windows below
+    if (o.prefill_chunk > 0 && n_prompt > 1 && !prompt_windows) {   // prompt_windows: the prompt runs as verify windows below
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
@@ -6785,7 +6788,7 @@ int main(int argc, char** argv) {
     // round emits (accepted drafts + 1) tokens.  `commit` keeps the state of the tokens that were emitted.
     const bool ended = o.stop_eos && !produced.empty() &&
                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) produced.back()) != o.eos_ids.end();
-    if ((spec_pos > 0 || (glm5_model && native_pack)) && (int64_t) produced.size() < o.max_new && !ended) {
+    if ((spec_pos > 0 || prompt_windows) && (int64_t) produced.size() < o.max_new && !ended) {
         std::vector<int64_t> oracle;
         if (!o.spec_oracle.empty()) {
             std::ifstream in(o.spec_oracle);
@@ -6942,7 +6945,7 @@ int main(int argc, char** argv) {
         };
         int64_t p = spec_pos;
         int32_t x = (int32_t) tok;
-        if (glm5_model) {   // glm5-next: no prompt path yet - the prompt's positions [0, n_prompt - 1) as verify windows
+        if (prompt_windows) {   // glm5-next: no prompt path yet - the prompt's positions [0, n_prompt - 1) as verify windows
             const int64_t np = n_prompt - 1;
             std::vector<int32_t> pw((size_t) o.spec), po((size_t) o.spec);
             const Clock::time_point tg = Clock::now();
@@ -6995,7 +6998,7 @@ int main(int argc, char** argv) {
                 while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
             }
             if (first_window) T = 1;
-            if (glm5_model && !use_mtp) T = 1;   // glm5-next without a drafter: wider windows would only verify zeros
+            if (prompt_windows && !use_mtp) T = 1;   // glm5-next without a drafter: wider windows would only verify zeros
             bool from_sfx = false;
             int sfx_match = 0;
             if (o.suffix_draft > 0 && !first_window) {
