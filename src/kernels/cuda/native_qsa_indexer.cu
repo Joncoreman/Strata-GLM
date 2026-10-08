@@ -223,6 +223,112 @@ bool overlaps(Span a, Span b) {
 }
 } // namespace
 
+// ---- glm5-next k-pool (see the header) ------------------------------------------------------------------------
+namespace {
+constexpr int KD = 128;   // indexer head size
+constexpr int KP = 4;     // cells per pool
+constexpr int KH = 32;    // indexer heads
+
+__global__ void __launch_bounds__(KD) glm5_kpool_append_kernel(const float* __restrict__ raw_k, const float* __restrict__ gate,
+                                                               const int32_t* __restrict__ pos, const float* __restrict__ kw,
+                                                               const float* __restrict__ kb, const float* __restrict__ ape,
+                                                               float eps, float* __restrict__ tail,
+                                                               float* __restrict__ pooled, int64_t max_cells,
+                                                               float* __restrict__ key_out) {
+    __shared__ float red[KD / 32];
+    const int d = threadIdx.x, lane = d & 31, w = d >> 5;
+    const int cell = *pos;
+    if (cell < 0 || cell >= max_cells) return;
+    // LayerNorm (ggml_norm: mean, then mean of squares of the centred values), then * weight + bias
+    const float x = raw_k[d];
+    float s = x;
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    if (lane == 0) red[w] = s;
+    __syncthreads();
+    const float mean = (red[0] + red[1] + red[2] + red[3]) / (float) KD;
+    __syncthreads();
+    const float xc = x - mean;
+    float v = xc * xc;
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if (lane == 0) red[w] = v;
+    __syncthreads();
+    const float var = (red[0] + red[1] + red[2] + red[3]) / (float) KD;
+    const float key = xc * (1.0f / sqrtf(var + eps)) * kw[d] + kb[d];
+    const float g = gate[d];
+    if (key_out) key_out[d] = key;
+    const int slot = cell % KP;
+    if (slot < KP - 1) {
+        tail[slot * 2 * KD + d] = key;
+        tail[slot * 2 * KD + KD + d] = g;
+        return;
+    }
+    // the block completes: softmax over the 4 members per channel (ggml_soft_max: max, exp, sum, scale)
+    float lg[KP], kj[KP];
+#pragma unroll
+    for (int j = 0; j < KP - 1; ++j) { kj[j] = tail[j * 2 * KD + d]; lg[j] = tail[j * 2 * KD + KD + d] + ape[j * KD + d]; }
+    kj[KP - 1] = key; lg[KP - 1] = g + ape[(KP - 1) * KD + d];
+    float mx = lg[0];
+#pragma unroll
+    for (int j = 1; j < KP; ++j) mx = fmaxf(mx, lg[j]);
+    float sum = 0.f;
+#pragma unroll
+    for (int j = 0; j < KP; ++j) { lg[j] = expf(lg[j] - mx); sum += lg[j]; }
+    const float inv = 1.0f / sum;
+    float p = 0.f;
+#pragma unroll
+    for (int j = 0; j < KP; ++j) p += (lg[j] * inv) * kj[j];   // ggml_sum_rows(probs * pk), j ascending
+    pooled[(size_t) (cell / KP) * KD + d] = p;
+}
+
+// one warp per block: each lane holds 4 of the 128 pooled values; the query heads come from shared memory
+__global__ void __launch_bounds__(256) glm5_kpool_scores_kernel(const float* __restrict__ q, const float* __restrict__ w,
+                                                                 const float* __restrict__ pooled,
+                                                                 const int32_t* __restrict__ steps, int64_t max_blocks,
+                                                                 float* __restrict__ scores) {
+    __shared__ float sq[KH][KD];
+    __shared__ float sw[KH];
+    const int qi = blockIdx.y;
+    q += (size_t) qi * KH * KD;
+    w += (size_t) qi * KH;
+    scores += (size_t) qi * max_blocks;
+    const int n_bid = steps[(size_t) qi * kStepCount + kStepNBid];
+    for (int i = threadIdx.x; i < KH * KD; i += blockDim.x) sq[i / KD][i % KD] = q[i];
+    if (threadIdx.x < KH) sw[threadIdx.x] = w[threadIdx.x];
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int b = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
+    if (b > n_bid || b >= max_blocks) return;
+    if (b == n_bid) { if (lane == 0) scores[b] = kGlm5TailScore; return; }
+    const float4 k4 = *reinterpret_cast<const float4*>(pooled + (size_t) b * KD + lane * 4);
+    float acc = 0.f;
+#pragma unroll 4
+    for (int h = 0; h < KH; ++h) {
+        const float4 q4 = *reinterpret_cast<const float4*>(&sq[h][lane * 4]);
+        float s = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        acc = fmaf(fmaxf(s, 0.f), sw[h], acc);
+    }
+    if (lane == 0) scores[b] = acc;
+}
+}  // namespace
+
+void glm5_kpool_append(const float* raw_k, const float* gate, const int32_t* relative_pos_device, const float* k_norm,
+                       const float* k_norm_b, const float* ape, float epsilon, const Glm5KpoolBuffers& b,
+                       int64_t max_cells, void* stream, float* key_out) {
+    if (!raw_k || !gate || !relative_pos_device || !k_norm || !k_norm_b || !ape || !b.tail || !b.pooled || !stream)
+        throw std::invalid_argument("glm5_kpool_append: missing buffer or stream");
+    glm5_kpool_append_kernel<<<1, KD, 0, (cudaStream_t) stream>>>(raw_k, gate, relative_pos_device, k_norm, k_norm_b,
+                                                                  ape, epsilon, b.tail, b.pooled, max_cells, key_out);
+}
+
+void glm5_kpool_scores(const float* q, const float* w, const float* pooled, const int32_t* steps, int64_t nq,
+                       int64_t max_blocks, float* scores, void* stream) {
+    if (!q || !w || !pooled || !steps || !scores || nq <= 0 || max_blocks <= 0 || !stream)
+        throw std::invalid_argument("glm5_kpool_scores: missing buffer or stream");
+    const dim3 grid((unsigned) ((max_blocks + 7) / 8), (unsigned) nq);
+    glm5_kpool_scores_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(q, w, pooled, steps, max_blocks, scores);
+}
+
 void native_qsa_indexer_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_qsa_indexer_enabled() { return enabled.load(std::memory_order_relaxed); }
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device, int32_t pos_base,

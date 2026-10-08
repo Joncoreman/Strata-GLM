@@ -12,6 +12,7 @@ call :one glm5_router_test "%K%\router_top10.cu" || exit /b 1
 call :one glm5_ffn_test "%K%\shared_expert.cu" "%K%\native_mmvq.cu" "%K%\iq_kernels.cu" "%K%\native_bf16.cu" "%K%\quantize_act.cu" "%K%\s_gemv.cu" "%K%\s2_gemv_q8.cu" || exit /b 1
 call :one glm5_kda_test "%K%\verify_kernels.cu" || exit /b 1
 call :one glm5_mla_test "%K%\qsa_decode_attn.cu" || exit /b 1
+call :one glm5_kpool_test "%K%\native_qsa_indexer.cu" "%K%\native_rope.cu" || exit /b 1
 exit /b 0
 
 :one

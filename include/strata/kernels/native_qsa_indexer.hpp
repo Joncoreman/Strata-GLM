@@ -43,4 +43,24 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
                                const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
                                int64_t max_cells, const RopeScaling& scaling, void* stream);
 
+// ---- glm5-next (GLM-5.3-Flash) k-pool indexer (llama.cpp b11461 glm5-next.cpp:756-859) -------------------------
+// Per cell: key = LayerNorm(indexer.attn_k x) * k_norm + k_norm_b (mean-centred, eps layer_norm_epsilon) and gate =
+// indexer_compressor_gate x, 128 each.  The first three cells of a block wait in `tail` (key | gate, 3 x 256 floats);
+// the fourth completes the block: pooled[b][d] = sum_j softmax_j(gate_j[d] + ape[j][d]) * key_j[d] (no norm, no RoPE).
+// The score of block b for a query: sum_h w_h * relu(q_h . pooled[b]) with w = indexer_proj(x) / sqrt(128 * 32)
+// (the caller scales), q = indexer_attn_q_b(qr) [32 x 128].  The incomplete tail block n_bid gets kGlm5TailScore so the
+// selection (qsa_block_topk) always keeps it; selection width 4 * min(n_bid, 512) + (n_kv - 4 * n_bid).
+struct Glm5KpoolBuffers {
+    float* tail = nullptr;     ///< [3][2 * 128] key | gate of the block's first three cells
+    float* pooled = nullptr;   ///< [max_cells / 4 + 1][128]
+};
+inline constexpr float kGlm5TailScore = 1.0e30f;
+/// raw_k, gate: [128] each for the cell at *relative_pos_device (kStepPos).  Capturable; no allocation.
+void glm5_kpool_append(const float* raw_k, const float* gate, const int32_t* relative_pos_device, const float* k_norm,
+                       const float* k_norm_b, const float* ape, float epsilon, const Glm5KpoolBuffers& b,
+                       int64_t max_cells, void* stream, float* key_out = nullptr);
+/// scores [nq][max_blocks] for blocks 0..n_bid (steps[kStepNBid]); q [nq][32][128], w [nq][32].
+void glm5_kpool_scores(const float* q, const float* w, const float* pooled, const int32_t* steps, int64_t nq,
+                       int64_t max_blocks, float* scores, void* stream);
+
 } // namespace strata::kernels
