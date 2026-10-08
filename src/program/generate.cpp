@@ -1659,11 +1659,17 @@ int main(int argc, char** argv) {
         o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
     }
     strata::core::layer_set_shared_early(!o.shared_late);
+    bool glm5_model = false;   // glm5-next (GLM-5.3-Flash): no PLE, its own geometry; the decode path is being wired
     if (!o.native_preset.empty()) {
         try {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native).  A missing shard is an error
             // here: it used to be skipped, leaving a model with some tensors absent and a later error, or none.
             o.native_shards = strata::gguf_split_paths(o.native_preset);
+            {
+                strata::GgufFile head(o.native_shards.front());
+                if (const strata::MetaValue* v = head.get("general.architecture")) glm5_model = v->s == "glm5-next";
+                if (glm5_model) o.no_ple = true;   // GLM has no per-layer token embeddings
+            }
             // --ple-gguf defaults to the shard that holds the PLE table, found by name: shard 2 of the ISTA files
             // and of Unsloth's UD-Q4_K_XL, shard 1 of Swift's
             if (o.ple_gguf.empty() && !o.no_ple) {
@@ -1675,7 +1681,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --native %s: %s\n", o.native_preset.c_str(), e.what());
             return 2;
         }
-        if (o.no_ple || o.ple_gguf.empty()) {
+        if (!glm5_model && (o.no_ple || o.ple_gguf.empty())) {
             std::fprintf(stderr, "strata generate: --native requires --ple-gguf (the PLE key is native too), and no "
                                  "shard of the model holds per_layer_token_embd.weight\n");
             return 2;
@@ -1685,6 +1691,7 @@ int main(int argc, char** argv) {
         o.native_bf16 = o.native_bf16_extra = true;
         o.native_ple_key = o.native_moe_combine = o.native_gdn = o.native_router = true;
         o.native_qsa = o.native_qsa_indexer = o.native_rope = o.native_ple_postops = true;
+        if (glm5_model) o.native_ple_key = o.native_ple_postops = false;   // no PLE in GLM
         if (o.native_head_gguf.empty()) o.native_head_gguf = o.native_preset;
         if (o.native_dense_gguf.empty()) {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native), then the PLE shard: a split
@@ -1848,10 +1855,35 @@ int main(int argc, char** argv) {
     // every quantized tensor in its GGUF form, so it needs --native (the dense projections, head and embedding
     // come from the model file) and runs its experts in verify windows only (--spec).
     {
-        const strata::core::ModelGeometry g0;
-        if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
+        strata::core::ModelGeometry g0;
+        int64_t g0_layers = g0.n_layers;
+        if (glm5_model) {   // the GGUF's geometry; the expert table also has the NextN (MTP) layer: block_count
+            try {
+                strata::GgufFile head(o.native_shards.front());
+                g0 = strata::core::geometry_from_gguf(head);
+                if (const strata::MetaValue* v = head.get("glm5-next.block_count")) g0_layers = (int64_t) v->u;
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "strata generate: glm5-next geometry: %s\n", e.what());
+                return 1;
+            }
+        }
+        if (!strata::kernels::cpu::expert_layout_load(o.pack, g0_layers, g0.n_expert, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
+        }
+        if (glm5_model) {
+            // 2026-10-08: the GLM kernels exist and match llama.cpp one by one (glm-notes), but the verify window
+            // does not call them yet.  Stop here, after the model file and the expert table have been read, with
+            // what was understood, instead of running the Qwen graph on GLM weights.
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            int dense = 0;
+            for (const auto& f : lay.fmt) dense += f.gu_type < 0;
+            std::fprintf(stderr, "strata generate: glm5-next model read: n_embd %lld, %lld layers (+NextN), %lld experts "
+                                 "top-%lld, expert table v%d: %d dense layers, %.1f GB of experts. The decode path is "
+                                 "not wired yet (see glm-notes, the Phase 3 wiring work order) - stopping.\n",
+                         (long long) g0.n_embd, (long long) g0.n_layers, (long long) g0.n_expert,
+                         (long long) g0.n_expert_used, lay.version, dense, (double) lay.total / 1e9);
+            return 3;
         }
         // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
         // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
