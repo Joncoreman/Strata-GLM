@@ -276,7 +276,7 @@ struct MetaValue {
     double num() const { return (type == MetaType::F32 || type == MetaType::F64) ? f : (double)u; }
 };
 
-inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
+inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0, bool keep_all = true) {
     if (depth > 2) throw std::runtime_error("GGUF: array nesting too deep");
     MetaValue v;
     v.type = t;
@@ -324,10 +324,10 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         v.elem = (MetaType)c.read<uint32_t>();
         v.count = c.read<uint64_t>();
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
-        v.items.reserve((size_t)std::min<uint64_t>(v.count, 64));
+        v.items.reserve((size_t)(keep_all ? v.count : std::min<uint64_t>(v.count, 64)));
         for (uint64_t i = 0; i < v.count; ++i) {
-            MetaValue e = read_value(c, v.elem, depth + 1);
-            if (i < 64) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
+            MetaValue e = read_value(c, v.elem, depth + 1, keep_all);
+            if (keep_all || i < 64) v.items.push_back(std::move(e));
         }
         break;
     }
@@ -431,7 +431,10 @@ private:
         for (uint64_t i = 0; i < n_kv; ++i) {
             std::string key = c.str();
             MetaType t = (MetaType)c.read<uint32_t>();
-            meta_.emplace(std::move(key), read_value(c, t));
+            // Model arrays are per-layer contracts, not samples. Only tokenizer arrays remain sampled.
+            const bool keep_all = key.rfind("tokenizer.", 0) != 0;
+            auto value = read_value(c, t, 0, keep_all);
+            meta_.emplace(std::move(key), std::move(value));
         }
         tensors_.reserve((size_t)n_tensors);
         // GGUF has no index to arbitrate between two tensors of one name: find() is first-match, so a
@@ -570,18 +573,63 @@ private:
     std::map<std::string, std::pair<size_t, const TensorInfo*>> index_;
 };
 
-// ---- architecture guard (P1.S2). The engine is specialised to ONE model; anything else must be
-// refused with a precise error rather than silently mis-run.
+// ---- architecture guard. Acceptance describes the loading contract, not GPU execution support.
+// glm5-next is a Phase 1 CPU loading skeleton; its execution kernels are not implemented yet.
 struct Qwen4ExpGuard {
     uint32_t block_count = 48, hidden = 2560, experts = 0, experts_used = 0, head_count = 24,
              head_count_kv = 2;   // 0 = presence-only: pruned variants (GSQ-RCO Coder) legitimately ship
                                   // fewer experts than the canonical 512; the graph reads the true value
 };
 
+/// GLM requires an array (including NextN); Qwen's legacy scalar can be broadcast for callers.
+inline std::vector<int64_t> read_head_count_kv(const GgufFile& g) {
+    const auto* arch = g.get("general.architecture");
+    if (!arch || arch->type != MetaType::STRING) throw std::runtime_error("missing general.architecture");
+    const auto prefix = arch->s + ".";
+    const auto* count = g.get(prefix + "block_count");
+    const auto key = prefix + "attention.head_count_kv";
+    const auto* v = g.get(key);
+    if (!count || count->u == 0 || count->u > 4096) throw std::runtime_error("invalid " + prefix + "block_count");
+    if (!v) throw std::runtime_error("missing " + key);
+    auto integer = [&](const MetaValue& x) -> int64_t {
+        if ((x.type != MetaType::U32 && x.type != MetaType::I32 && x.type != MetaType::U64 && x.type != MetaType::I64) ||
+            x.u > uint64_t((std::numeric_limits<int32_t>::max)()))
+            throw std::runtime_error("invalid integer in " + key);
+        return int64_t(x.u);
+    };
+    if (v->type != MetaType::ARRAY) {
+        if (arch->s == "glm5-next") throw std::runtime_error(key + " must be a per-layer array");
+        return std::vector<int64_t>(size_t(count->u), integer(*v));
+    }
+    if (v->count != count->u || v->items.size() != count->u)
+        throw std::runtime_error(key + " length must equal block_count (including NextN)");
+    std::vector<int64_t> result;
+    for (const auto& item : v->items) result.push_back(integer(item));
+    return result;
+}
+
 inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& want = {}) {
     const MetaValue* arch = g.get("general.architecture");
     if (!arch) return "missing general.architecture";
-    if (arch->s != "qwen4exp") return "architecture is '" + arch->s + "', this engine requires 'qwen4exp'";
+    if (arch->s == "glm5-next") {
+        const char* required[] = {"block_count", "embedding_length", "expert_count", "expert_used_count", "attention.head_count"};
+        for (const char* suffix : required) {
+            const std::string key = std::string("glm5-next.") + suffix;
+            const auto* v = g.get(key);
+            if (!v) return "missing " + key;
+            if ((v->type != MetaType::U32 && v->type != MetaType::I32 && v->type != MetaType::U64 && v->type != MetaType::I64) ||
+                v->u == 0 || v->u > uint64_t((std::numeric_limits<int32_t>::max)())) return "invalid " + key;
+        }
+        if (g.get("glm5-next.expert_used_count")->u > g.get("glm5-next.expert_count")->u)
+            return "glm5-next.expert_used_count exceeds expert_count";
+        try {
+            for (auto heads : read_head_count_kv(g))
+                if (uint64_t(heads) > g.get("glm5-next.attention.head_count")->u)
+                    return "glm5-next.attention.head_count_kv exceeds head_count";
+        } catch (const std::exception& e) { return e.what(); }
+        return {};
+    }
+    if (arch->s != "qwen4exp") return "architecture is '" + arch->s + "', this reader requires 'qwen4exp' or 'glm5-next'";
     struct Req {
         const char* key;
         uint64_t want;

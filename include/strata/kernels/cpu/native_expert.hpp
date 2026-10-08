@@ -10,13 +10,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <algorithm>
+#include <cmath>
 
 namespace strata::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
-inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// GLM GGUF: 4096 input / 2048 expert values. Q8_K is 292 bytes per 256 values
+/// (ggml-common.h block_q8_K). Round strides up to 64 bytes for the pool's aligned token rows.
+inline constexpr size_t kNativeActBytes = ((4096 / 256 * 292 + 63) / 64) * 64; // 4672
+inline constexpr size_t kNativeHBytes = ((2048 / 256 * 292 + 63) / 64) * 64;   // 2368, holds 2336
 
 /// One layer's native expert geometry.
 struct NativeFmt {
@@ -27,12 +29,23 @@ struct NativeFmt {
     size_t up_off = 0, down_off = 0;    ///< inside the blob
     size_t bytes = 0;                   ///< the whole blob
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
+    float swiglu_limit = 0.f;          ///< opt-in clamp: 0 disables (Qwen), GLM reads 10 from its GGUF
 };
 
 /// Whether this build has the ggml-cpu path.
 bool native_experts_available() noexcept;
 /// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
-bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
+bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
+                float swiglu_limit = 0.f);
+
+/// llama.cpp ggml-cpu/ops.cpp:3614-3616: only gate's upper side is clipped; up is clipped on both sides.
+inline float native_swiglu(float gate, float up, float limit = 0.f) {
+    if (limit > 0.f) {
+        gate = std::min(gate, limit);
+        up = std::clamp(up, -limit, limit);
+    }
+    return (gate / (1.f + std::exp(-gate))) * up;
+}
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes).
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
