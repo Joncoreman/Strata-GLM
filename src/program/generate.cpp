@@ -7112,6 +7112,18 @@ int main(int argc, char** argv) {
             std::fflush(stderr);
             std::vector<int32_t> outw((size_t) strata::kernels::kVerifyMaxT);
             std::vector<uint8_t> msg;
+            // the prompt chunks (StageMsg::Prefill): this engine's experts for the chunk path
+            const int pf_stage_chunk = [] { const char* v = std::getenv("STRATA_GLM5_PREFILL"); return v ? std::atoi(v) : 1024; }();
+            strata::core::Verifier::Glm5Fetch spf;
+            spf.host_res = host_res.empty() ? nullptr : host_res.data();
+            spf.cache_base = thits.cache_base;
+            spf.slot_off = xcache.slot_offsets();
+            spf.cache_blob = (uint64_t) thits.blob;
+            spf.ctx = srcp;
+            spf.blob = [](void* c, int64_t l, int64_t e) -> const uint8_t* { return ((strata::core::ExpertSource*) c)->blob(l, e); };
+            std::vector<float> pf_in, pf_out;
+            double ms_pf = 0;
+            int64_t tok_pf = 0;
             for (;;) {
                 strata::core::StageSocket s;
                 std::string peer;
@@ -7164,12 +7176,45 @@ int main(int argc, char** argv) {
                                 if (!s.send(strata::core::StageMsg::Ok, gl_stage_out, hbytes, nullptr, 0, err)) break;
                             }
                         }
+                    } else if (type == strata::core::StageMsg::Prefill) {
+                        // a prompt chunk through [K1, K2) in one go (the head's chunked prompt path, 2026-10-08)
+                        int32_t T = 0, commit_first = 0;
+                        int64_t pos0 = 0;
+                        if (msg.size() >= 16) {
+                            std::memcpy(&T, msg.data(), 4);
+                            std::memcpy(&pos0, msg.data() + 4, 8);
+                            std::memcpy(&commit_first, msg.data() + 12, 4);
+                        }
+                        const size_t hbytes = sizeof(float) * (size_t) T * (size_t) hf;
+                        if (T < 1 || T > pf_stage_chunk || msg.size() != 16 + 4 * (size_t) T + hbytes) {
+                            fail = "a malformed Prefill";
+                        } else if (commit_first > 0 && (!ver.commit(commit_first, err) || !ver.wait_commit(err))) {
+                            fail = err;
+                        } else {
+                            const auto t0 = Clock::now();
+                            pf_in.assign((const float*) (msg.data() + 16 + 4 * (size_t) T),
+                                         (const float*) (msg.data() + 16 + 4 * (size_t) T) + (size_t) T * hf);
+                            pf_out.resize((size_t) T * hf);
+                            if (!ver.prefill_glm5((const int32_t*) (msg.data() + 16), T, pos0, pf_stage_chunk, spf, err,
+                                                  g_stage_lb, g_stage_le, pf_in.data(), pf_out.data())) {
+                                fail = err;
+                            } else {
+                                ms_pf += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                                tok_pf += T;
+                                if (!s.send(strata::core::StageMsg::Ok, pf_out.data(), hbytes, nullptr, 0, err)) break;
+                            }
+                        }
                     } else if (type == strata::core::StageMsg::Commit) {
                         int32_t n_keep = 0;
                         if (msg.size() == 4) std::memcpy(&n_keep, msg.data(), 4);
                         if (!ver.commit(n_keep, err) || !ver.wait_commit(err)) fail = err;
                         else if (!s.send(strata::core::StageMsg::Ok, nullptr, 0, nullptr, 0, err)) break;
                     } else if (type == strata::core::StageMsg::Reset) {
+                        if (tok_pf > 0)
+                            std::fprintf(stderr, "strata stage: prompt chunks %lld tokens in %.0f ms here (%.1f tok/s)\n",
+                                         (long long) tok_pf, ms_pf, 1000.0 * (double) tok_pf / ms_pf);
+                        tok_pf = 0;
+                        ms_pf = 0;
                         if (!ver.wait_commit(err) || !ver.glm5_state_zero(err)) {
                             fail = err;
                         } else {
@@ -7216,8 +7261,8 @@ int main(int argc, char** argv) {
                 in_eof.store(true);
                 in_cv.notify_one();
             }).detach();
-            // multinode: the prompt as verify windows (the chunked path runs one engine's layers only)
-            const int pf_chunk = !gl_chain.empty() ? 0 : [] { const char* v = std::getenv("STRATA_GLM5_PREFILL"); return v ? std::atoi(v) : 1024; }();
+            // STRATA_GLM5_PREFILL: the chunk (0 = the prompt as verify windows); the stage engines must use the same
+            const int pf_chunk = [] { const char* v = std::getenv("STRATA_GLM5_PREFILL"); return v ? std::atoi(v) : 1024; }();
             strata::core::Verifier::Glm5Fetch pf;
             pf.host_res = host_res.empty() ? nullptr : host_res.data();
             pf.cache_base = thits.cache_base;
@@ -7225,6 +7270,27 @@ int main(int argc, char** argv) {
             pf.cache_blob = (uint64_t) thits.blob;
             pf.ctx = srcp;
             pf.blob = [](void* c, int64_t l, int64_t e) -> const uint8_t* { return ((strata::core::ExpertSource*) c)->blob(l, e); };
+            // multinode (2026-10-08): each chunk through [0, K1) here, the stage engines' ranges, then [Kn, end) here
+            std::vector<std::vector<float>> mn_hand;
+            auto mn_prefill = [&](const int32_t* toks, int64_t n_tok, int64_t p0, std::string& e) -> bool {
+                const size_t nr = gl_links.size();
+                const size_t rows = (size_t) pf_chunk * (size_t) strata::core::Verifier::handoff_floats(g);
+                mn_hand.resize(nr + 1);
+                for (auto& h : mn_hand) h.resize(rows);
+                for (int64_t c0 = 0; c0 < n_tok; c0 += pf_chunk) {
+                    const int64_t T = std::min<int64_t>(pf_chunk, n_tok - c0);
+                    if (!ver.prefill_glm5(toks + c0, T, p0 + c0, pf_chunk, pf, e, 0, split_at.front(), nullptr,
+                                          mn_hand[0].data()))
+                        return false;
+                    for (size_t r = 0; r < nr; ++r)
+                        if (!gl_links[r]->prefill((int) T, p0 + c0, toks + c0, mn_hand[r].data(), mn_hand[r + 1].data(), e))
+                            return false;
+                    if (!ver_tail.prefill_glm5(toks + c0, T, p0 + c0, pf_chunk, pf, e, split_at.back(), -1,
+                                               mn_hand[nr].data(), nullptr))
+                        return false;
+                }
+                return true;
+            };
             std::vector<int32_t> live, snap_toks;   // live: the cells whose state is committed; snap: the last prompt
             std::vector<float> snap;
             if (!ver.glm5_state_zero(err)) { std::fprintf(stderr, "strata serve: %s\n", err.c_str()); return 1; }
@@ -7292,7 +7358,8 @@ int main(int argc, char** argv) {
                 bool cancelled = false;
                 if (np - reused >= 16 && pf_chunk > 0) {
                     ver.prefill_ms_total = 0;
-                    if (!ver.prefill_glm5(prompt.data() + reused, np - reused, reused, pf_chunk, pf, err)) {
+                    if (!(gl_chain.empty() ? ver.prefill_glm5(prompt.data() + reused, np - reused, reused, pf_chunk, pf, err)
+                                           : mn_prefill(prompt.data() + reused, np - reused, reused, err))) {
                         std::printf("ERR %s\n", err.c_str());
                         std::fflush(stdout);
                         if (err.find("do not fit") == std::string::npos && err.find("page-locked") == std::string::npos) return 1;
@@ -7380,6 +7447,28 @@ int main(int argc, char** argv) {
                                      "(%.2f tok/s), %s\n", (long long) n, (long long) reused, prompt_ms,
                              (long long) produced_n, decode_ms, decode_ms > 0 ? 1000.0 * (double) produced_n / decode_ms : 0.0,
                              cancelled ? "cancel" : finish);
+                // where a window's time went (2026-10-08): per verifier, GPU (waiting for each layer's doorbell), the
+                // CPU experts, staging; per stage link, the round trip (the stage's compute included)
+                auto vstat = [&](const char* nm, strata::core::Verifier& v) {
+                    if (v.windows <= 0) return;
+                    const double w = (double) v.windows;
+                    std::fprintf(stderr, "strata serve: time %s: %lld windows; per window GPU %.2f ms, CPU experts %.2f ms, "
+                                         "staging %.2f ms, commit %.2f ms\n", nm, (long long) v.windows, v.ms_wait / w,
+                                 v.ms_pool / w, v.ms_host / w, v.ms_commit / w);
+                    v.ms_wait = v.ms_pool = v.ms_host = v.ms_commit = 0;
+                    v.windows = 0;
+                };
+                vstat(gl_chain.empty() ? "all layers" : "front layers", ver);
+                if (!gl_chain.empty()) vstat("back layers", ver_tail);
+                for (size_t r = 0; r < gl_links.size(); ++r) {
+                    strata::core::StageLink& lk = *gl_links[r];
+                    if (lk.windows > 0)
+                        std::fprintf(stderr, "strata serve: time stage %zu: %lld windows; per window round trip %.2f ms "
+                                             "(the stage's compute included)\n", r + 1, (long long) lk.windows,
+                                     lk.ms_net / (double) lk.windows);
+                    lk.ms_net = 0;
+                    lk.windows = 0;
+                }
             }
             return 0;
         }

@@ -595,7 +595,7 @@ bool Verifier::glm5_state_zero(std::string& err) {
 // at once: each distinct expert of the layer is one group of native_expert_grouped, its blob a VRAM cache slot or
 // copied from host memory into a small staging ring - every blob read once per chunk instead of once per window.
 bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, int chunk, const Glm5Fetch& f,
-                            std::string& err) {
+                            std::string& err, int64_t l_begin, int64_t l_end, const float* hand_in, float* hand_out) {
     using namespace strata::kernels;
     if (glm_ == nullptr) { err = "verify glm5 prefill: no glm5 window"; return false; }
     const OnDevice on_device(device_);
@@ -909,17 +909,41 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         return true;
     };
 
+    // a layer split: this call runs [lb, le) of one chunk; the hand-off rows are R | the last FFN's output | post | comb
+    const int64_t lb = l_begin, le = l_end < 0 ? g.n_layers : l_end, HF = handoff_floats(g);
+    if (lb < 0 || le > g.n_layers || lb >= le || ((lb > 0 || le < g.n_layers) && n_all > C) ||
+        (lb > 0 && hand_in == nullptr) || (le < g.n_layers && hand_out == nullptr)) {
+        err = "verify glm5 prefill: a layer range runs one chunk, with its hand-offs";
+        return false;
+    }
+    // one strided copy per part: device [t][w] <-> host [t][HF] at offset `at`
+    auto hand_copy = [&](float* dev, const float* host_in, float* host_out, int64_t at, int64_t w, int64_t T) {
+        if (host_in) cudaMemcpy2DAsync(dev, (size_t) w * 4, host_in + at, (size_t) HF * 4, (size_t) w * 4, (size_t) T,
+                                       cudaMemcpyHostToDevice, cs);
+        else cudaMemcpy2DAsync(host_out + at, (size_t) HF * 4, dev, (size_t) w * 4, (size_t) w * 4, (size_t) T,
+                               cudaMemcpyDeviceToHost, cs);
+    };
+    auto hand_parts = [&](const float* hin, float* hout, int64_t T) {
+        hand_copy(Rc, hin, hout, 0, HC * N, T);
+        hand_copy(boc, hin, hout, HC * N, N, T);
+        hand_copy(postF, hin, hout, HC * N + N, HC, T);
+        hand_copy(combF, hin, hout, HC * N + N + HC, HC * HC, T);
+    };
     try {
         for (int64_t c0 = 0; c0 < n_all; c0 += C) {
             const int64_t T = std::min<int64_t>(C, n_all - c0);
             for (int64_t t = 0; t < T; ++t) qsa_step_fill(h_steps.data() + (size_t) t * kStepCount, pos0 + c0 + t, s);
             cudaMemcpyAsync(tokc, tokens + c0, (size_t) T * 4, cudaMemcpyHostToDevice, cs);
             cudaMemcpyAsync(stepc, h_steps.data(), (size_t) T * kStepCount * 4, cudaMemcpyHostToDevice, cs);
-            const NativeEmbed* ne = native_embed();
-            if (ne == nullptr) { err = "verify glm5 prefill: needs the native token embedding"; return false; }
-            ne->gather_dev(tokc, T, embc, cs);
-            broadcast_streams(embc, Rc, N, (int) HC, (int) T, cs);
-            for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (lb > 0) {
+                hand_parts(hand_in, nullptr, T);
+            } else {
+                const NativeEmbed* ne = native_embed();
+                if (ne == nullptr) { err = "verify glm5 prefill: needs the native token embedding"; return false; }
+                ne->gather_dev(tokc, T, embc, cs);
+                broadcast_streams(embc, Rc, N, (int) HC, (int) T, cs);
+            }
+            for (int64_t l = lb; l < le; ++l) {
                 for (int64_t s0 = 0; s0 < T; s0 += SL) {
                     const int n = (int) std::min<int64_t>(SL, T - s0);
                     if (!mhc_read(l, "attn", l > 0, s0, n, "attn_norm.weight") || !attn(l, s0, n)) return false;
@@ -944,6 +968,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                     return false;
                 }
             }
+            if (le < g.n_layers) hand_parts(nullptr, hand_out, T);   // synced below, before the caller sends it
         }
     } catch (const std::exception& e) {
         err = std::string("verify glm5 prefill: ") + e.what();

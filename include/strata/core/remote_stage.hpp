@@ -24,7 +24,8 @@
 namespace strata::core {
 
 /// Ping = any bytes -> Ok (the same bytes): the link's own round trip, nothing computed (mn-test/ping.py)
-enum class StageMsg : uint32_t { Hello = 1, Window = 2, Commit = 3, Reset = 4, Quit = 5, Ping = 6, Ok = 100, Err = 101 };
+/// Prefill (glm5-next, 2026-10-08) = a prompt chunk: the Window layout with T up to the chunk -> Ok (its hand-off)
+enum class StageMsg : uint32_t { Hello = 1, Window = 2, Commit = 3, Reset = 4, Quit = 5, Ping = 6, Prefill = 7, Ok = 100, Err = 101 };
 
 struct StageHello {
     int64_t lb = 0, le = 0, hf = 0, max_t = 0;
@@ -79,6 +80,8 @@ public:
     /// Connects and exchanges Hello: the stage must run exactly [want.lb, want.le) with the same hand-off size.
     bool connect(const std::string& host_port, const StageHello& want, std::string& err);
     bool window(int T, int64_t pos0, const int32_t* tokens, const float* hand_in, float* hand_out, std::string& err);
+    /// a prompt chunk of T tokens through the stage's layers (glm5-next): the pending commit goes first, as in window
+    bool prefill(int T, int64_t pos0, const int32_t* tokens, const float* hand_in, float* hand_out, std::string& err);
     bool commit(int n_keep, std::string& err);
     bool reset(std::string& err);
     void quit();

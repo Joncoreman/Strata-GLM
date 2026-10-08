@@ -168,7 +168,10 @@ public:
     /// The prompt's cells [pos0, pos0 + n) in chunks of `chunk` tokens, the state written as commits would (KDA state
     /// and conv history, the latent cache, the indexer pool).  Per layer the attention runs in slices of 8 tokens (the
     /// window's kernels), the routed experts once per chunk on the GPU, each expert's blob read once.
-    bool prefill_glm5(const int32_t* tokens, int64_t n, int64_t pos0, int chunk, const Glm5Fetch& f, std::string& err);
+    /// (a layer split, 2026-10-08: the layers [l_begin, l_end) of ONE chunk, n <= chunk; a stage after the first starts
+    /// from `hand_in`, one before the last ends in `hand_out` - host rows of handoff_floats, the windows' layout)
+    bool prefill_glm5(const int32_t* tokens, int64_t n, int64_t pos0, int chunk, const Glm5Fetch& f, std::string& err,
+                      int64_t l_begin = 0, int64_t l_end = -1, const float* hand_in = nullptr, float* hand_out = nullptr);
     /// glm5 serve (2026-10-08): the sequence state that a later request continuing the same prompt needs - the KDA
     /// states with their conv histories and the indexer tails (the latents and completed indexer blocks of earlier
     /// cells are never rewritten) - copied to `host`, back from it, or zeroed (a new sequence).
