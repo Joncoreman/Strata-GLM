@@ -67,6 +67,9 @@
 #include "strata/artifact/gguf_reader.hpp"
 #if defined(_WIN32)
 #include <windows.h>
+#include <dbghelp.h>   // STRATA_CRASH_TRACE's symbolized stack
+#include <malloc.h>    // _heapchk (heap_mark)
+#pragma comment(lib, "dbghelp.lib")
 #include <psapi.h>
 #include <io.h>
 #else
@@ -851,6 +854,18 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
 /// MULTINODE --stage-layers K1,K2: the layers a stage engine runs (set once, while the options are checked)
 int64_t g_stage_lb = 0, g_stage_le = 0;
 
+/// STRATA_CRASH_TRACE=1: is the C heap still intact after this start-up step (_heapchk; the GLM port's overflow hunt)
+void heap_mark(const char* where) {
+#if defined(_WIN32)
+    static const bool on = std::getenv("STRATA_CRASH_TRACE") != nullptr;
+    if (!on) return;
+    const int h = _heapchk();
+    std::fprintf(stderr, "strata heap: %s after %s\n", h == _HEAPOK ? "ok" : (h == _HEAPBADNODE ? "BAD NODE" : "BAD"), where);
+#else
+    (void) where;
+#endif
+}
+
 /// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
 void mem_mark(const char* where) {
     static const bool on = std::getenv("STRATA_TRACE") != nullptr;
@@ -1075,9 +1090,59 @@ double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
 
+#if defined(_WIN32)
+// STRATA_CRASH_TRACE=1 (2026-10-08, the GLM port): on an access violation or any other unhandled exception, print the
+// code, the faulting address and a symbolized stack (strata.pdb beside the exe) to stderr before the process dies.
+LONG WINAPI crash_trace_filter(EXCEPTION_POINTERS* ep) {
+    HANDLE proc = GetCurrentProcess(), thread = GetCurrentThread();
+    std::fprintf(stderr, "strata crash: exception 0x%08lX at %p (thread %lu)\n", ep->ExceptionRecord->ExceptionCode,
+                 ep->ExceptionRecord->ExceptionAddress, GetCurrentThreadId());
+    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymInitialize(proc, nullptr, TRUE);
+    CONTEXT ctx = *ep->ContextRecord;
+    STACKFRAME64 f = {};
+    f.AddrPC.Offset = ctx.Rip; f.AddrPC.Mode = AddrModeFlat;
+    f.AddrFrame.Offset = ctx.Rbp; f.AddrFrame.Mode = AddrModeFlat;
+    f.AddrStack.Offset = ctx.Rsp; f.AddrStack.Mode = AddrModeFlat;
+    alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 512];
+    for (int i = 0; i < 40 && StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, thread, &f, &ctx, nullptr,
+                                            SymFunctionTableAccess64, SymGetModuleBase64, nullptr); ++i) {
+        if (f.AddrPC.Offset == 0) break;
+        SYMBOL_INFO* s = (SYMBOL_INFO*) buf;
+        s->SizeOfStruct = sizeof(SYMBOL_INFO); s->MaxNameLen = 511;
+        DWORD64 disp = 0;
+        const char* name = SymFromAddr(proc, f.AddrPC.Offset, &disp, s) ? s->Name : "?";
+        IMAGEHLP_LINE64 line = {}; line.SizeOfStruct = sizeof(line);
+        DWORD ldisp = 0;
+        if (SymGetLineFromAddr64(proc, f.AddrPC.Offset, &ldisp, &line))
+            std::fprintf(stderr, "  #%02d %s  %s:%lu\n", i, name, line.FileName, line.LineNumber);
+        else
+            std::fprintf(stderr, "  #%02d %s  +0x%llx\n", i, name, (unsigned long long) disp);
+    }
+    std::fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+// first chance, any thread: only access violations, once (the unhandled filter above can be bypassed by runtimes)
+LONG WINAPI crash_trace_vectored(EXCEPTION_POINTERS* ep) {
+    static std::atomic<bool> once{false};
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || once.exchange(true))
+        return EXCEPTION_CONTINUE_SEARCH;
+    std::fprintf(stderr, "strata crash: access violation %s address 0x%llx\n",
+                 ep->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
+                 (unsigned long long) ep->ExceptionRecord->ExceptionInformation[1]);
+    return crash_trace_filter(ep);
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+    if (std::getenv("STRATA_CRASH_TRACE") != nullptr) {
+        SetUnhandledExceptionFilter(crash_trace_filter);
+        AddVectoredExceptionHandler(1, crash_trace_vectored);
+    }
+#endif
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
@@ -1660,6 +1725,7 @@ int main(int argc, char** argv) {
     }
     strata::core::layer_set_shared_early(!o.shared_late);
     bool glm5_model = false;   // glm5-next (GLM-5.3-Flash): no PLE, its own geometry; the decode path is being wired
+    strata::core::ModelGeometry glm5_geom;   // filled from the GGUF when glm5_model
     if (!o.native_preset.empty()) {
         try {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native).  A missing shard is an error
@@ -1703,7 +1769,7 @@ int main(int argc, char** argv) {
                 strata::GgufFile pg(o.ple_gguf);
                 if (const strata::MetaValue* v = pg.get("general.architecture")) ple_only = v->s == "strata-ple";
             } catch (const std::exception&) {}
-            if (!ple_only &&
+            if (!ple_only && !o.ple_gguf.empty() &&   // glm5-next has no PLE shard
                 std::find(o.native_dense_gguf.begin(), o.native_dense_gguf.end(), o.ple_gguf) == o.native_dense_gguf.end())
                 o.native_dense_gguf.push_back(o.ple_gguf);
         }
@@ -1857,11 +1923,12 @@ int main(int argc, char** argv) {
     {
         strata::core::ModelGeometry g0;
         int64_t g0_layers = g0.n_layers;
-        if (glm5_model) {   // the GGUF's geometry; the expert table also has the NextN (MTP) layer: block_count
+        if (glm5_model) {   // the GGUF's geometry; the trunk only (the table's NextN line is left out, MTP is off)
             try {
                 strata::GgufFile head(o.native_shards.front());
                 g0 = strata::core::geometry_from_gguf(head);
-                if (const strata::MetaValue* v = head.get("glm5-next.block_count")) g0_layers = (int64_t) v->u;
+                glm5_geom = g0;
+                g0_layers = g0.n_layers;
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "strata generate: glm5-next geometry: %s\n", e.what());
                 return 1;
@@ -1871,7 +1938,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        if (glm5_model) {
+        if (glm5_model && std::getenv("STRATA_GLM5_GO") == nullptr) {   // STRATA_GLM5_GO=1: go on (porting)
             // 2026-10-08: the GLM kernels exist and match llama.cpp one by one (glm-notes), but the verify window
             // does not call them yet.  Stop here, after the model file and the expert table have been read, with
             // what was understood, instead of running the Qwen graph on GLM weights.
@@ -1891,6 +1958,8 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             const auto& f = lay.fmt[(size_t) l];
+            // glm5-next: the dense layers have no experts, and the NextN (MTP) layer is not run yet
+            if (glm5_model && f.gu_type < 0) continue;
             if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
                 std::fprintf(stderr, "strata generate: layer %lld's experts are %s/%s (ggml types %d/%d), which this "
                                      "engine has no GPU kernels for\n", (long long) l,
@@ -1945,6 +2014,7 @@ int main(int argc, char** argv) {
                      std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
     strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
+    if (glm5_model) { g = glm5_geom; K = glm5_geom.n_expert_used; }   // glm5-next: the whole geometry from its GGUF
     // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,
     // and `session_init` below builds the rope table from it and captures the kernels reading its constants
     // (rope_scaling.hpp); the only hard constraint is "set before that", and dying on a bad rope key beats
@@ -2054,13 +2124,14 @@ int main(int argc, char** argv) {
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }
-        const strata::core::ModelGeometry g0;
+        const strata::core::ModelGeometry g0 = glm5_model ? glm5_geom : strata::core::ModelGeometry{};
         if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g0.n_embd,
-                               248320, err)) {
+                               glm5_model ? g0.n_vocab : 248320, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
         strata::core::set_native_embed(&native_embed);
+    heap_mark("the native embedding");
         std::fprintf(stderr, "strata generate: native pack: %s experts (largest blob %.2f MB), token embedding "
                              "%s in mapped host memory (%.0f MiB)\n",
                      o.pack.c_str(), (double) strata::kernels::cpu::expert_layout().max_blob / 1e6,
@@ -2132,6 +2203,7 @@ int main(int argc, char** argv) {
                  (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), skip.size());
 
     strata::core::NativeDense native_dense;
+    heap_mark("the canonical weight table");
     if (!o.native_dense_gguf.empty()) {
         if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key, stage_mode ? g_stage_lb : 0,
                                stage_mode ? g_stage_le : -1)) {
@@ -2349,7 +2421,7 @@ int main(int argc, char** argv) {
         }
         ss.ple.emb_dev = ple_emb_dev;
         ss.ple.scratch = ple_scratch;
-    } else {
+    } else if (!glm5_model) {   // glm5-next has no PLE: nothing is off
         std::fprintf(stderr,
                      "strata generate: PLE OFF by explicit --no-ple diagnostic request.\n"
                      "  The tokens below are NOT this model's; this is only useful for A/B measurement.\n");
@@ -2717,10 +2789,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
         }
+        heap_mark("everything before the session");
         if (strata::core::session_init(g, o.max_context, K, sbuf, ss, lo0, hi0) == 0) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
+        heap_mark("session_init");
         if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1)
             std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
                                  "%.2f GiB of pinned RAM\n",
@@ -2868,6 +2942,7 @@ int main(int argc, char** argv) {
         src.set_gguf(o.native_preset);
         if (const char* v = std::getenv("STRATA_FETCH_THREADS"); v != nullptr && std::atoi(v) > 0)
             src.set_fetch_threads(std::atoi(v));
+        heap_mark("everything before the expert source");
         if (!src.open(o.pack, g.n_layers, g.n_expert, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;

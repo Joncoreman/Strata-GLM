@@ -23,7 +23,14 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
         return include_ple_key && (tensor.type == 42 || tensor.type == 18 || tensor.type == 23 || tensor.type == 8);
     static const char* suffixes[] = {".attn_qkv.weight", ".attn_gate.weight", ".ssm_out.weight",
         ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight",
-        ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight"};
+        ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight",
+        // glm5-next (all Q8_0 in its GGUFs; none of these names occurs in qwen4exp, whose BF16 ssm_beta is not an
+        // MMVQ type anyway): the dense FFN of layers 0-2, mHC, KDA gates, MLA, the k-pool indexer, NextN
+        ".ffn_gate.weight", ".ffn_up.weight", ".ffn_down.weight", ".hc_attn_fn.weight", ".hc_ffn_fn.weight",
+        ".ssm_beta.weight", ".ssm_f_a.weight", ".ssm_f_b.weight", ".ssm_g_a.weight", ".ssm_g_b.weight",
+        ".attn_q_a.weight", ".attn_q_b.weight", ".attn_kv_a_mqa.weight", ".attn_k_b.weight", ".attn_v_b.weight",
+        ".indexer.attn_k.weight", ".indexer.attn_q_b.weight", ".indexer_compressor_gate.weight",
+        ".nextn.eh_proj.weight"};
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
@@ -44,7 +51,7 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
             strata::GgufFile gguf(path);
             for (const auto& tensor : gguf.tensors())
                 if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
-                    tensor.shape.size() == 2)
+                    (tensor.shape.size() == 2 || tensor.shape.size() == 3))   // 3: glm5-next's per-head wk_b / wv_b
                     out.insert(tensor.name);
         }
         return true;
@@ -156,9 +163,13 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
                 // #326: the pack keeps an unquantized (--compat-bf16) key, which the PLE reads from the arena
                 if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
-                if (!ref.quantized() || tensor.shape.size() != 2 ||
+                // a 3-D tensor (glm5-next attn_k_b / attn_v_b: [in, out, head]) is served as one [in, out * head]
+                // matrix: head h's rows start at h * out
+                const uint64_t rows = tensor.shape.size() == 3 ? tensor.shape[1] * tensor.shape[2]
+                                                               : (tensor.shape.size() == 2 ? tensor.shape[1] : 0);
+                if (!ref.quantized() || (tensor.shape.size() != 2 && tensor.shape.size() != 3) ||
                     ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||
-                    tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
+                    tensor.shape[0] != (uint64_t) ref.ne0 || rows != (uint64_t) ref.ne1) {
                     err = "native dense: incompatible matrix " + tensor.name; return false;
                 }
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(

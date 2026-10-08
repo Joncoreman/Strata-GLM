@@ -182,6 +182,10 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         std::istringstream ss(line);
         long long l = -1, gt = -1, dt = -1;
         unsigned long long off = 0, blob = 0, go = 0, uo = 0, dox = 0;
+        // v5 (glm5-next): the table also lists the NextN (MTP) layer after the trunk; a caller that runs the trunk
+        // only (n_layers = the trunk) leaves it out - it is the last line, so the rest stays contiguous
+        if (L.version >= 5 && (ss >> l) && l >= n_layers) continue;
+        if (L.version >= 5) { ss.clear(); ss.str(line); }
         if (!(ss >> l >> gt >> dt >> off >> blob) || l < 0 || l >= n_layers) {
             err = "native_experts.txt: a malformed line: " + line;
             return false;

@@ -112,16 +112,17 @@ bool make_cache_complement_plan(
     };
     if (!mark_pairs(primary_gpu_pairs, 1, "primary GPU") ||
         !mark_pairs(additional_gpu_pairs, 2, "additional GPU")) return false;
-    for (uint64_t blob_bytes : layer_blob_bytes) {
-        if (blob_bytes == 0) {
-            err = "FileExpertSource: cache complement layer has zero-sized expert blobs";
-            return false;
-        }
+    // glm5-next's dense layers have no experts (zero-sized blobs): nothing of theirs is complemented.  A table with
+    // no expert layer at all is still an error.
+    if (std::all_of(layer_blob_bytes.begin(), layer_blob_bytes.end(), [](uint64_t b) { return b == 0; })) {
+        err = "FileExpertSource: cache complement layer has zero-sized expert blobs";
+        return false;
     }
 
     offsets.assign(count, kNoCacheComplement);
     for (int64_t layer = 0; layer < n_layers; ++layer) {
         const uint64_t blob_bytes = layer_blob_bytes[(size_t) layer];
+        if (blob_bytes == 0) continue;
         for (int64_t expert = 0; expert < n_expert; ++expert) {
             const size_t index = (size_t) layer * (size_t) n_expert + (size_t) expert;
             if (omitted[index] != 0) continue;
@@ -340,6 +341,12 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         for (int64_t layer = 0; layer < n_layers; ++layer) {
             const size_t i = (size_t) layer;
             const uint64_t bytes = (uint64_t) layout.fmt[i].bytes;
+            if (layout.fmt[i].gu_type < 0 && bytes == 0 && layout.bytes[i] == 0 && layout.offset[i] == at) {
+                // glm5-next's dense layers (v5 table): no experts - nothing to map, never routed to
+                layer_offsets[i] = at;
+                layer_blob_bytes[i] = 0;
+                continue;
+            }
             if (layout.offset[i] != at || bytes == 0 || layout.bytes[i] != bytes ||
                 bytes > std::numeric_limits<uint64_t>::max() / (uint64_t) n_expert) {
                 err = "FileExpertSource: the native expert layout is invalid at layer " + std::to_string(layer);
@@ -2337,6 +2344,7 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
         std::map<std::string, std::unique_ptr<strata::GgufFile>> files;
         for (int64_t l = 0; l < lay.n_layers; ++l) {
             const auto& fm = lay.fmt[(size_t) l];
+            if (fm.gu_type < 0 && lay.bytes[(size_t) l] == 0) continue;   // glm5-next dense layer: no experts
             const uint64_t blob = lay.bytes[(size_t) l];
             const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
             for (int r = 0; r < 3; ++r) {

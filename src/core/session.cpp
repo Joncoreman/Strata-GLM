@@ -43,6 +43,16 @@ uint64_t gdn_state_floats(const ModelGeometry& g) {
            (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
 }
 
+/// QSA (sparse attention) layers in [0, bound).  Qwen: every `qsa_interval`-th, so bound / interval.  glm5-next has no
+/// period (qsa_interval 0; the GGUF's head_count_kv array decides), so they are counted - dividing by the 0 clamped to
+/// 1 counted every layer and overran `qsa_states` (2026-10-08).
+int64_t qsa_below(const ModelGeometry& g, int64_t bound) {
+    if (!g.is_glm5_next()) return bound / std::max<int64_t>(g.qsa_interval, 1);
+    int64_t n = 0;
+    for (int64_t l = 0; l < bound; ++l) n += g.is_sparse_layer(l);
+    return n;
+}
+
 }  // namespace
 
 /// `NG_HIST` rows of `hc_dim` floats: the PLE conv's history, which is the ONLY PLE state that lives in the
@@ -55,8 +65,7 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     // QSA layers are `l % interval == interval-1`, so exactly `bound / interval` of them live below `bound`
-    const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
-    const int64_t q_lo = layer_lo / I, q_hi = layer_hi / I;
+    const int64_t q_lo = qsa_below(g, layer_lo), q_hi = qsa_below(g, layer_hi);
     const int64_t q_n = std::max<int64_t>(q_hi - q_lo, g.n_qsa_layers() > 0 ? 1 : 0);
     const int64_t gdn_n = std::max<int64_t>((layer_hi - layer_lo) - std::max<int64_t>(q_hi - q_lo, 0), 0);
     uint64_t n = 0;
@@ -88,11 +97,10 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     s.k = k;
     s.layer_lo = layer_lo;
     s.layer_hi = layer_hi;
-    const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
-    const int64_t q_n_range = layer_hi / I - layer_lo / I;
-    s.qsa_ord0 = layer_lo / I;
+    const int64_t q_n_range = qsa_below(g, layer_hi) - qsa_below(g, layer_lo);
+    s.qsa_ord0 = qsa_below(g, layer_lo);
     s.qsa_alloc = std::max<int64_t>(q_n_range, g.n_qsa_layers() > 0 ? 1 : 0);
-    s.gdn_ord0 = layer_lo - layer_lo / I;
+    s.gdn_ord0 = layer_lo - qsa_below(g, layer_lo);
     s.gdn_alloc = std::max<int64_t>((layer_hi - layer_lo) - q_n_range, 0);
 
     gdn_buffers_init(g, take(gdn_buffers_bytes(g)), s.gdn);
