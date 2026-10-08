@@ -29,7 +29,13 @@ void init_once() {
 
 bool native_experts_available() noexcept { return true; }
 
-bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
+bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
+                float swiglu_limit) {
+    if (gu_type < 0 || gu_type >= GGML_TYPE_COUNT || d_type < 0 || d_type >= GGML_TYPE_COUNT ||
+        n_embd <= 0 || n_ff <= 0 || !std::isfinite(swiglu_limit) || swiglu_limit < 0.f) {
+        err = "native experts: invalid dimensions, type or SwiGLU limit";
+        return false;
+    }
     init_once();
     const ggml_type_traits_cpu* tg = traits(gu_type);
     const ggml_type_traits_cpu* td = traits(d_type);
@@ -54,6 +60,7 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.d_act = (int) td->vec_dot_type;
     f.n_embd = n_embd;
     f.n_ff = n_ff;
+    f.swiglu_limit = swiglu_limit;
     f.gu_row = ggml_row_size((ggml_type) gu_type, n_embd);
     f.d_row = ggml_row_size((ggml_type) d_type, n_ff);
     f.up_off = f.gu_row * (size_t) n_ff;
@@ -94,7 +101,9 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
     // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
     static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return v != nullptr && std::atoi(v) != 0; }();
-    if (kq && f.gu_type == 12 && nt >= 2) {   // one token: ggml's own dot below (the same bits, less overhead)
+    // The fused SIMD gate/up kernels implement unclamped SwiGLU. A clamp must be applied BEFORE SiLU,
+    // so GLM deliberately uses ggml's CPU dots below until those kernels gain a clamped variant.
+    if (f.swiglu_limit == 0.f && kq && f.gu_type == 12 && nt >= 2) {
         kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
@@ -102,7 +111,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // it, as before (its rows would round differently).  Each kernel only for the formats it implements: falling
     // through an empty switch would leave ff unwritten instead of falling back to ggml-cpu.
     static const bool cpu512 = cpu_avx512_ok();
-    if (nt >= mt_min && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
+    if (f.swiglu_limit == 0.f && nt >= mt_min && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
         if (avx512 && iq512_supported(f.gu_type)) {
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
             return;
@@ -121,7 +130,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             float g = 0.f, u = 0.f;
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
             dot(n, &u, 0, ur, 0, act[t], 0, 1);
-            ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+            ff[t][r] = native_swiglu(g, u, f.swiglu_limit);
         }
     }
 }

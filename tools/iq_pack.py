@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
@@ -84,21 +85,33 @@ FORM = {
     "ple_norm_query.weight": "F32", "ssm_a": "F32", "ssm_conv1d.weight": "F32", "ssm_dt.bias": "F32",
     "ssm_norm.weight": "F32",
 }
+# GLM's small projections stay native (Q8_0 in the measured artifact); its router and indexer
+# weights are F32. No GLM projection goes through the Qwen BF16 compatibility conversion.
+GLM5_FORM = {name: "F32" for name in (
+    "ffn_gate_inp.weight", "exp_probs_b.bias", "indexer.proj.weight",
+    "attn_norm.weight", "ffn_norm.weight", "output_norm.weight",
+    "attn_q_a_norm.weight", "attn_kv_a_norm.weight", "indexer.k_norm.weight", "indexer.k_norm.bias",
+    "hc_attn_base.weight", "hc_attn_scale.weight", "hc_ffn_base.weight", "hc_ffn_scale.weight",
+    "ssm_a", "ssm_dt.bias", "ssm_norm.weight",
+    "ssm_conv1d_q.weight", "ssm_conv1d_k.weight", "ssm_conv1d_v.weight", "indexer_compressor_ape.weight",
+    "nextn.enorm.weight", "nextn.hnorm.weight", "nextn.shared_head_norm.weight",
+)}
 # PLE key encodings left in the GGUF for the engine's native PLE key (Q2_0; Q8_0 in UD-Q4_K_XL).  Other quantized
 # keys take the BF16 path (--compat-bf16), as before.
 NATIVE_PLE_KEY = {"Q2_0", "Q8_0"}
 KIND = {"BF16": "4", "F16": "5", "F32": "2"}
 
 
-def form_of(name: str):
-    return FORM.get(re.sub(r"^blk\.\d+\.", "", name))
+def form_of(name: str, architecture: str = "qwen4exp"):
+    forms = GLM5_FORM if architecture == "glm5-next" else FORM
+    return forms.get(re.sub(r"^blk\.\d+\.", "", name))
 
 
-def needs_bf16(name: str, type_name: str) -> bool:
+def needs_bf16(name: str, type_name: str, architecture: str = "qwen4exp") -> bool:
     """Whether the engine reads `name` as BF16 from the pack (not natively from the GGUF)."""
     if name == "blk.1.ple_key.weight" and type_name in NATIVE_PLE_KEY:
         return False
-    return form_of(name) == "BF16"
+    return form_of(name, architecture) == "BF16"
 
 
 def dequantize(raw: np.ndarray, type_name: str) -> np.ndarray:
@@ -141,7 +154,7 @@ def f16_values(values: np.ndarray, name: str) -> np.ndarray:
 class Model:
     """All shards of one model: name -> (GGUFFile, TensorInfo, memmap, shard path)."""
 
-    def __init__(self, first: pathlib.Path):
+    def __init__(self, first: pathlib.Path, header_only: bool = False):
         import re
         m = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", first.name)
         paths = [first]
@@ -152,22 +165,31 @@ class Model:
         missing = [str(p) for p in paths if not p.is_file()]
         if missing:
             raise FileNotFoundError("missing model shards (wait for the download): " + ", ".join(missing))
+        active = [str(p) for p in paths if pathlib.Path(str(p) + ".aria2").exists()]
+        if active:
+            raise ValueError("download still active; refusing to open: " + ", ".join(active))
         self.paths = paths
         self.files = [G.GGUFFile(p) for p in paths]
         self.sizes = [p.stat().st_size for p in paths]
         check_split(self.files)
+        self.architecture = self.files[0].metadata.get("general.architecture", "qwen4exp")
+        if self.architecture not in ("qwen4exp", "glm5-next"):
+            raise ValueError("unsupported architecture: " + self.architecture)
+        self.header_only = header_only
         self.where = {}
-        for p, g in zip(paths, self.files):
-            mm = np.memmap(p, dtype=np.uint8, mode="r")
+        for p, g, file_size in zip(paths, self.files, self.sizes):
+            mm = None if header_only else np.memmap(p, dtype=np.uint8, mode="r")
             for t in g.tensors:
                 size = t.expected_bytes()
-                if size is None or g.data_start + t.offset + size > mm.size:
+                if size is None or g.data_start + t.offset + size > file_size:
                     raise ValueError(f"{p.name}: unsupported or truncated tensor {t.name}")
                 if t.name in self.where:
                     raise ValueError(f"{p.name}: duplicate tensor {t.name}")
                 self.where[t.name] = (g, t, mm, p)
 
     def bytes(self, name) -> np.ndarray:
+        if self.header_only:
+            raise RuntimeError("header-only model cannot read tensor payloads")
         g, t, mm, _ = self.where[name]
         return tensor_bytes(mm, g, t)
 
@@ -199,7 +221,6 @@ def check_split(files) -> None:
 
 
 ROLES = ("gate", "up", "down")
-N_EXPERT = 512
 ALIGN = 64
 
 
@@ -223,10 +244,10 @@ def is_expert(name: str) -> bool:
     return name.startswith("blk.") and name.endswith(("_exps.weight",))
 
 
-def convert(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool):
+def convert(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool, architecture: str = "qwen4exp"):
     """The pack form of one tensor the engine reads from dense.bin: (kind, stored bytes, destination bytes,
     record or None), or an error string.  `record` describes a conversion for conversions.json."""
-    form = form_of(name)
+    form = form_of(name, architecture)
     if form is None or form == type_name:
         return KIND[type_name], raw.tobytes(), raw.nbytes, None
     values = dequantize(raw, type_name)
@@ -278,12 +299,12 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
     for name, (g, t, mm, p) in model.where.items():
         if is_expert(t.name) or t.name in NOT_IN_PACK:
             continue
-        if len(t.shape) > 2:
+        if len(t.shape) > 2 and model.architecture != "glm5-next":
             print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
             return 1
         # quantized: served from the GGUF unless the engine reads it from the pack (FORM), which takes
         # --compat-bf16 to dequantize - except the native PLE key encodings
-        form = form_of(name)
+        form = form_of(name, model.architecture)
         native = t.type_name not in FLOAT and (form is None or (
             name == "blk.1.ple_key.weight" and t.type_name in NATIVE_PLE_KEY))
         if t.type_name not in FLOAT and not native and not compat_bf16:
@@ -302,14 +323,16 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
     with open(out / "dense.bin.tmp", "wb") as fo:
         for name, g, t, mm, p, native in todo:
             ne0 = int(t.shape[0])
-            ne1 = int(t.shape[1]) if len(t.shape) > 1 else 0
+            # The legacy index is 2-D. Flatten only the trailing axes, without changing byte order;
+            # GLM's original head/convolution axes are retained in glm5-layout.json below.
+            ne1 = math.prod(t.shape[1:]) if len(t.shape) > 1 else 0
             if native:
                 served += 1
                 rows.append([t.name, "0", "0", "0", "0", "0", "0", str(ne0), str(ne1), "8", "0", "32"] + ["0"] * 7)
                 continue
             raw = tensor_bytes(mm, g, t)
             try:
-                got = convert(name, t.type_name, raw, compat_bf16)
+                got = convert(name, t.type_name, raw, compat_bf16, model.architecture)
             except ValueError as e:
                 got = str(e)
             if isinstance(got, str):
@@ -344,6 +367,8 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
     (out / "dense.bin.tmp").replace(out / "dense.bin")
     (out / "index.txt.tmp").replace(out / "index.txt")
     conv.replace(out / "conversions.json")
+    if model.architecture == "glm5-next":
+        (out / "glm5-layout.json").write_text(json.dumps(glm5_layout_metadata(model), indent=2) + "\n", encoding="utf-8")
     if records:
         exact = sum(1 for r in records if r["exact"])
         print("conversions.json: %d tensors converted to the engine's form (%d exact, %d rounded; max |err| %.3g)"
@@ -436,17 +461,41 @@ def expert_layout(model: Model, src: pathlib.Path):
     if not exps:
         return "the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)"
     n_layers = 1 + max(int(n.split(".")[1]) for n in exps)
-    n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])   # router rows = experts kept (pruned models ship < 512)
-    if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != n_expert for l in range(n_layers)):
+    first_expert = 0
+    if model.architecture == "glm5-next":
+        md = model.files[0].metadata
+        first_expert = int(md["glm5-next.leading_dense_block_count"])
+        n_layers = int(md["glm5-next.block_count"]) # includes NextN; never omit it silently
+        if first_expert < 0 or first_expert >= n_layers:
+            return "glm5-next: invalid leading_dense_block_count"
+        for name in exps:
+            if not first_expert <= int(name.split(".")[1]) < n_layers:
+                return "glm5-next: expert tensor in dense or out-of-range layer: " + name
+    layers = range(first_expert, n_layers)
+    router_names = ["blk.%d.ffn_gate_inp.weight" % l for l in layers]
+    if any(name not in T or len(T[name].shape) != 2 for name in router_names):
+        return "missing or malformed router in expert layer"
+    n_expert = int(T[router_names[0]].shape[1])
+    if any(int(T[name].shape[1]) != n_expert for name in router_names):
         return "the routers disagree on the expert count; a per-layer pruned model cannot be packed"
+    if model.architecture == "glm5-next" and n_expert != int(md["glm5-next.expert_count"]):
+        return "glm5-next: router count disagrees with expert_count"
     layout, lines, offset, n_split = [], [], 0, 0
-    for l in range(n_layers):
+    for l in layers:
         names = ["blk.%d.ffn_%s_exps.weight" % (l, r) for r in ROLES]
         if any(n not in T for n in names):
             return "layer %d: missing %s" % (l, ", ".join(n for n in names if n not in T))
         ts = [T[n] for n in names]
         if any(t.expected_bytes() is None or len(t.shape) != 3 or int(t.shape[2]) != n_expert for t in ts):
             return "layer %d: an expert tensor is not [*, *, %d] of whole blocks" % (l, n_expert)
+        if model.architecture == "glm5-next":
+            hidden = int(md["glm5-next.embedding_length"])
+            widths = md["glm5-next.expert_feed_forward_length"]
+            width = int(widths[l] if isinstance(widths, list) else widths)
+            if T[router_names[l - first_expert]].shape != [hidden, n_expert] or \
+                    ts[0].shape != [hidden, width, n_expert] or ts[1].shape != ts[0].shape or \
+                    ts[2].shape != [width, hidden, n_expert]:
+                return "layer %d: expert geometry disagrees with glm5-next metadata" % l
         per = [t.expected_bytes() // n_expert for t in ts]
         if per[0] != per[1] or ts[0].type_name != ts[1].type_name:
             return "layer %d: gate and up differ in type" % l
@@ -465,12 +514,83 @@ def expert_layout(model: Model, src: pathlib.Path):
                 "[shard | gate,up,down] (n_expert %d, total %d; absolute offsets in %s, or in the named shard "
                 "beside it - per role where the column is gate,up,down)\n" % (n_expert, offset, src.name))
         print("%d layer(s) have their gate/up/down in different shards: native_experts.txt v4, per-role shard "
-              "column for %s" % (n_split, ", ".join(str(l) for l, *_ in layout if "," in lines[l])))
+              "column for %s" % (n_split, ", ".join(str(row[0]) for row, line in zip(layout, lines) if "," in line)))
     else:
         head = ("# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard] "
                 "(n_expert %d, total %d; absolute offsets in %s, or in the named shard beside it)\n"
                 % (n_expert, offset, src.name))
+    if model.architecture == "glm5-next":
+        # Dense leading layers and non-Qwen widths require a new runtime contract. Old engines must refuse
+        # this table rather than size their fixed 2560/640 pools from it. Phase 2 consumes glm5-layout.json.
+        head = ("# strata native experts v5: layer gu_type d_type offset blob_bytes gate_off up_off down_off "
+                "[shard | gate,up,down] (n_expert %d, total %d; architecture glm5-next; geometry and original "
+                "tensor axes in glm5-layout.json; CPU packing skeleton, execution not implemented)\n"
+                % (n_expert, offset))
     return layout, head + "".join(line + "\n" for line in lines), n_expert, offset
+
+
+def glm5_layout_metadata(model: Model) -> dict:
+    """Lossless source geometry alongside the two-axis legacy index; no weight payloads."""
+    return {
+        "schema": 1, "architecture": "glm5-next", "runtime_ready": False,
+        "metadata": {k: v for k, v in model.files[0].metadata.items() if k.startswith("glm5-next.")},
+        "tensor_axes": {n: {"shape": t.shape, "source_type": t.type_name, "source_type_id": t.type_id,
+                             "shard": p.name, "offset": g.data_start + t.offset}
+                        for n, (g, t, _, p) in model.where.items()},
+        "native_index_axes": "ne0=shape[0], ne1=product(shape[1:]); 1-D ne1=0; byte order unchanged",
+        "kda_projections": "Q/K/V and convolutions remain separate tensors, as in the source",
+    }
+
+
+def packing_plan(model: Model, compat_bf16: bool = False) -> list[dict]:
+    """The dry-run plan. Uses metadata only, and deliberately never checks floating weight values."""
+    plan = []
+    for name, (_, t, _, p) in model.where.items():
+        form = form_of(name, model.architecture)
+        destination = form or t.type_name
+        if is_expert(name):
+            action, destination = "expert-native", t.type_name
+        elif name in NOT_IN_PACK:
+            action, destination = "external-native", t.type_name
+        elif t.type_name not in FLOAT and (form is None or (
+                name == "blk.1.ple_key.weight" and t.type_name in NATIVE_PLE_KEY)):
+            action, destination = "native", t.type_name
+        else:
+            if len(t.shape) > 2 and model.architecture != "glm5-next":
+                raise ValueError(f"{name}: the Qwen index holds at most two dimensions")
+            if t.type_name not in FLOAT and not compat_bf16:
+                raise ValueError(f"{name} is {t.type_name}, but the engine requires {form}; use --compat-bf16")
+            action = "pack-float" if destination == t.type_name else "convert-needs-payload-check"
+        plan.append({"name": name, "action": action, "source_type": t.type_name, "destination_type": destination,
+                     "shape": t.shape, "index_shape": [t.shape[0], math.prod(t.shape[1:]) if len(t.shape) > 1 else 0],
+                     "source_bytes": t.expected_bytes(), "shard": p.name})
+    return plan
+
+
+def dry_run(model: Model, src: pathlib.Path, compat_bf16: bool = False) -> int:
+    got = expert_layout(model, src)
+    if isinstance(got, str):
+        print(got)
+        return 1
+    layout, _, n_expert, expert_bytes = got
+    plan = packing_plan(model, compat_bf16)
+    counts = {}
+    print(f"DRY RUN: architecture={model.architecture}; headers only; no tensor payloads or output files")
+    for row in plan:
+        action = row["action"]
+        counts[action] = counts.get(action, 0) + 1
+        print(f"{action}: {row['name']} {row['source_type']} -> {row['destination_type']} "
+              f"shape={row['shape']} index={row['index_shape']} source_bytes={row['source_bytes']} shard={row['shard']}")
+    if model.architecture == "glm5-next":
+        dense = int(model.files[0].metadata["glm5-next.leading_dense_block_count"])
+        print(f"dense layers: {list(range(dense))}; skipped in expert table")
+        print("GLM small Q8_0 projections kept native; F32 router kept F32; KDA Q/K/V kept separate")
+        print("native_experts.txt v5 and glm5-layout.json: Phase 1 packing contract; runtime support pending Phase 2")
+    print(f"expert layers: {[row[0] for row in layout]}; experts per layer={n_expert}; "
+          f"optional experts.bin bytes={expert_bytes} (not written)")
+    print(f"dry-run: tensors={len(plan)} actions={json.dumps(counts, sort_keys=True)}; "
+          f"payload_reads=0 files_written=0")
+    return 0
 
 
 def experts_source(model: Model, text: str, total: int) -> dict:
@@ -494,7 +614,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True, help="the model's shard 1")
     ap.add_argument("--base", help="optional: a Q2_0 canonical pack whose dense.bin holds the shared float tensors")
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", help="required except with --dry-run")
+    ap.add_argument("--dry-run", action="store_true", help="read headers only; list actions without creating any files")
     ap.add_argument("--skip-experts", action="store_true", help="rewrite the index only")
     ap.add_argument("--compat-bf16", action="store_true",
                     help="dequantize small non-native projections to BF16 for ordinary Qwen4Exp GGUFs "
@@ -504,18 +625,25 @@ def main() -> int:
     a = ap.parse_args()
     if a.compat_bf16 and a.base:
         ap.error("--compat-bf16 cannot reuse --base dense weights")
+    if not a.dry_run and not a.out:
+        ap.error("--out is required unless --dry-run is selected")
+    if a.dry_run and a.base:
+        ap.error("--dry-run cannot inspect --base compatibility without reading weight payloads")
     # HF snapshot files are symlinks to hash-named blobs. Keep the shard filename for discovery: .absolute(), not
     # .resolve(), which would follow the link to the blob and lose the -0000N-of-0000M name.
     src = pathlib.Path(a.gguf).absolute()
     base = pathlib.Path(a.base).resolve() if a.base else None
-    out = pathlib.Path(a.out)
-    out.mkdir(parents=True, exist_ok=True)
-
-    g = G.GGUFFile(src)
-    mm = np.memmap(src, dtype=np.uint8, mode="r")
-    model = Model(src)
+    model = Model(src, header_only=a.dry_run)
+    if model.architecture == "glm5-next" and (a.base or a.compat_bf16):
+        ap.error("glm5-next preserves native projections and F32 routing; --base and --compat-bf16 are not applicable")
     if len(model.paths) > 1:
         print("model shards: " + ", ".join(p.name for p in model.paths))
+    if a.dry_run:
+        return dry_run(model, src, a.compat_bf16)
+    out = pathlib.Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    g = model.files[0]
+    mm = np.memmap(src, dtype=np.uint8, mode="r")
     # ---- the expert table first: a model that cannot be packed is refused before any file of the pack changes
     got = expert_layout(model, src)
     if isinstance(got, str):
