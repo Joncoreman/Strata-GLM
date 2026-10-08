@@ -17,5 +17,8 @@ void glm5_pack3(const float* q, const float* k, const float* v, float* dst, int 
 /// `pool`, c = steps[t * step_count + 0] (kStepPos, the cell).
 void glm5_latent_store(const float* kv, uint16_t* pool, const int32_t* page_table, const int32_t* steps, int step_count,
                        int page_size, int dim, int n_tok, void* stream);
+/// The same into a q4_0 pool (dim / 32 ggml blocks of 18 bytes per row; read by mla_decode_attn_batch_q4).
+void glm5_latent_store_q4(const float* kv, uint8_t* pool, const int32_t* page_table, const int32_t* steps, int step_count,
+                          int page_size, int dim, int n_tok, void* stream);
 
 }  // namespace strata::kernels

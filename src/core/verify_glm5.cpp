@@ -60,7 +60,9 @@ struct Verifier::Glm5 {
     float* convw = nullptr;          // [nK][C][4]
     float* gate = nullptr;           // [nK][MT][H][S]
     // per DSA layer
-    uint16_t* latent = nullptr;      // [nD][max_cells][KVR] fp16
+    uint8_t* latent = nullptr;       // [nD][max_cells] rows of lat_row bytes: fp16 [KVR], or q4_0 (STRATA_GLM5_KV)
+    bool lat_q4 = true;
+    size_t lat_row = 0;
     float* tail = nullptr;           // [nD][3][2*ID]
     float* pooled = nullptr;         // [nD][max_cells/4 + 1][ID]
     float* tail_snap = nullptr;      // [nD][3][2*ID]
@@ -138,7 +140,9 @@ bool Verifier::init_glm5(std::string& err) {
     // per-layer device state
     m.convw = m.dev<float>((size_t) nK * m.C * 4);
     m.gate = m.dev<float>((size_t) nK * MT * m.H * m.S);
-    m.latent = m.dev<uint16_t>((size_t) nD * m.max_cells * m.KVR);
+    { const char* kvv = std::getenv("STRATA_GLM5_KV"); m.lat_q4 = !(kvv && std::string(kvv) == "f16"); }   // default q4 (2026-10-08)
+    m.lat_row = m.lat_q4 ? (size_t) kMlaQ4RowBytes : (size_t) m.KVR * 2;
+    m.latent = m.dev<uint8_t>((size_t) nD * m.max_cells * m.lat_row);
     m.tail = m.dev<float>((size_t) nD * 3 * 2 * m.ID);
     m.pooled = m.dev<float>((size_t) nD * (m.max_cells / 4 + 1) * m.ID);
     m.tail_snap = m.dev<float>((size_t) nD * 3 * 2 * m.ID);
@@ -193,8 +197,8 @@ bool Verifier::init_glm5(std::string& err) {
                  (long long) m.NFF, (long long) m.NFFD, (long long) m.NE, (long long) m.K, (long long) m.cap, m.rms_eps,
                  m.ln_eps, m.hc_eps, m.lb, m.wscale, m.clamp_exp, m.clamp_sh);
     std::fprintf(stderr, "strata verify: glm5-next window: %lld KDA + %lld DSA layers, %lld dense, %lld-cell latent cache "
-                         "(%.1f MiB)\n", (long long) nK, (long long) nD, (long long) g.n_dense_layers,
-                 (long long) m.max_cells, (double) nD * m.max_cells * m.KVR * 2 / 1048576.0);
+                         "(%.1f MiB, %s)\n", (long long) nK, (long long) nD, (long long) g.n_dense_layers,
+                 (long long) m.max_cells, (double) nD * m.max_cells * m.lat_row / 1048576.0, m.lat_q4 ? "q4_0" : "fp16");
     return true;
 }
 
@@ -285,7 +289,7 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
             if (!wqa || !wqan || !wqb || !wkb || !wvb || !wkv || !wkvn || !wo || !wik || !wiqb || !wikn || !wikb || !wip ||
                 !wape || !wig) return false;
             const int64_t QLR = m.QLR, NH = m.NH, QK = m.QK, KVR = m.KVR, VD = m.VD, ID = m.ID, IH = m.IH;
-            uint16_t* lat_pool = m.latent + (size_t) qi * m.max_cells * KVR;
+            uint8_t* lat_pool = m.latent + (size_t) qi * m.max_cells * m.lat_row;
             float* tail = m.tail + (size_t) qi * 3 * 2 * ID;
             float* pooled = m.pooled + (size_t) qi * (m.max_cells / 4 + 1) * ID;
             float* rk = m.raw_k + (size_t) qi * MT * ID;
@@ -297,7 +301,8 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
             native_mmvq(wig->native_type, wig->native_data, xq_, rg, (int) N, (int) ID, n, cs);
             native_qsa_rms_norm_weighted(m.qr, (const float*) wqan->data, m.qr, (int) QLR, n, m.rms_eps, cs);
             native_qsa_rms_norm_weighted(m.kv, (const float*) wkvn->data, m.kv, (int) KVR, n, m.rms_eps, cs);
-            glm5_latent_store(m.kv, lat_pool, m.page_table, step_, kStepCount, 4, (int) KVR, n, cs);
+            if (m.lat_q4) glm5_latent_store_q4(m.kv, lat_pool, m.page_table, step_, kStepCount, 4, (int) KVR, n, cs);
+            else glm5_latent_store(m.kv, (uint16_t*) lat_pool, m.page_table, step_, kStepCount, 4, (int) KVR, n, cs);
             // q: q_b, then the absorbed query q_abs[h] = wk_b[h] . q[h] (256 -> 512), head by head
             mmvq(wqb, m.qr, (int) QLR, m.qb, (int) (NH * QK), n, m.q8, cs);
             glm5_transpose_abd(m.qb, m.qT, n, (int) NH, (int) QK, cs);                      // [h][t][QK]
@@ -321,7 +326,8 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
             glm5_kpool_scores(m.iq, m.iw, pooled, step_, n, max_blocks_, scores_, cs);
             qsa_block_topk(scores_, step_, n, max_blocks_, cap_, s, sel_, cs);
             // MLA over the selection (fp16 latents; scale 1/sqrt(q head dim) as llama.cpp), wv_b per head, then wo
-            mla_decode_attn_batch(m.qa, lat_pool, m.page_table, 4, sel_, step_, cap_, (int) NH, 1.0f / std::sqrt((float) QK),
+            if (m.lat_q4) mla_decode_attn_batch_q4(m.qa, lat_pool, m.page_table, 4, sel_, step_, cap_, (int) NH, 1.0f / std::sqrt((float) QK), m.mla_scratch, m.lat, n, cs);
+            else mla_decode_attn_batch(m.qa, (const uint16_t*) lat_pool, m.page_table, 4, sel_, step_, cap_, (int) NH, 1.0f / std::sqrt((float) QK),
                                   m.mla_scratch, m.lat, n, cs);
             glm5_transpose_abd(m.lat, m.latT, n, (int) NH, (int) KVR, cs);                  // [h][t][KVR]
             native_quantize_q8_1(m.latT, m.q8, (int) (KVR * NH * n), 1, cs);
@@ -718,7 +724,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         if (!wqa || !wqan || !wqb || !wkb || !wvb || !wkv || !wkvn || !wo || !wik || !wiqb || !wikn || !wikb || !wip ||
             !wape || !wig) return false;
         const int64_t QLR = m.QLR, NH = m.NH, QK = m.QK, KVR = m.KVR, VD = m.VD, ID = m.ID, IH = m.IH;
-        uint16_t* lat_pool = m.latent + (size_t) qi * m.max_cells * KVR;
+        uint8_t* lat_pool = m.latent + (size_t) qi * m.max_cells * m.lat_row;
         float* tail = m.tail + (size_t) qi * 3 * 2 * ID;
         float* pooled = m.pooled + (size_t) qi * (m.max_cells / 4 + 1) * ID;
         float* rk = m.raw_k + (size_t) qi * MT * ID;
@@ -730,7 +736,8 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         native_mmvq(wig->native_type, wig->native_data, xq_, rg, (int) N, (int) ID, n, cs);
         native_qsa_rms_norm_weighted(m.qr, (const float*) wqan->data, m.qr, (int) QLR, n, m.rms_eps, cs);
         native_qsa_rms_norm_weighted(m.kv, (const float*) wkvn->data, m.kv, (int) KVR, n, m.rms_eps, cs);
-        glm5_latent_store(m.kv, lat_pool, m.page_table, st, kStepCount, 4, (int) KVR, n, cs);
+        if (m.lat_q4) glm5_latent_store_q4(m.kv, lat_pool, m.page_table, st, kStepCount, 4, (int) KVR, n, cs);
+        else glm5_latent_store(m.kv, (uint16_t*) lat_pool, m.page_table, st, kStepCount, 4, (int) KVR, n, cs);
         mmvq(wqb, m.qr, (int) QLR, m.qb, (int) (NH * QK), n, m.q8, cs);
         glm5_transpose_abd(m.qb, m.qT, n, (int) NH, (int) QK, cs);
         native_quantize_q8_1(m.qT, m.q8, (int) (QK * NH * n), 1, cs);
@@ -750,7 +757,8 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         glm5_f32_gemv((const float*) wip->data, xm, m.iw, (int) N, (int) IH, n, 1.0f / std::sqrt((float) (ID * IH)), cs);
         glm5_kpool_scores(m.iq, m.iw, pooled, st, n, max_blocks_, scores_, cs);
         qsa_block_topk(scores_, st, n, max_blocks_, cap_, s, sel_, cs);
-        mla_decode_attn_batch(m.qa, lat_pool, m.page_table, 4, sel_, st, cap_, (int) NH, 1.0f / std::sqrt((float) QK),
+        if (m.lat_q4) mla_decode_attn_batch_q4(m.qa, lat_pool, m.page_table, 4, sel_, st, cap_, (int) NH, 1.0f / std::sqrt((float) QK), m.mla_scratch, m.lat, n, cs);
+        else mla_decode_attn_batch(m.qa, (const uint16_t*) lat_pool, m.page_table, 4, sel_, st, cap_, (int) NH, 1.0f / std::sqrt((float) QK),
                               m.mla_scratch, m.lat, n, cs);
         glm5_transpose_abd(m.lat, m.latT, n, (int) NH, (int) KVR, cs);
         native_quantize_q8_1(m.latT, m.q8, (int) (KVR * NH * n), 1, cs);

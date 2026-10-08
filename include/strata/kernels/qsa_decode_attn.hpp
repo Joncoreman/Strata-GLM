@@ -51,5 +51,11 @@ uint64_t mla_decode_attn_scratch_floats(int64_t cap, int64_t n_head);
 void mla_decode_attn_batch(const float* q_abs, const uint16_t* latent_pool, const int32_t* page_table, int page_size,
                            const int32_t* ids, const int32_t* steps, int64_t cap, int n_head, float scale,
                            float* scratch, float* out, int64_t n_q, void* stream);
+/// The same over a q4_0 latent pool (2026-10-08): rows of 288 bytes (16 ggml q4_0 blocks of 32), written by
+/// glm5_latent_store_q4 - 0.28 of the fp16 pool, so a 262144-cell context costs 0.77 GiB instead of 2.75.
+inline constexpr int64_t kMlaQ4RowBytes = 288;
+void mla_decode_attn_batch_q4(const float* q_abs, const uint8_t* latent_q4, const int32_t* page_table, int page_size,
+                              const int32_t* ids, const int32_t* steps, int64_t cap, int n_head, float scale,
+                              float* scratch, float* out, int64_t n_q, void* stream);
 
 }  // namespace strata::kernels

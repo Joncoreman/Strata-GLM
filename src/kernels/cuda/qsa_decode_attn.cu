@@ -216,7 +216,44 @@ constexpr int MHD = 512;            // latent dim
 constexpr int MGH = 16;             // query heads per block
 constexpr int MPL = MHD / 32;       // latent values per lane in the score pass (16)
 
-__global__ void __launch_bounds__(THREADS) mla_chunk_kernel(const float* __restrict__ q, const uint16_t* __restrict__ pool,
+// The latent row's formats: fp16 (512 x 2 bytes) or q4_0 (16 ggml blocks of 32: an fp16 scale + 16 bytes of nibbles,
+// value i < 16 in the low nibble of qs[i], i >= 16 in the high nibble of qs[i - 16]; 288 bytes), 2026-10-08.
+constexpr int MQ4_ROW = (MHD / QK4_0) * (int) sizeof(block_q4_0);
+template <bool Q4>
+__device__ __forceinline__ void mla_load8(const void* pool, long long row, int d0, float* out) {
+    if constexpr (!Q4) {
+        const uint4 raw = *reinterpret_cast<const uint4*>((const uint16_t*) pool + row * MHD + d0);
+        const __half2* h2 = reinterpret_cast<const __half2*>(&raw);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) { const float2 f = __half22float2(h2[j]); out[2 * j] = f.x; out[2 * j + 1] = f.y; }
+    } else {
+        const block_q4_0* blk = reinterpret_cast<const block_q4_0*>((const uint8_t*) pool + row * MQ4_ROW) + d0 / QK4_0;
+        const float d = __half2float(__ushort_as_half(blk->d));
+        const int rem = d0 % QK4_0;                       // 0, 8, 16 or 24
+        const uint8_t* bytes = blk->qs + (rem & 15);
+        if (rem < 16) {
+#pragma unroll
+            for (int k = 0; k < 8; ++k) out[k] = (float) ((int) (bytes[k] & 0x0F) - 8) * d;
+        } else {
+#pragma unroll
+            for (int k = 0; k < 8; ++k) out[k] = (float) ((int) (bytes[k] >> 4) - 8) * d;
+        }
+    }
+}
+template <bool Q4>
+__device__ __forceinline__ float mla_load1(const void* pool, long long row, int i) {
+    if constexpr (!Q4) {
+        return __half2float(__ushort_as_half(((const uint16_t*) pool)[row * MHD + i]));
+    } else {
+        const block_q4_0* blk = reinterpret_cast<const block_q4_0*>((const uint8_t*) pool + row * MQ4_ROW) + i / QK4_0;
+        const int r = i % QK4_0;
+        const int nib = r < 16 ? (blk->qs[r] & 0x0F) : (blk->qs[r - 16] >> 4);
+        return (float) (nib - 8) * __half2float(__ushort_as_half(blk->d));
+    }
+}
+
+template <bool Q4>
+__global__ void __launch_bounds__(THREADS) mla_chunk_kernel(const float* __restrict__ q, const void* __restrict__ pool,
                                                             const int32_t* __restrict__ page_table,
                                                             const int32_t* __restrict__ ids,
                                                             const int32_t* __restrict__ step, int n_head, int page_size,
@@ -260,14 +297,9 @@ __global__ void __launch_bounds__(THREADS) mla_chunk_kernel(const float* __restr
             continue;
         }
         float k16[MPL];
-        const uint16_t* row = pool + srow[c] * MHD + lane * 8;
 #pragma unroll
-        for (int half = 0; half < 2; ++half) {   // dims lane*8 + [0,8) and 256 + lane*8 + [0,8)
-            const uint4 raw = *reinterpret_cast<const uint4*>(row + half * 256);
-            const __half2* h2 = reinterpret_cast<const __half2*>(&raw);
-#pragma unroll
-            for (int j = 0; j < 4; ++j) { const float2 f = __half22float2(h2[j]); k16[half * 8 + 2 * j] = f.x; k16[half * 8 + 2 * j + 1] = f.y; }
-        }
+        for (int half = 0; half < 2; ++half)   // dims lane*8 + [0,8) and 256 + lane*8 + [0,8)
+            mla_load8<Q4>(pool, srow[c], half * 256 + lane * 8, k16 + half * 8);
 #pragma unroll
         for (int h = 0; h < MGH; ++h) {
             float s = 0.f;
@@ -301,8 +333,8 @@ __global__ void __launch_bounds__(THREADS) mla_chunk_kernel(const float* __restr
     for (int h = 0; h < MGH; ++h) { acc0[h] = 0.0f; acc1[h] = 0.0f; }
     for (int c = 0; c < n_here; ++c) {
         if (srow[c] < 0) continue;
-        const float v0 = __half2float(__ushort_as_half(pool[srow[c] * MHD + t]));
-        const float v1 = __half2float(__ushort_as_half(pool[srow[c] * MHD + 256 + t]));
+        const float v0 = mla_load1<Q4>(pool, srow[c], t);
+        const float v1 = mla_load1<Q4>(pool, srow[c], 256 + t);
 #pragma unroll
         for (int h = 0; h < MGH; ++h) { acc0[h] = fmaf(sp[h][c], v0, acc0[h]); acc1[h] = fmaf(sp[h][c], v1, acc1[h]); }
     }
@@ -342,9 +374,11 @@ uint64_t mla_decode_attn_scratch_floats(int64_t cap, int64_t n_head) {
     return (uint64_t) chunks * (uint64_t) n_head * (MHD + 2) + 64;
 }
 
-void mla_decode_attn_batch(const float* q_abs, const uint16_t* latent_pool, const int32_t* page_table, int page_size,
-                           const int32_t* ids, const int32_t* steps, int64_t cap, int n_head, float scale,
-                           float* scratch, float* out, int64_t n_q, void* stream) {
+namespace {
+template <bool Q4>
+void mla_decode_attn_any(const float* q_abs, const void* latent_pool, const int32_t* page_table, int page_size,
+                         const int32_t* ids, const int32_t* steps, int64_t cap, int n_head, float scale,
+                         float* scratch, float* out, int64_t n_q, void* stream) {
     if (n_q <= 0) return;
     if (n_head % MGH != 0 || cap <= 0 || !scratch || !ids || !steps || !page_table || !latent_pool || n_q > 65535) {
         std::fprintf(stderr, "mla_decode_attn_batch: unsupported geometry or missing buffers\n");
@@ -356,7 +390,7 @@ void mla_decode_attn_batch(const float* q_abs, const uint16_t* latent_pool, cons
     float* part_m = scratch + (size_t) n_chunks * n_head * MHD;
     float* part_l = part_m + (size_t) n_chunks * n_head;
     cudaStream_t st = (cudaStream_t) stream;
-    mla_chunk_kernel<<<dim3((unsigned) n_chunks, (unsigned) (n_head / MGH), (unsigned) n_q), THREADS, 0, st>>>(
+    mla_chunk_kernel<Q4><<<dim3((unsigned) n_chunks, (unsigned) (n_head / MGH), (unsigned) n_q), THREADS, 0, st>>>(
         q_abs, latent_pool, page_table, ids, steps, n_head, page_size, scale, part_acc, part_m, part_l, n_chunks,
         (int) cap, stride);
     mla_merge_kernel<<<dim3((unsigned) n_head, (unsigned) n_q), MHD, 0, st>>>(part_acc, part_m, part_l, n_chunks, n_head,
@@ -366,6 +400,21 @@ void mla_decode_attn_batch(const float* q_abs, const uint16_t* latent_pool, cons
         std::fprintf(stderr, "mla_decode_attn_batch: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
+}
+}  // namespace
+
+void mla_decode_attn_batch(const float* q_abs, const uint16_t* latent_pool, const int32_t* page_table, int page_size,
+                           const int32_t* ids, const int32_t* steps, int64_t cap, int n_head, float scale,
+                           float* scratch, float* out, int64_t n_q, void* stream) {
+    mla_decode_attn_any<false>(q_abs, latent_pool, page_table, page_size, ids, steps, cap, n_head, scale, scratch, out,
+                               n_q, stream);
+}
+
+void mla_decode_attn_batch_q4(const float* q_abs, const uint8_t* latent_q4, const int32_t* page_table, int page_size,
+                              const int32_t* ids, const int32_t* steps, int64_t cap, int n_head, float scale,
+                              float* scratch, float* out, int64_t n_q, void* stream) {
+    mla_decode_attn_any<true>(q_abs, latent_q4, page_table, page_size, ids, steps, cap, n_head, scale, scratch, out,
+                              n_q, stream);
 }
 
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,

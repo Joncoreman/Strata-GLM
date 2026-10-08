@@ -58,7 +58,38 @@ __global__ void latent_store_kernel(const float* __restrict__ kv, uint16_t* __re
     for (int i = threadIdx.x; i < dim; i += blockDim.x) row[i] = __half_as_ushort(__float2half(kv[(size_t) t * dim + i]));
 }
 
+// q4_0 as ggml's quantize_row_q4_0_ref: per 32 values the one of largest magnitude m, d = m / -8, q = min(15,
+// (int)(x / d + 8.5)), value i < 16 in the low nibble of qs[i], i >= 16 in the high nibble of qs[i - 16]
+struct Q4Block { uint16_t d; uint8_t qs[16]; };
+static_assert(sizeof(Q4Block) == 18, "q4_0 block");
+__global__ void latent_store_q4_kernel(const float* __restrict__ kv, uint8_t* __restrict__ pool,
+                                       const int32_t* __restrict__ page_table, const int32_t* __restrict__ steps,
+                                       int step_count, int page_size, int dim) {
+    const int t = blockIdx.x, b = threadIdx.x, nb = dim / 32;
+    if (b >= nb) return;
+    const int cell = steps[t * step_count + 0];
+    const long long page = page_table[cell / page_size];
+    if (page < 0) return;
+    const float* x = kv + (size_t) t * dim + (size_t) b * 32;
+    float amax = 0.f, m = 0.f;
+    for (int i = 0; i < 32; ++i) { const float v = x[i]; if (fabsf(v) > amax) { amax = fabsf(v); m = v; } }
+    const float d = m / -8.0f, id = d != 0.f ? 1.0f / d : 0.f;
+    Q4Block* blk = reinterpret_cast<Q4Block*>(pool + (size_t) (page * page_size + cell % page_size) * (size_t) (nb * 18)) + b;
+    blk->d = __half_as_ushort(__float2half(d));
+    for (int j = 0; j < 16; ++j) {
+        const int q0 = min(15, (int) (x[j] * id + 8.5f)), q1 = min(15, (int) (x[16 + j] * id + 8.5f));
+        blk->qs[j] = (uint8_t) (q0 | (q1 << 4));
+    }
+}
+
 }  // namespace
+
+void glm5_latent_store_q4(const float* kv, uint8_t* pool, const int32_t* page_table, const int32_t* steps, int step_count,
+                          int page_size, int dim, int n_tok, void* stream) {
+    latent_store_q4_kernel<<<(unsigned) n_tok, 32, 0, (cudaStream_t) stream>>>(kv, pool, page_table, steps, step_count,
+                                                                              page_size, dim);
+    check("glm5_latent_store_q4");
+}
 
 void glm5_f32_gemv(const float* w, const float* x, float* y, int n_in, int n_out, int n_tok, float scale, void* stream) {
     f32_gemv_kernel<<<(unsigned) ((n_out + 7) / 8), 256, 0, (cudaStream_t) stream>>>(w, x, y, n_in, n_out, n_tok, scale);
