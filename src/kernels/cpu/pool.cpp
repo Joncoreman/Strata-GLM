@@ -533,8 +533,9 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
         } else if (mode_ >= 5) {
-            // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
-            const int per = mode_ == 5 ? FF : H;
+            // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows; the widths are the layer's (glm5-next:
+            // 2048 / 4096, Qwen: 640 / 2560)
+            const int per = mode_ == 5 ? (int) nfmt_->n_ff : (int) nfmt_->n_embd;
             const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
             for (int64_t r = g0; r < g1;) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
@@ -662,6 +663,10 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
 
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
+    if (f.n_ff > kPoolMaxFF || (f.gu_type == 42 && f.n_ff > FF)) {
+        std::fprintf(stderr, "strata: native expert width %lld is past the pool's buffers\n", (long long) f.n_ff);
+        std::abort();
+    }
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
@@ -670,7 +675,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         nfmt_ = &f;
         const int threads = n_ + (host_works_ ? 1 : 0);
         mtasks_ = 3 * threads;
-        mrows_ = (int64_t) nb * FF;
+        mrows_ = (int64_t) nb * f.n_ff;
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
@@ -679,7 +684,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
                 if (f.d_type == 42) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
         const auto c = std::chrono::steady_clock::now();
-        mrows_ = (int64_t) nb * H;
+        mrows_ = (int64_t) nb * f.n_embd;
         run_phase(6, mtasks_);
         const auto d = std::chrono::steady_clock::now();
         ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();

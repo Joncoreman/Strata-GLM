@@ -258,8 +258,11 @@ private:
     ExpertJobMulti* mjobs_ = nullptr;
     int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H)
     int mtasks_ = 1;        // equal row ranges the phase is cut into
+    // glm5-next: the native path's expert width comes from the layer's NativeFmt (GLM 2048, Qwen 640); the buffer
+    // holds the widest.  The Q2_0 paths (modes 1-4) stay at FF.
+    static constexpr int kPoolMaxFF = 2048;
     struct SplitBufMulti {
-        alignas(64) float ff[MAXT][FF];
+        alignas(64) float ff[MAXT][kPoolMaxFF];
         ActQ a2[MAXT];
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
     };
