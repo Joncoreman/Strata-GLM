@@ -31,8 +31,10 @@ public:
     Glm5Mtp(const Glm5Mtp&) = delete;
     Glm5Mtp& operator=(const Glm5Mtp&) = delete;
 
+    /// `native_shard1`: the model's GGUF shard 1 (--native); with `experts_dir_pack` (the pack directory, whose
+    /// native_experts.txt names blk.45's expert slices) the 288 routed experts are loaded into VRAM (phase B).
     bool init(const WeightTable& wt, const ModelGeometry& g, const NativeHead* head, int64_t max_cells, int max_t,
-              std::string& err);
+              const std::string& native_shard1, const std::string& pack_dir, std::string& err);
     /// Catch-up: rows t < n pair h_rows[t] (device, the trunk's h at cell c0 + t) with tokens[t] (host, the token at
     /// cell c0 + t + 1).  Writes the drafter's cache for cells c0 .. c0 + n - 1.  When `draft_from` >= 0, also returns
     /// the first draft from row `draft_from` (its output) in *first and that row's h' becomes the chain's h.

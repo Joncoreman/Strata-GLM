@@ -6978,7 +6978,7 @@ int main(int argc, char** argv) {
         // glm5-next MTP (STRATA_GLM5_MTP=1, 2026-10-08): the NextN layer drafts o.spec - 1 tokens per round
         strata::core::Glm5Mtp gmtp;
         const bool gmtp_on = glm5_model && std::getenv("STRATA_GLM5_MTP") != nullptr && std::atoi(std::getenv("STRATA_GLM5_MTP")) != 0;
-        if (gmtp_on && !gmtp.init(wt, g, native_head.loaded() ? &native_head : nullptr, o.max_context, o.spec, err)) {
+        if (gmtp_on && !gmtp.init(wt, g, native_head.loaded() ? &native_head : nullptr, o.max_context, o.spec, o.native_preset, o.pack, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }

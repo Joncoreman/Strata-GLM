@@ -6,6 +6,9 @@
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/glm5_misc.hpp"
+#include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
@@ -21,6 +24,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
 
 namespace strata::core {
 
@@ -51,10 +57,24 @@ struct Glm5Mtp::Impl {
           *hp = nullptr, *logits = nullptr;
     uint8_t* q8 = nullptr;
     std::vector<int32_t> h_steps;
+    // phase B: blk.45's routed experts in VRAM, [288][blob] native blobs (gate | up | down), and the router
+    uint8_t* experts = nullptr;
+    strata::kernels::NativeExpertLayout L;
+    int64_t NE = 0, K = 8;
+    float wscale = 1.f, clamp_exp = 0.f;
+    const WeightRef *wr = nullptr, *wb = nullptr;
+    float *rlog = nullptr, *rw = nullptr, *parts = nullptr, *moe = nullptr;
+    int32_t* rids = nullptr;
+    int32_t* plan = nullptr;   // device: start[cap+1] | dst[cap] | tok[cap] | count
+    unsigned long long* gptr = nullptr;
+    uint8_t* xq = nullptr;
+    void* gscratch = nullptr;
+    std::vector<int32_t> h_ids, h_plan;
+    std::vector<unsigned long long> h_ptr;
     std::vector<void*> allocs;
     template <typename T> T* dev(size_t n) {
         void* p = nullptr;
-        if (cudaMalloc(&p, n * sizeof(T) + 256) != cudaSuccess) return nullptr;
+        if (cudaMalloc(&p, n * sizeof(T) + 256) != cudaSuccess) { cudaGetLastError(); allocs.push_back(nullptr); return nullptr; }
         cudaMemset(p, 0, n * sizeof(T) + 256);
         allocs.push_back(p);
         return (T*) p;
@@ -69,7 +89,7 @@ Glm5Mtp::~Glm5Mtp() {
 }
 
 bool Glm5Mtp::init(const WeightTable& wt, const ModelGeometry& g, const NativeHead* head, int64_t max_cells, int max_t,
-                   std::string& err) {
+                   const std::string& native_shard1, const std::string& pack_dir, std::string& err) {
     using namespace strata::kernels;
     m_ = new Impl();
     Impl& m = *m_;
@@ -138,8 +158,73 @@ bool Glm5Mtp::init(const WeightTable& wt, const ModelGeometry& g, const NativeHe
         cudaMemcpy(m.page_table, pt.data(), pt.size() * 4, cudaMemcpyHostToDevice);
     }
     m.h_steps.assign(T * kStepCount, 0);
-    std::fprintf(stderr, "strata glm5 mtp: NextN layer blk.%lld bound (shared expert only, phase A), %lld-cell cache\n",
-                 (long long) L, (long long) max_cells);
+    // ---- phase B: blk.45's routed experts into VRAM (STRATA_GLM5_MTP_EXPERTS=0: the shared expert alone, phase A)
+    const char* ev = std::getenv("STRATA_GLM5_MTP_EXPERTS");
+    if (!(ev != nullptr && std::atoi(ev) == 0) && !pack_dir.empty() && !native_shard1.empty()) {
+        m.NE = g.n_expert; m.K = g.n_expert_used; m.wscale = g.expert_weights_scale;
+        m.clamp_exp = g.swiglu_clamp_exp.empty() ? 0.f : g.swiglu_clamp_exp.back();
+        m.wr = W("ffn_gate_inp.weight"); m.wb = W("exp_probs_b.bias");
+        if (!err.empty()) return false;
+        std::ifstream lay(pack_dir + "/native_experts.txt");
+        std::string line, want = std::to_string(L) + " ";
+        long long gu = -1, dt = -1, off = 0, blob = 0, go = 0, uo = 0, dofs = 0;
+        std::string shard;
+        while (std::getline(lay, line))
+            if (line.rfind(want, 0) == 0) {
+                std::istringstream is(line);
+                long long l2;
+                is >> l2 >> gu >> dt >> off >> blob >> go >> uo >> dofs >> shard;
+                break;
+            }
+        if (gu < 0 || shard.empty() || shard.find(',') != std::string::npos) {
+            err = "glm5 mtp: native_experts.txt has no single-shard line for blk." + std::to_string(L);
+            return false;
+        }
+        if (!native_expert_supported((int) gu, (int) dt, m.N, m.NFF)) {
+            err = "glm5 mtp: blk.45's expert types " + std::to_string(gu) + "/" + std::to_string(dt) + " have no GPU kernel";
+            return false;
+        }
+        m.L = native_expert_layout((int) gu, (int) dt, m.N, m.NFF);
+        m.L.swiglu_limit = m.clamp_exp;
+        if ((long long) m.L.bytes != blob) { err = "glm5 mtp: blk.45's blob size disagrees with the layout"; return false; }
+        const size_t slash = native_shard1.find_last_of("/\\");
+        const std::string path = (slash == std::string::npos ? std::string() : native_shard1.substr(0, slash + 1)) + shard;
+        m.experts = m.dev<uint8_t>((size_t) m.NE * m.L.bytes);
+        if (m.experts == nullptr) {
+            err = "glm5 mtp: blk.45's experts (" + std::to_string((m.NE * (long long) m.L.bytes) >> 20) +
+                  " MiB) do not fit in VRAM - raise --vram-reserve-mib";
+            return false;
+        }
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (f == nullptr) { err = "glm5 mtp: cannot open " + path; return false; }
+        const long long role_off[3] = {go, uo, dofs};
+        const size_t role_bytes[3] = {m.L.up_off, m.L.up_off, m.L.bytes - m.L.down_off};
+        const size_t dst_off[3] = {0, m.L.up_off, m.L.down_off};
+        std::vector<uint8_t> buf;
+        for (int r = 0; r < 3; ++r) {
+            buf.resize((size_t) m.NE * role_bytes[r]);
+            if (_fseeki64(f, role_off[r], SEEK_SET) != 0 || std::fread(buf.data(), 1, buf.size(), f) != buf.size()) {
+                std::fclose(f);
+                err = "glm5 mtp: reading blk.45's experts from " + path + " failed";
+                return false;
+            }
+            cudaMemcpy2D(m.experts + dst_off[r], m.L.bytes, buf.data(), role_bytes[r], role_bytes[r], (size_t) m.NE,
+                         cudaMemcpyHostToDevice);
+        }
+        std::fclose(f);
+        const int64_t cap = (int64_t) T * m.K;
+        m.rlog = m.dev<float>(T * m.NE); m.rw = m.dev<float>((size_t) cap); m.rids = m.dev<int32_t>((size_t) cap);
+        m.parts = m.dev<float>((size_t) cap * m.N); m.moe = m.dev<float>(T * m.N);
+        m.plan = m.dev<int32_t>((size_t) (3 * cap + 2)); m.gptr = m.dev<unsigned long long>((size_t) cap);
+        m.xq = m.dev<uint8_t>(T * (m.N / 32) * 36);
+        m.gscratch = m.dev<uint8_t>(native_expert_scratch_bytes(cap, m.NFF));
+        for (void* p : m.allocs) if (p == nullptr) { err = "glm5 mtp: a device buffer does not fit"; return false; }
+        m.h_ids.resize((size_t) cap); m.h_plan.resize((size_t) (3 * cap + 2)); m.h_ptr.resize((size_t) cap);
+        std::fprintf(stderr, "strata glm5 mtp: blk.%lld's %lld routed experts in VRAM (%.2f GiB, types %lld/%lld) from %s\n",
+                     (long long) L, (long long) m.NE, (double) m.NE * m.L.bytes / 1073741824.0, gu, dt, shard.c_str());
+    }
+    std::fprintf(stderr, "strata glm5 mtp: NextN layer blk.%lld bound (%s), %lld-cell cache\n", (long long) L,
+                 m.experts ? "routed + shared experts" : "shared expert only, phase A", (long long) max_cells);
     return true;
 }
 
@@ -213,7 +298,45 @@ bool Glm5Mtp::layer(const int32_t* tok_dev, const float* h_in, int n, int64_t c0
         nsw.gate_type = m.wsg->native_type; nsw.gate_data = m.wsg->native_data; nsw.up_type = m.wsu->native_type;
         nsw.up_data = m.wsu->native_data; nsw.down_type = m.wsd->native_type; nsw.down_data = m.wsd->native_data; nsw.q8_1 = m.q8;
         shared_expert_multi(n, m.x, nullptr, nsw, nullptr, m.sg, m.su, m.sgs, m.sh, N, m.NFF, cs, m.clamp_sh);
-        add_inplace(m.u, m.sh, (int64_t) n * N, cs);
+        if (m.experts != nullptr) {   // phase B: the routed experts, all on the GPU
+            const int64_t K = m.K, cap = (int64_t) n * K;
+            glm5_f32_gemv((const float*) m.wr->data, m.x, m.rlog, (int) N, (int) m.NE, n, 1.0f, cs);
+            router_sigmoid_topk(m.rlog, (const float*) m.wb->data, n, (int) m.NE, (int) K, m.wscale, m.rids, m.rw, cs);
+            cudaMemcpyAsync(m.h_ids.data(), m.rids, (size_t) cap * 4, cudaMemcpyDeviceToHost, cs);
+            if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "glm5 mtp: the router failed on the GPU"; return false; }
+            // groups: one per distinct expert, its entries (row t*K + j of parts, token t)
+            int32_t* start = m.h_plan.data();
+            int32_t* dst = start + cap + 1;
+            int32_t* tok = dst + cap;
+            int groups = 0, entries = 0;
+            std::vector<char> done((size_t) cap, 0);
+            for (int64_t i = 0; i < cap; ++i) {
+                if (done[(size_t) i]) continue;
+                const int32_t e = m.h_ids[(size_t) i];
+                m.h_ptr[(size_t) groups] = (unsigned long long) (m.experts + (size_t) e * m.L.bytes);
+                start[groups] = entries;
+                for (int64_t j = i; j < cap; ++j)
+                    if (!done[(size_t) j] && m.h_ids[(size_t) j] == e) {
+                        done[(size_t) j] = 1;
+                        dst[entries] = (int32_t) j;
+                        tok[entries] = (int32_t) (j / K);
+                        ++entries;
+                    }
+                ++groups;
+            }
+            start[groups] = entries;
+            int32_t* count = tok + cap;
+            count[0] = groups;
+            cudaMemcpyAsync(m.plan, m.h_plan.data(), m.h_plan.size() * 4, cudaMemcpyHostToDevice, cs);
+            cudaMemcpyAsync(m.gptr, m.h_ptr.data(), (size_t) groups * 8, cudaMemcpyHostToDevice, cs);
+            quantize_q8_1_rows(m.x, n, N, m.xq, cs);
+            native_expert_grouped(m.L, m.gptr, m.plan, m.plan + 3 * cap + 1, m.plan + cap + 1, m.plan + 2 * cap + 1, cap, cap,
+                                  m.xq, m.gscratch, m.parts, cs);
+            native_moe_combine_multi(m.parts, m.rw, m.sh, m.moe, N, K, n, cs);
+            add_inplace(m.u, m.moe, (int64_t) n * N, cs);
+        } else {
+            add_inplace(m.u, m.sh, (int64_t) n * N, cs);
+        }
         // ---- h' and the draft
         native_qsa_rms_norm_weighted(m.u, (const float*) m.shn->data, m.hp, (int) N, n, m.rms_eps, cs);
         native_quantize_q8_1(m.hp, m.q8, (int) N, n, cs);

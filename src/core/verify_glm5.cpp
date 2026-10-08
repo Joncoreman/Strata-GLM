@@ -73,7 +73,7 @@ struct Verifier::Glm5 {
     std::vector<void*> allocs;
     template <typename T> T* dev(size_t n) {
         void* p = nullptr;
-        if (cudaMalloc(&p, n * sizeof(T) + 256) != cudaSuccess) return nullptr;
+        if (cudaMalloc(&p, n * sizeof(T) + 256) != cudaSuccess) { cudaGetLastError(); allocs.push_back(nullptr); return nullptr; }
         cudaMemset(p, 0, n * sizeof(T) + 256);
         allocs.push_back(p);
         return (T*) p;
