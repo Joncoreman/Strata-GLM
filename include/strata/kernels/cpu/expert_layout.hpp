@@ -61,6 +61,6 @@ const ExpertLayout& expert_layout();
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
 /// The newest native_experts.txt this engine reads.  v4 = v3 plus the per-role shard column `gate,up,down`,
 /// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
-inline constexpr int kExpertLayoutVersion = 4;
+inline constexpr int kExpertLayoutVersion = 5;   // v5 (2026-10-08): glm5-next, n_embd / n_ff / swiglu_limit in the header
 
 }  // namespace strata::kernels::cpu

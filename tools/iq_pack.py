@@ -522,10 +522,17 @@ def expert_layout(model: Model, src: pathlib.Path):
     if model.architecture == "glm5-next":
         # Dense leading layers and non-Qwen widths require a new runtime contract. Old engines must refuse
         # this table rather than size their fixed 2560/640 pools from it. Phase 2 consumes glm5-layout.json.
+        md = model.files[0].metadata
+        n_embd = int(md["glm5-next.embedding_length"])
+        widths = md["glm5-next.expert_feed_forward_length"]           # per layer; the expert layers share one width
+        n_ff = int(widths[-1] if isinstance(widths, (list, tuple)) else widths)
+        clamp = md.get("glm5-next.swiglu_clamp_exp", 0.0)
+        clamp = float(clamp[-1] if isinstance(clamp, (list, tuple)) else clamp)
+        # 2026-10-08: the engine reads the expert geometry from this header (expert_layout.cpp); keep the fields
         head = ("# strata native experts v5: layer gu_type d_type offset blob_bytes gate_off up_off down_off "
-                "[shard | gate,up,down] (n_expert %d, total %d; architecture glm5-next; geometry and original "
-                "tensor axes in glm5-layout.json; CPU packing skeleton, execution not implemented)\n"
-                % (n_expert, offset))
+                "[shard | gate,up,down] (n_expert %d, total %d; architecture glm5-next; n_embd %d, n_ff %d, "
+                "swiglu_limit %g; geometry and original tensor axes in glm5-layout.json)\n"
+                % (n_expert, offset, n_embd, n_ff, clamp))
     return layout, head + "".join(line + "\n" for line in lines), n_expert, offset
 
 

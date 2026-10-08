@@ -148,6 +148,8 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     L.offset.assign((size_t) n_layers, ~0ull);
     L.bytes.assign((size_t) n_layers, 0);
     L.max_blob = 0;
+    int64_t hdr_embd = 0, hdr_ff = 0;   // v5 header fields (glm5-next); 0 = the Qwen geometry H / FF
+    float hdr_limit = 0.f;
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') {
@@ -169,6 +171,11 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 // default, so the header wins.
                 const size_t at = line.find("(n_expert ");
                 if (at != std::string::npos) L.n_expert = std::atoll(line.c_str() + at + 10);
+                // v5 (glm5-next): the expert geometry and the SwiGLU clamp are in the header
+                const size_t ae = line.find("n_embd "), af = line.find("n_ff "), al = line.find("swiglu_limit ");
+                if (ae != std::string::npos) hdr_embd = std::atoll(line.c_str() + ae + 7);
+                if (af != std::string::npos) hdr_ff = std::atoll(line.c_str() + af + 5);
+                if (al != std::string::npos) hdr_limit = (float) std::atof(line.c_str() + al + 13);
             }
             continue;
         }
@@ -180,7 +187,8 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             return false;
         }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
+        if (!native_fmt((int) gt, (int) dt, hdr_embd > 0 ? hdr_embd : H, hdr_ff > 0 ? hdr_ff : FF, f, err, hdr_limit))
+            return false;
         if (f.bytes != blob) {
             err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);
