@@ -112,6 +112,21 @@ __global__ void __launch_bounds__(256) gdn_ab_multi_kernel(const float* __restri
     }
 }
 
+// glm5-next KDA: the decay gate per KEY dimension, gate[t][head][i] = lb * sigmoid(-(f + dt_b) * A[head]) (llama.cpp
+// b11461 glm5-next.cpp:697-716, the order kept: + dt_b, * A, * -1, sigmoid, * lower bound), and beta = sigmoid.
+__global__ void kda_gate_beta_multi_kernel(const float* __restrict__ f, const float* __restrict__ dt_b,
+                                           const float* __restrict__ ssm_a, float lower_bound,
+                                           const float* __restrict__ beta_logit, float* __restrict__ gate,
+                                           float* __restrict__ beta, int h_v) {
+    const int t = blockIdx.y, head = blockIdx.x, i = threadIdx.x;   // S threads
+    const size_t o = ((size_t) t * h_v + head) * S + i;
+    const float v = (f[o] + dt_b[head * S + i]) * ssm_a[head];
+    const float nv = -1.0f * v;                          // ggml_scale(-1)
+    gate[o] = lower_bound * (1.0f / (1.0f + expf(-nv)));   // ggml_sigmoid, then ggml_scale(lower bound)
+    if (i == 0) beta[(size_t) t * h_v + head] = 1.0f / (1.0f + expf(-beta_logit[(size_t) t * h_v + head]));
+}
+
+template <bool KDA>
 __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
                                                                      const float* __restrict__ hbuf, int C,
                                                                      const float* __restrict__ gate,
@@ -121,6 +136,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
                                                                      float* __restrict__ y, int h_k, int h_v, int T,
                                                                      const int32_t* __restrict__ n_keep, int t_out_begin) {
     __shared__ float sk[S], sq[S];
+    __shared__ float se[KDA ? S : 1];   // KDA: exp(gate[i]) per key dimension i (the state's row axis)
     __shared__ float red[RG][S];
     __shared__ float wsum[S * RG / 32];
     const int head = blockIdx.x;
@@ -140,7 +156,23 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
         const float* ht = hbuf + (size_t) t * C;
         __syncthreads();                // the previous token is done with sk/sq/red/wsum
         if (tid < S) { sk[tid] = ht[qk + qh * S + tid]; sq[tid] = ht[qh * S + tid]; }
+        if (KDA && tid < S) se[tid] = expf(gate[((size_t) t * h_v + head) * S + tid]);
         __syncthreads();
+        float o = 0.0f;
+        if (KDA) {   // llama.cpp ggml-cuda/gated_delta_net.cu:112-134 (decay per key dimension i = rg*RPG + r)
+            float kv = 0.0f;
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) kv = fmaf(se[rg * RPG + r] * s[r], sk[rg * RPG + r], kv);
+            red[rg][col] = kv;
+            __syncthreads();
+            const float kv_col = red[0][col] + red[1][col] + red[2][col] + red[3][col];
+            const float delta = (ht[2 * qk + head * S + col] - kv_col) * beta[(size_t) t * h_v + head];
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) {
+                s[r] = fmaf(se[rg * RPG + r], s[r], sk[rg * RPG + r] * delta);
+                o = fmaf(s[r], sq[rg * RPG + r], o);
+            }
+        } else {
         const float g = __expf(gate[(size_t) t * h_v + head]);
         float kv = 0.0f;
 #pragma unroll
@@ -149,11 +181,11 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
         __syncthreads();
         const float kv_col = red[0][col] + red[1][col] + red[2][col] + red[3][col];
         const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
-        float o = 0.0f;
 #pragma unroll
         for (int r = 0; r < RPG; ++r) {
             s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
             o = fmaf(s[r], sq[rg * RPG + r], o);
+        }
         }
         __syncthreads();
         red[rg][col] = o;
@@ -411,15 +443,30 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin) {
+                         const int32_t* n_keep, void* stream, int t_out_begin, bool kda) {
     if (!state || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_tok < 1 ||
         n_tok > kVerifyMaxT) {
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
         std::exit(1);
     }
-    gdn_step_norm_multi_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
-        state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
+    if (kda)
+        gdn_step_norm_multi_kernel<true><<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
+    else
+        gdn_step_norm_multi_kernel<false><<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
     check("gdn_step_norm_multi");
+}
+
+void kda_gate_beta_multi(const float* f, const float* dt_b, const float* ssm_a, float lower_bound,
+                         const float* beta_logit, float* gate, float* beta, int h_v, int n_tok, void* stream) {
+    if (!f || !dt_b || !ssm_a || !beta_logit || !gate || !beta || h_v <= 0 || n_tok < 1 || n_tok > kVerifyMaxT) {
+        std::fprintf(stderr, "kda_gate_beta_multi: invalid arguments\n");
+        std::exit(1);
+    }
+    kda_gate_beta_multi_kernel<<<dim3((unsigned) h_v, (unsigned) n_tok), S, 0, (cudaStream_t) stream>>>(
+        f, dt_b, ssm_a, lower_bound, beta_logit, gate, beta, h_v);
+    check("kda_gate_beta_multi");
 }
 
 namespace {

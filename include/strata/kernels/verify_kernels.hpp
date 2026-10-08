@@ -32,9 +32,16 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 /// The recurrence + output norm for T tokens (h = (T, conv_channels) as q|k|v, gate/beta (T, h_v), z/y
 /// (T, value_dim)).  With `n_keep == nullptr` the state is read and NOT written (verify); otherwise the first
 /// *n_keep tokens are run and the state is written (commit; `y` may be scratch).  Bitwise `fused_gdn_step_norm`.
+/// glm5-next KDA (`kda`): `gate` is (T, h_v, S) log-decays, one per KEY dimension (the state's row axis); the
+/// update is s = exp(g_i) s + k_i delta with delta = (v - sum_i exp(g_i) s k_i) beta, as llama.cpp's KDA branch.
+/// q/k/v are 64 heads each (h_k == h_v); `eps` is the output RMSNorm's (GLM 1e-5, not the L2 norm's 1e-6).
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin = 0);
+                         const int32_t* n_keep, void* stream, int t_out_begin = 0, bool kda = false);
+/// glm5-next KDA: gate (T, h_v, S) = lower_bound * sigmoid(-(f + dt_b) * ssm_a[head]) from f = ssm_f_b(ssm_f_a(x))
+/// (T, h_v*S), and beta (T, h_v) = sigmoid(beta_logit) from ssm_beta(x).
+void kda_gate_beta_multi(const float* f, const float* dt_b, const float* ssm_a, float lower_bound,
+                         const float* beta_logit, float* gate, float* beta, int h_v, int n_tok, void* stream);
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
