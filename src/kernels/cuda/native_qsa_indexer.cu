@@ -292,6 +292,9 @@ __global__ void __launch_bounds__(256) glm5_kpool_scores_kernel(const float* __r
     w += (size_t) qi * KH;
     scores += (size_t) qi * max_blocks;
     const int n_bid = steps[(size_t) qi * kStepCount + kStepNBid];
+    // a CTA wholly past the filled blocks leaves before loading the query: with --max-context 262144 the grid is
+    // 8,193 CTAs per token while a short context fills a few hundred (the same scores; the rest are never read)
+    if ((int64_t) blockIdx.x * (blockDim.x / 32) > n_bid) return;
     for (int i = threadIdx.x; i < KH * KD; i += blockDim.x) sq[i / KD][i % KD] = q[i];
     if (threadIdx.x < KH) sw[threadIdx.x] = w[threadIdx.x];
     __syncthreads();
