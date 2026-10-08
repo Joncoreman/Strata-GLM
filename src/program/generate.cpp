@@ -7186,7 +7186,9 @@ int main(int argc, char** argv) {
                             std::memcpy(&commit_first, msg.data() + 12, 4);
                         }
                         const size_t hbytes = sizeof(float) * (size_t) T * (size_t) hf;
-                        if (T < 1 || T > pf_stage_chunk || msg.size() != 16 + 4 * (size_t) T + hbytes) {
+                        // the head's chunk may be larger than this engine's STRATA_GLM5_PREFILL: the chunk buffers are
+                        // allocated per call, so the stage follows the head (no setting to keep in step on the 3060)
+                        if (T < 1 || T > 65536 || msg.size() != 16 + 4 * (size_t) T + hbytes) {
                             fail = "a malformed Prefill";
                         } else if (commit_first > 0 && (!ver.commit(commit_first, err) || !ver.wait_commit(err))) {
                             fail = err;
@@ -7195,7 +7197,7 @@ int main(int argc, char** argv) {
                             pf_in.assign((const float*) (msg.data() + 16 + 4 * (size_t) T),
                                          (const float*) (msg.data() + 16 + 4 * (size_t) T) + (size_t) T * hf);
                             pf_out.resize((size_t) T * hf);
-                            if (!ver.prefill_glm5((const int32_t*) (msg.data() + 16), T, pos0, pf_stage_chunk, spf, err,
+                            if (!ver.prefill_glm5((const int32_t*) (msg.data() + 16), T, pos0, std::max<int>(pf_stage_chunk, T), spf, err,
                                                   g_stage_lb, g_stage_le, pf_in.data(), pf_out.data())) {
                                 fail = err;
                             } else {
@@ -7261,7 +7263,7 @@ int main(int argc, char** argv) {
                 in_eof.store(true);
                 in_cv.notify_one();
             }).detach();
-            // STRATA_GLM5_PREFILL: the chunk (0 = the prompt as verify windows); the stage engines must use the same
+            // STRATA_GLM5_PREFILL: the chunk (0 = the prompt as verify windows); the stage engines follow the head's chunk
             const int pf_chunk = [] { const char* v = std::getenv("STRATA_GLM5_PREFILL"); return v ? std::atoi(v) : 1024; }();
             strata::core::Verifier::Glm5Fetch pf;
             pf.host_res = host_res.empty() ? nullptr : host_res.data();

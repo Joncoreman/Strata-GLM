@@ -35,7 +35,8 @@ namespace strata::core {
 namespace {
 
 constexpr uint32_t kMagic = 0x314E4D53u;                 // "SMN1"
-constexpr uint64_t kMaxPayload = 256ull * 1024 * 1024;   // far above any window (8 tokens: ~400 KB)
+// far above any window (8 tokens: ~400 KB); a GLM prompt chunk is 64 KiB a token (4,096 tokens: 256 MiB + its header)
+constexpr uint64_t kMaxPayload = 1024ull * 1024 * 1024;
 
 bool net_init(std::string& err) {
 #if defined(_WIN32)
