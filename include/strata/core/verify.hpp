@@ -150,6 +150,23 @@ public:
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
     /// glm5-next: the last window's rows of output_norm(mean of the 4 streams) - the head's input and the MTP's h
     const float* glm5_h() const { return head_mixed_; }
+    /// glm5-next prompt path (2026-10-08): where a layer's routed expert blobs are.  A resident one is the VRAM cache
+    /// slot host_res[l * n_expert + e] (cache_base + slot_off[slot], or slot * cache_blob without offsets); any other
+    /// is `blob(ctx, l, e)`, host memory (the RAM tier, or a stage buffer the file tier fills).
+    struct Glm5Fetch {
+        const int32_t* host_res = nullptr;
+        const uint8_t* cache_base = nullptr;
+        const unsigned long long* slot_off = nullptr;
+        uint64_t cache_blob = 0;
+        void* ctx = nullptr;
+        const uint8_t* (*blob)(void* ctx, int64_t layer, int64_t expert) = nullptr;
+    };
+    /// The prompt's cells [pos0, pos0 + n) in chunks of `chunk` tokens, the state written as commits would (KDA state
+    /// and conv history, the latent cache, the indexer pool).  Per layer the attention runs in slices of 8 tokens (the
+    /// window's kernels), the routed experts once per chunk on the GPU, each expert's blob read once.
+    bool prefill_glm5(const int32_t* tokens, int64_t n, int64_t pos0, int chunk, const Glm5Fetch& f, std::string& err);
+    double prefill_ms_copy = 0, prefill_ms_total = 0;
+    int64_t prefill_streamed = 0, prefill_resident = 0;
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.

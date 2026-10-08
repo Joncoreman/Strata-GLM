@@ -6986,7 +6986,37 @@ int main(int argc, char** argv) {
             const int64_t np = n_prompt - 1;
             std::vector<int32_t> pw((size_t) o.spec), po((size_t) o.spec), nx((size_t) o.spec);
             const Clock::time_point tg = Clock::now();
-            for (int64_t q = 0; q < np;) {
+            // glm5-next prompt path: chunks of STRATA_GLM5_PREFILL tokens (default 1024; 0 = verify windows only), the
+            // routed experts once per chunk on the GPU.  The MTP drafter's cache is not filled by it (windows only).
+            const int pf_chunk = [] { const char* v = std::getenv("STRATA_GLM5_PREFILL"); return v ? std::atoi(v) : 1024; }();
+            int64_t q0 = 0;
+            if (glm5_model && pf_chunk > 0 && np >= 16 && !gmtp_on) {
+                std::vector<int32_t> toks32((size_t) np);
+                for (int64_t i = 0; i < np; ++i) toks32[(size_t) i] = (int32_t) o.tokens[(size_t) i];
+                strata::core::Verifier::Glm5Fetch pf;
+                pf.host_res = host_res.empty() ? nullptr : host_res.data();
+                pf.cache_base = thits.cache_base;
+                pf.slot_off = xcache.slot_offsets();
+                pf.cache_blob = (uint64_t) thits.blob;
+                pf.ctx = srcp;
+                pf.blob = [](void* c, int64_t l, int64_t e) -> const uint8_t* { return ((strata::core::ExpertSource*) c)->blob(l, e); };
+                if (ver.prefill_glm5(toks32.data(), np, 0, pf_chunk, pf, err)) {
+                    std::fprintf(stderr, "strata generate: glm5 prefill %lld tokens in chunks of %d, %.1f ms (%.1f tok/s); "
+                                         "experts streamed %lld, resident %lld, host copy submission %.1f ms\n",
+                                 (long long) np, pf_chunk, ver.prefill_ms_total, 1000.0 * (double) np / ver.prefill_ms_total,
+                                 (long long) ver.prefill_streamed, (long long) ver.prefill_resident, ver.prefill_ms_copy);
+                    q0 = np;
+                } else if (err.find("do not fit") != std::string::npos || err.find("page-locked") != std::string::npos) {
+                    // its buffers are allocated before any state is written: the windows take the whole prompt
+                    std::fprintf(stderr, "strata generate: %s - the prompt runs as verify windows (a larger "
+                                         "--vram-reserve-mib or a smaller STRATA_GLM5_PREFILL makes room)\n", err.c_str());
+                    err.clear();
+                } else {
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                    return 1;
+                }
+            }
+            for (int64_t q = q0; q < np;) {
                 const int T = (int) std::min<int64_t>(o.spec, np - q);
                 for (int t = 0; t < T; ++t) pw[(size_t) t] = (int32_t) o.tokens[(size_t) (q + t)];
                 if (!ver.run(T, pw.data(), q, &drive_pool_multi, &drive, po.data(), err) || !ver.commit(T, err) ||
