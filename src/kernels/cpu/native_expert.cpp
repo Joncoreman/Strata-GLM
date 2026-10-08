@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <mutex>
+#include <vector>
 
 namespace strata::kernels::cpu {
 namespace {
@@ -121,6 +122,22 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             return;
         }
     }
+    // GLM (clamped SwiGLU, 2026-10-09): the AVX-2 multi-token row dots for gate and up separately, then the clamp and
+    // SiLU here.  The dots are the ones iq256_gu_rows uses.  STRATA_GLM_IQ256=0 keeps ggml's per-token dots.
+    static const bool glm_mt = [] { const char* v = std::getenv("STRATA_GLM_IQ256"); return v == nullptr || std::atoi(v) != 0; }();
+    if (f.swiglu_limit > 0.f && glm_mt && avx2 && !cpu512 && nt >= mt_min && nt <= 8 && iq256_supported(f.gu_type)) {
+        thread_local std::vector<float> gb, ub;
+        const size_t span = (size_t) r1;
+        if (gb.size() < span * nt) { gb.resize(span * nt); ub.resize(span * nt); }
+        float* gp[8];
+        float* up[8];
+        for (int t = 0; t < nt; ++t) { gp[t] = gb.data() + t * span; up[t] = ub.data() + t * span; }
+        iq256_rows(f.gu_type, blob, f.gu_row, (int) f.n_embd, act, nt, gp, r0, r1);
+        iq256_rows(f.gu_type, blob + f.up_off, f.gu_row, (int) f.n_embd, act, nt, up, r0, r1);
+        for (int t = 0; t < nt; ++t)
+            for (int r = r0; r < r1; ++r) ff[t][r] = native_swiglu(gp[t][r], up[t][r], f.swiglu_limit);
+        return;
+    }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const int n = (int) f.n_embd;
     for (int r = r0; r < r1; ++r) {
@@ -148,6 +165,15 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     }
     if (nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
+    // GLM only (2026-10-09): IQ down rows (GLM UD-IQ4_XS: IQ4_XS) through the AVX-2 multi-token dots.  Limited to the
+    // clamped-SwiGLU models so the Qwen packs keep their rounding.  STRATA_GLM_IQ256=0 keeps ggml's dots.
+    static const bool glm_mt = [] { const char* v = std::getenv("STRATA_GLM_IQ256"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool cpu512 = cpu_avx512_ok();
+    if (f.swiglu_limit > 0.f && glm_mt && !cpu512 && nt >= mt_min && iq256_supported(f.d_type) &&
+        std::getenv("STRATA_NO_IQ256") == nullptr) {
+        iq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
