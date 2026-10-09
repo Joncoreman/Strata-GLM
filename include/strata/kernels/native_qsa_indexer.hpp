@@ -56,8 +56,8 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
 // (the caller scales), q = indexer_attn_q_b(qr) [32 x 128].  The incomplete tail block n_bid gets kGlm5TailScore so the
 // selection (qsa_block_topk) always keeps it; selection width 4 * min(n_bid, 512) + (n_kv - 4 * n_bid).
 struct Glm5KpoolBuffers {
-    float* tail = nullptr;     ///< [3][2 * 128] key | gate of the block's first three cells
-    float* pooled = nullptr;   ///< [max_cells / 4 + 1][128]
+    float* tail = nullptr;        ///< [3][2 * 128] key | gate of the block's first three cells
+    uint16_t* pooled = nullptr;   ///< [max_cells / 4 + 1][128] BF16 (2026-10-09: F32 before; 369 -> 185 MiB at 262K)
 };
 inline constexpr float kGlm5TailScore = 1.0e30f;
 /// raw_k, gate: [128] each for the cell at *relative_pos_device (kStepPos).  Capturable; no allocation.
@@ -65,7 +65,7 @@ void glm5_kpool_append(const float* raw_k, const float* gate, const int32_t* rel
                        const float* k_norm_b, const float* ape, float epsilon, const Glm5KpoolBuffers& b,
                        int64_t max_cells, void* stream, float* key_out = nullptr);
 /// scores [nq][max_blocks] for blocks 0..n_bid (steps[kStepNBid]); q [nq][32][128], w [nq][32].
-void glm5_kpool_scores(const float* q, const float* w, const float* pooled, const int32_t* steps, int64_t nq,
+void glm5_kpool_scores(const float* q, const float* w, const uint16_t* pooled, const int32_t* steps, int64_t nq,
                        int64_t max_blocks, float* scores, void* stream);
 
 } // namespace strata::kernels

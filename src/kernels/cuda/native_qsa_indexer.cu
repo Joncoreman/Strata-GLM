@@ -22,6 +22,7 @@
 #include "strata/kernels/mrope.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -242,7 +243,7 @@ __global__ void __launch_bounds__(KD) glm5_kpool_append_kernel(const float* __re
                                                                const int32_t* __restrict__ pos, const float* __restrict__ kw,
                                                                const float* __restrict__ kb, const float* __restrict__ ape,
                                                                float eps, float* __restrict__ tail,
-                                                               float* __restrict__ pooled, int64_t max_cells,
+                                                               __nv_bfloat16* __restrict__ pooled, int64_t max_cells,
                                                                float* __restrict__ key_out) {
     __shared__ float red[KD / 32];
     const int d = threadIdx.x, lane = d & 31, w = d >> 5;
@@ -286,12 +287,12 @@ __global__ void __launch_bounds__(KD) glm5_kpool_append_kernel(const float* __re
     float p = 0.f;
 #pragma unroll
     for (int j = 0; j < KP; ++j) p += (lg[j] * inv) * kj[j];   // ggml_sum_rows(probs * pk), j ascending
-    pooled[(size_t) (cell / KP) * KD + d] = p;
+    pooled[(size_t) (cell / KP) * KD + d] = __float2bfloat16_rn(p);   // BF16 (2026-10-09), as Infernix keeps its pooled keys
 }
 
 // one warp per block: each lane holds 4 of the 128 pooled values; the query heads come from shared memory
 __global__ void __launch_bounds__(256) glm5_kpool_scores_kernel(const float* __restrict__ q, const float* __restrict__ w,
-                                                                 const float* __restrict__ pooled,
+                                                                 const __nv_bfloat16* __restrict__ pooled,
                                                                  const int32_t* __restrict__ steps, int64_t max_blocks,
                                                                  float* __restrict__ scores) {
     __shared__ float sq[KH][KD];
@@ -311,7 +312,13 @@ __global__ void __launch_bounds__(256) glm5_kpool_scores_kernel(const float* __r
     const int b = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
     if (b > n_bid || b >= max_blocks) return;
     if (b == n_bid) { if (lane == 0) scores[b] = kGlm5TailScore; return; }
-    const float4 k4 = *reinterpret_cast<const float4*>(pooled + (size_t) b * KD + lane * 4);
+    float4 k4;
+    {
+        const uint2 raw = *reinterpret_cast<const uint2*>(pooled + (size_t) b * KD + lane * 4);   // 4 BF16
+        const float2 lo = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
+        const float2 hi = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
+        k4 = make_float4(lo.x, lo.y, hi.x, hi.y);
+    }
     float acc = 0.f;
 #pragma unroll 4
     for (int h = 0; h < KH; ++h) {
@@ -330,15 +337,17 @@ void glm5_kpool_append(const float* raw_k, const float* gate, const int32_t* rel
     if (!raw_k || !gate || !relative_pos_device || !k_norm || !k_norm_b || !ape || !b.tail || !b.pooled || !stream)
         throw std::invalid_argument("glm5_kpool_append: missing buffer or stream");
     glm5_kpool_append_kernel<<<1, KD, 0, (cudaStream_t) stream>>>(raw_k, gate, relative_pos_device, k_norm, k_norm_b,
-                                                                  ape, epsilon, b.tail, b.pooled, max_cells, key_out);
+                                                                  ape, epsilon, b.tail, (__nv_bfloat16*) b.pooled,
+                                                                  max_cells, key_out);
 }
 
-void glm5_kpool_scores(const float* q, const float* w, const float* pooled, const int32_t* steps, int64_t nq,
+void glm5_kpool_scores(const float* q, const float* w, const uint16_t* pooled, const int32_t* steps, int64_t nq,
                        int64_t max_blocks, float* scores, void* stream) {
     if (!q || !w || !pooled || !steps || !scores || nq <= 0 || max_blocks <= 0 || !stream)
         throw std::invalid_argument("glm5_kpool_scores: missing buffer or stream");
     const dim3 grid((unsigned) ((max_blocks + 7) / 8), (unsigned) nq);
-    glm5_kpool_scores_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(q, w, pooled, steps, max_blocks, scores);
+    glm5_kpool_scores_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(q, w, (const __nv_bfloat16*) pooled, steps,
+                                                                       max_blocks, scores);
 }
 
 void native_qsa_indexer_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }

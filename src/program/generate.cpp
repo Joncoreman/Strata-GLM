@@ -12489,7 +12489,7 @@ int main(int argc, char** argv) {
             const bool slots_on = slot_max > 0 && !slot_dir.empty() && gl_chain.empty();
             const uint64_t slot_fp = [&] {   // the model, the pack and the latent format: a slot of another is never read
                 uint64_t hsh = 1469598103934665603ull;
-                const std::string id = "glm5-slot-1|" + o.native_preset + "|" + o.pack + "|" +
+                const std::string id = "glm5-slot-2|" + o.native_preset + "|" + o.pack + "|" +
                                        (std::getenv("STRATA_GLM5_KV") ? std::getenv("STRATA_GLM5_KV") : "q4") + "|" +
                                        std::to_string(g.n_layers) + "|" + std::to_string(g.n_embd);
                 for (unsigned char c : id) { hsh ^= c; hsh *= 1099511628211ull; }

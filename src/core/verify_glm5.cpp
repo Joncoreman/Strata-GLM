@@ -67,7 +67,7 @@ struct Verifier::Glm5 {
     bool lat_q4 = true;
     size_t lat_row = 0;
     float* tail = nullptr;           // [nD][3][2*ID]
-    float* pooled = nullptr;         // [nD][max_cells/4 + 1][ID]
+    uint16_t* pooled = nullptr;      // [nD][max_cells/4 + 1][ID] BF16 (2026-10-09)
     float* tail_snap = nullptr;      // [nD][3][2*ID]
     float* raw_k = nullptr;          // [nD][MT][ID]  the window's indexer keys / gates, for the commit's re-append
     float* raw_g = nullptr;
@@ -147,7 +147,7 @@ bool Verifier::init_glm5(std::string& err) {
     m.lat_row = m.lat_q4 ? (size_t) kMlaQ4RowBytes : (size_t) m.KVR * 2;
     m.latent = m.dev<uint8_t>((size_t) nD * m.max_cells * m.lat_row);
     m.tail = m.dev<float>((size_t) nD * 3 * 2 * m.ID);
-    m.pooled = m.dev<float>((size_t) nD * (m.max_cells / 4 + 1) * m.ID);
+    m.pooled = m.dev<uint16_t>((size_t) nD * (m.max_cells / 4 + 1) * m.ID);
     m.tail_snap = m.dev<float>((size_t) nD * 3 * 2 * m.ID);
     m.raw_k = m.dev<float>((size_t) nD * MT * m.ID);
     m.raw_g = m.dev<float>((size_t) nD * MT * m.ID);
@@ -323,7 +323,7 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
             const int64_t QLR = m.QLR, NH = m.NH, QK = m.QK, KVR = m.KVR, VD = m.VD, ID = m.ID, IH = m.IH;
             uint8_t* lat_pool = m.latent + (size_t) qi * m.max_cells * m.lat_row;
             float* tail = m.tail + (size_t) qi * 3 * 2 * ID;
-            float* pooled = m.pooled + (size_t) qi * (m.max_cells / 4 + 1) * ID;
+            uint16_t* pooled = m.pooled + (size_t) qi * (m.max_cells / 4 + 1) * ID;
             float* rk = m.raw_k + (size_t) qi * MT * ID;
             float* rg = m.raw_g + (size_t) qi * MT * ID;
             native_quantize_q8_1(xm, xq_, (int) N, n, cs);
@@ -618,7 +618,7 @@ bool Verifier::glm5_slot_write(const std::string& path, const int32_t* toks, int
     h.gdn_n = (int64_t) s.gdn_n; h.tail_n = (int64_t) s.tail_n;
     const size_t lat_bytes = (size_t) n_cells * m.lat_row, pool_rows = (size_t) n_cells / 4 + 1;
     std::vector<uint8_t> buf(std::max<size_t>({s.gdn_n * 4, s.tail_n * 4, (size_t) nD * lat_bytes,
-                                               (size_t) nD * pool_rows * m.ID * 4}));
+                                               (size_t) nD * pool_rows * m.ID * 2}));
     cudaStreamSynchronize(cs_);
     const std::string tmp = path + ".tmp";
     FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -632,7 +632,7 @@ bool Verifier::glm5_slot_write(const std::string& path, const int32_t* toks, int
     ok = ok && cudaMemcpy2D(buf.data(), lat_bytes, m.latent, (size_t) m.max_cells * m.lat_row, lat_bytes, (size_t) nD,
                             cudaMemcpyDeviceToHost) == cudaSuccess &&
          std::fwrite(buf.data(), 1, (size_t) nD * lat_bytes, f) == (size_t) nD * lat_bytes;
-    const size_t pool_bytes = pool_rows * (size_t) m.ID * 4, pool_pitch = (size_t) (m.max_cells / 4 + 1) * m.ID * 4;
+    const size_t pool_bytes = pool_rows * (size_t) m.ID * 2, pool_pitch = (size_t) (m.max_cells / 4 + 1) * m.ID * 2;
     ok = ok && cudaMemcpy2D(buf.data(), pool_bytes, m.pooled, pool_pitch, pool_bytes, (size_t) nD,
                             cudaMemcpyDeviceToHost) == cudaSuccess &&
          std::fwrite(buf.data(), 1, (size_t) nD * pool_bytes, f) == (size_t) nD * pool_bytes;
@@ -677,7 +677,7 @@ bool Verifier::glm5_slot_read(const std::string& path, uint64_t fingerprint, std
         return false;
     }
     const size_t lat_bytes = (size_t) h.n_cells * m.lat_row, pool_rows = (size_t) h.n_cells / 4 + 1;
-    const size_t pool_bytes = pool_rows * (size_t) m.ID * 4, pool_pitch = (size_t) (m.max_cells / 4 + 1) * m.ID * 4;
+    const size_t pool_bytes = pool_rows * (size_t) m.ID * 2, pool_pitch = (size_t) (m.max_cells / 4 + 1) * m.ID * 2;
     std::vector<uint8_t> buf(std::max<size_t>({s.gdn_n * 4, s.tail_n * 4, (size_t) nD * lat_bytes,
                                                (size_t) nD * pool_bytes}));
     cudaStreamSynchronize(cs_);
@@ -928,7 +928,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         const int64_t QLR = m.QLR, NH = m.NH, QK = m.QK, KVR = m.KVR, VD = m.VD, ID = m.ID, IH = m.IH;
         uint8_t* lat_pool = m.latent + (size_t) qi * m.max_cells * m.lat_row;
         float* tail = m.tail + (size_t) qi * 3 * 2 * ID;
-        float* pooled = m.pooled + (size_t) qi * (m.max_cells / 4 + 1) * ID;
+        uint16_t* pooled = m.pooled + (size_t) qi * (m.max_cells / 4 + 1) * ID;
         float* rk = m.raw_k + (size_t) qi * MT * ID;
         float* rg = m.raw_g + (size_t) qi * MT * ID;
         native_quantize_q8_1(xm, xq_, (int) N, n, cs);

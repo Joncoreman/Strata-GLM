@@ -46,7 +46,8 @@ struct Glm5Mtp::Impl {
                     *wip = nullptr, *wape = nullptr, *wig = nullptr, *wsg = nullptr, *wsu = nullptr, *wsd = nullptr;
     // state
     uint16_t* latent = nullptr;   // [max_cells][KVR] fp16
-    float *tail = nullptr, *pooled = nullptr, *tail_snap = nullptr;
+    float *tail = nullptr, *tail_snap = nullptr;
+    uint16_t* pooled = nullptr;   // BF16 (2026-10-09), as the verifier's
     int32_t* page_table = nullptr;
     // scratch [MT][...]
     int32_t *tok = nullptr, *steps = nullptr, *sel = nullptr, *out_tok = nullptr;
@@ -135,7 +136,7 @@ bool Glm5Mtp::init(const WeightTable& wt, const ModelGeometry& g, const NativeHe
     const size_t T = (size_t) m.MT;
     m.latent = m.dev<uint16_t>((size_t) max_cells * m.KVR);
     m.tail = m.dev<float>(3 * 2 * m.ID); m.tail_snap = m.dev<float>(3 * 2 * m.ID);
-    m.pooled = m.dev<float>((size_t) (max_cells / 4 + 1) * m.ID);
+    m.pooled = m.dev<uint16_t>((size_t) (max_cells / 4 + 1) * m.ID);
     m.page_table = m.dev<int32_t>((size_t) (max_cells / 4 + 1));
     m.tok = m.dev<int32_t>(T); m.steps = m.dev<int32_t>(T * kStepCount); m.sel = m.dev<int32_t>(T * m.cap);
     m.out_tok = m.dev<int32_t>(T);
