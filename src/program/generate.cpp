@@ -7004,11 +7004,38 @@ int main(int argc, char** argv) {
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
         int64_t adapt_rounds = 0;   // counted here: `rounds` is declared below the adapt lambda
+        double ms_pending_wait = 0;   // serve's per-window breakdown (2026-10-09): the wait for a round's copies
+        double ms_adapt_select = 0, ms_adapt_back = 0, ms_adapt_launch = 0;   // and the adapt round's three parts
+        // 2026-10-09: the RAM copy is not page-locked when the OS refuses to pin ~100 GiB, and a refill from pageable
+        // memory is a synchronous copy at ~9 GB/s on this thread (8 swaps = 10.7 ms a window).  So the refills go
+        // through one page-locked staging area: several threads copy the blobs in, then the DMA is truly
+        // asynchronous.  A round is only started once the previous one's copies have landed (`pending`), so the area
+        // is free again by then.  STRATA_ADAPT_STAGE=0 keeps the old direct copies.
+        uint8_t* refill_stage = nullptr;
+        size_t refill_stage_n = 0;
+        const size_t refill_stride = ((size_t) strata::kernels::cpu::expert_layout().max_blob + 255) / 256 * 256;
+        if (!drive.d.usage.empty() && !(std::getenv("STRATA_ADAPT_STAGE") && std::getenv("STRATA_ADAPT_STAGE")[0] == '0')) {
+            refill_stage_n = (size_t) std::min(o.adapt_swaps, 96);
+            if (cudaHostAlloc((void**) &refill_stage, refill_stage_n * refill_stride, cudaHostAllocDefault) != cudaSuccess) {
+                cudaGetLastError();
+                std::fprintf(stderr, "strata generate: no page-locked refill staging (%.0f MiB); refills copy directly\n",
+                             (double) (refill_stage_n * refill_stride) / 1048576.0);
+                refill_stage = nullptr;
+                refill_stage_n = 0;
+            } else {
+                std::fprintf(stderr, "strata generate: refill staging %zu x %.1f MiB page-locked\n", refill_stage_n,
+                             (double) refill_stride / 1048576.0);
+            }
+        }
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
             // STRATA_TRACE_ADAPT=1: whether a round's copies had landed when the next window read the table
             static const bool trace_pending = std::getenv("STRATA_TRACE_ADAPT") != nullptr;
-            if (wait) cudaEventSynchronize(adapt_ev);
+            if (wait) {
+                const Clock::time_point tw = Clock::now();
+                cudaEventSynchronize(adapt_ev);
+                ms_pending_wait += std::chrono::duration<double, std::milli>(Clock::now() - tw).count();
+            }
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) {
                 if (trace_pending)
                     std::fprintf(stderr, "strata: PENDING not landed, %zu stay non-resident this window\n",
@@ -7017,6 +7044,29 @@ int main(int argc, char** argv) {
             }
             if (trace_pending)
                 std::fprintf(stderr, "strata: PENDING landed, %zu experts become resident\n", pending.size());
+            // STRATA_ADAPT_VERIFY=1 (2026-10-09, for the staged refills): each landed slot read back and compared
+            // byte for byte with the expert's RAM copy
+            static const bool verify_refill = std::getenv("STRATA_ADAPT_VERIFY") != nullptr;
+            if (verify_refill) {
+                cudaEventSynchronize(adapt_ev);
+                static std::vector<uint8_t> back;
+                static int64_t checked = 0, bad = 0;
+                for (const auto& [i, slot] : pending) {
+                    const int64_t l = i / g.n_expert, e = i % g.n_expert;
+                    const size_t nb = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+                    const uint8_t* b = srcp->blob(l, e);
+                    back.resize(nb);
+                    cudaMemcpy(back.data(), xcache.device_slot(slot), nb, cudaMemcpyDeviceToHost);
+                    ++checked;
+                    if (b == nullptr || std::memcmp(back.data(), b, nb) != 0) {
+                        ++bad;
+                        std::fprintf(stderr, "strata: REFILL MISMATCH layer %lld expert %lld slot %d\n", (long long) l,
+                                     (long long) e, slot);
+                    }
+                }
+                if (checked % 64 < pending.size())
+                    std::fprintf(stderr, "strata: refill verify: %lld checked, %lld bad\n", (long long) checked, (long long) bad);
+            }
             src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
             pending.clear();
@@ -7064,17 +7114,44 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            const Clock::time_point ts = Clock::now();
             if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) {
                 std::fprintf(stderr, "strata generate: an adaptive refill failed (copying evicted experts back)\n");
                 return false;
             }
-            for (const Swap& s : swaps) {
+            const Clock::time_point tl = Clock::now();
+            ms_adapt_select += std::chrono::duration<double, std::milli>(ts - ta).count();
+            ms_adapt_back += std::chrono::duration<double, std::milli>(tl - ts).count();
+            const bool staged_refill = refill_stage != nullptr && swaps.size() <= refill_stage_n;
+            if (staged_refill && !swaps.empty()) {
+                // the blobs into the staging area on several threads, in 1 MiB pieces so a few experts still spread
+                struct Piece { const uint8_t* src; uint8_t* dst; size_t n; };
+                std::vector<Piece> pieces;
+                for (size_t q = 0; q < swaps.size(); ++q) {
+                    const uint8_t* b = srcp->blob(swaps[q].layer, swaps[q].in);
+                    if (b == nullptr) continue;   // reported by the loop below
+                    const size_t nb = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(swaps[q].layer);
+                    for (size_t off = 0; off < nb; off += (size_t) 1 << 20)
+                        pieces.push_back({b + off, refill_stage + q * refill_stride + off, std::min((size_t) 1 << 20, nb - off)});
+                }
+                std::atomic<size_t> next{0};
+                auto work = [&] {
+                    for (size_t i; (i = next.fetch_add(1)) < pieces.size();) std::memcpy(pieces[i].dst, pieces[i].src, pieces[i].n);
+                };
+                std::vector<std::thread> th;
+                for (int t = 1; t < 8; ++t) th.emplace_back(work);
+                work();
+                for (auto& t : th) t.join();
+            }
+            for (size_t q = 0; q < swaps.size(); ++q) {
+                const Swap& s = swaps[q];
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
                 const uint8_t* b = srcp->blob(s.layer, s.in);
+                const uint8_t* from = staged_refill ? refill_stage + q * refill_stride : b;
                 // asynchronous: the copies run while the MTP drafts; the next window waits for them
                 if (slot < 0 || b == nullptr ||
-                    cudaMemcpyAsync(xcache.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                    cudaMemcpyAsync(xcache.device_slot(slot), from, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
                                     cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
                     std::fprintf(stderr, "strata generate: an adaptive refill failed\n");
                     return false;
@@ -7083,6 +7160,7 @@ int main(int argc, char** argv) {
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+            ms_adapt_launch += std::chrono::duration<double, std::milli>(Clock::now() - tl).count();
             if (trace_adapt)
                 std::fprintf(stderr, "strata: ADAPT round=%lld swapped %zu of %d slots, usage decayed\n",
                              (long long) adapt_rounds, swaps.size(), o.adapt_swaps);
@@ -7408,6 +7486,8 @@ int main(int argc, char** argv) {
                 pool.ms_multi_gu = pool.ms_multi_q = pool.ms_multi_down = 0;
                 drive.d.ms_plan = drive.d.ms_actq = drive.d.ms_jobs = drive.d.ms_run = 0;
                 { double a, b; int64_t r; strata::core::expert_pool_jobs_stats(a, b, r); }
+                ms_adapt = 0; swaps_total = 0; ms_pending_wait = 0;
+                ms_adapt_select = ms_adapt_back = ms_adapt_launch = 0;
                 const Clock::time_point td = Clock::now();
                 int64_t produced_n = 0, acc_n = 0, off_n = 0, pos = np;
                 int32_t xt = prompt[(size_t) np];
@@ -7481,6 +7561,12 @@ int main(int argc, char** argv) {
                                              "dispatch plan %.2f  act-quant %.2f  jobs %.2f  run %.2f ms\n",
                                      pool.ms_multi_gu / w, pool.ms_multi_q / w, pool.ms_multi_down / w, drive.d.ms_plan / w,
                                      drive.d.ms_actq / w, drive.d.ms_jobs / w, drive.d.ms_run / w);
+                    std::fprintf(stderr, "strata serve: adapt per window: %.2f ms (%.1f swaps), waiting for its copies %.2f ms\n",
+                                 ms_adapt / w, (double) swaps_total / w, ms_pending_wait / w);
+                    std::fprintf(stderr, "strata serve: adapt parts per window: choose %.2f ms, copy evicted back %.2f ms, "
+                                         "queue the refills %.2f ms\n", ms_adapt_select / w, ms_adapt_back / w, ms_adapt_launch / w);
+                    ms_adapt = 0; swaps_total = 0; ms_pending_wait = 0;
+                    ms_adapt_select = ms_adapt_back = ms_adapt_launch = 0;
                     double jp = 0, jz = 0; int64_t zr = 0;
                     strata::core::expert_pool_jobs_stats(jp, jz, zr);
                     if (cx > 0)
