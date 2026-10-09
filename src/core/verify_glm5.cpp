@@ -2205,6 +2205,14 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     }
     const cudaError_t se = cudaStreamSynchronize(cs);
     if (se != cudaSuccess) { err = std::string("verify glm5 prefill: ") + cudaGetErrorString(se); return false; }
+    // STRATA_GLM5_PF_DUMP=path (2026-10-10, a check): the last token's R (4 x N) and block output (N), F32, appended
+    if (const char* dp = std::getenv("STRATA_GLM5_PF_DUMP"); dp != nullptr && le == g.n_layers) {
+        const int64_t Tl = (n_all - 1) % C + 1;   // the last chunk's tokens (both paths leave it in Rc / boc)
+        std::vector<float> h((size_t) (HC + 1) * N);
+        cudaMemcpy(h.data(), Rc + (size_t) (Tl - 1) * HC * N, (size_t) HC * N * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(h.data() + (size_t) HC * N, boc + (size_t) (Tl - 1) * N, (size_t) N * 4, cudaMemcpyDeviceToHost);
+        if (FILE* fp = std::fopen(dp, "ab")) { std::fwrite(h.data(), 4, h.size(), fp); std::fclose(fp); }
+    }
     prefill_ms_total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
     if (prof)
         std::fprintf(stderr, "strata glm5 prefill prof: setup (buffers, page-locked staging) %.0f ms of %.0f ms\n", setup_ms,
