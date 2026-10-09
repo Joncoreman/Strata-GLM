@@ -377,6 +377,10 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 /// resident experts' rows are zeroed (the GPU adds them).  Requires `host_res` (the token-graph residency).
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out);
+/// the CPU's share of the verify windows since the last call (distinct experts, their bytes, routed rows); resets them
+void expert_pool_cpu_stats(int64_t& experts, uint64_t& bytes, int64_t& rows);
+/// inside the dispatch's job building: the prefetch call, the zeroing of the GPU's rows (and how many); resets them
+void expert_pool_jobs_stats(double& ms_prefetch, double& ms_zero, int64_t& zero_rows);
 
 /// **THE HITS, LAUNCHED AFTER THE MISSES ARE STAGED AND BEFORE `post[l]`.**  Same shape as `PoolFn` and for the
 /// same reason: `session_loop` owns the ORDER and this owns the work, so the loop needs to know nothing about

@@ -7404,6 +7404,10 @@ int main(int argc, char** argv) {
                             prompt_ms > 0 ? 1000.0 * (double) (np - reused) / prompt_ms : 0.0);
                 std::fflush(stdout);
                 // decode: windows of one token (and the suffix lookup's drafts)
+                { int64_t a, r; uint64_t b; strata::core::expert_pool_cpu_stats(a, b, r); }   // drop the prompt's counts
+                pool.ms_multi_gu = pool.ms_multi_q = pool.ms_multi_down = 0;
+                drive.d.ms_plan = drive.d.ms_actq = drive.d.ms_jobs = drive.d.ms_run = 0;
+                { double a, b; int64_t r; strata::core::expert_pool_jobs_stats(a, b, r); }
                 const Clock::time_point td = Clock::now();
                 int64_t produced_n = 0, acc_n = 0, off_n = 0, pos = np;
                 int32_t xt = prompt[(size_t) np];
@@ -7466,6 +7470,22 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: time %s: %lld windows; per window GPU %.2f ms, CPU experts %.2f ms, "
                                          "staging %.2f ms, commit %.2f ms\n", nm, (long long) v.windows, v.ms_wait / w,
                                  v.ms_pool / w, v.ms_host / w, v.ms_commit / w);
+                    int64_t cx = 0, cr = 0; uint64_t cb = 0;
+                    strata::core::expert_pool_cpu_stats(cx, cb, cr);
+                    if (cx > 0)
+                        std::fprintf(stderr, "strata serve: CPU experts per window: %.1f distinct (%.1f rows), %.1f MB; "
+                                             "%.1f GB/s over the CPU-expert time\n", cx / w, cr / w, cb / w / 1e6,
+                                     v.ms_pool > 0 ? (double) cb / (v.ms_pool / 1000.0) / 1e9 : 0.0);
+                    if (cx > 0)
+                        std::fprintf(stderr, "strata serve: CPU pool per window: gate/up %.2f  quantize %.2f  down %.2f ms; "
+                                             "dispatch plan %.2f  act-quant %.2f  jobs %.2f  run %.2f ms\n",
+                                     pool.ms_multi_gu / w, pool.ms_multi_q / w, pool.ms_multi_down / w, drive.d.ms_plan / w,
+                                     drive.d.ms_actq / w, drive.d.ms_jobs / w, drive.d.ms_run / w);
+                    double jp = 0, jz = 0; int64_t zr = 0;
+                    strata::core::expert_pool_jobs_stats(jp, jz, zr);
+                    if (cx > 0)
+                        std::fprintf(stderr, "strata serve: jobs per window: prefetch %.2f ms, zeroing %.2f ms (%.1f rows)\n",
+                                     jp / w, jz / w, zr / w);
                     v.ms_wait = v.ms_pool = v.ms_host = v.ms_commit = 0;
                     v.windows = 0;
                 };

@@ -1930,7 +1930,23 @@ namespace {
 // refused at run time rather than written past them.
 constexpr int64_t kMaxWindowEntries = 128;
 static_assert(strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
+// what the CPU computed in the verify windows (2026-10-09 diagnosis): distinct experts, their bytes, routed rows
+std::atomic<int64_t> g_cpu_experts{0}, g_cpu_rows{0};
+std::atomic<uint64_t> g_cpu_bytes{0};
+std::atomic<int64_t> g_ns_prefetch{0}, g_ns_zero{0}, g_zero_rows{0};
 }  // namespace
+
+void expert_pool_jobs_stats(double& ms_prefetch, double& ms_zero, int64_t& zero_rows) {
+    ms_prefetch = (double) g_ns_prefetch.exchange(0) / 1e6;
+    ms_zero = (double) g_ns_zero.exchange(0) / 1e6;
+    zero_rows = g_zero_rows.exchange(0);
+}
+
+void expert_pool_cpu_stats(int64_t& experts, uint64_t& bytes, int64_t& rows) {
+    experts = g_cpu_experts.exchange(0);
+    bytes = g_cpu_bytes.exchange(0);
+    rows = g_cpu_rows.exchange(0);
+}
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
@@ -2098,8 +2114,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (kind[i] < 0 && ids[i] >= 0 && ids[i] < d.n_expert &&
                 std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
                 miss.push_back(ids[i]);
+        int64_t rows = 0;
+        for (int64_t i = 0; i < n_tok * k; ++i) rows += kind[i] < 0 ? 1 : 0;
+        g_cpu_experts += (int64_t) miss.size();
+        g_cpu_bytes += (uint64_t) miss.size() * lay.blob_bytes(d.layers);
+        g_cpu_rows += rows;
+        const auto p0 = std::chrono::steady_clock::now();
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
+        g_ns_prefetch += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - p0).count();
     }
+    std::chrono::nanoseconds zero_ns{0};
     int njobs = 0;
     for (int64_t t = 0; t < n_tok; ++t)
         for (int64_t j = 0; j < k; ++j) {
@@ -2117,8 +2141,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 if (kind[i] == 0) ++d.cache_hits;
                 else if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
                 // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it
-                if (!(kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()))
+                if (!(kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct())) {
+                    const auto z0 = std::chrono::steady_clock::now();
                     std::memset(row, 0, (size_t) HW * sizeof(float));
+                    zero_ns += std::chrono::steady_clock::now() - z0;
+                    ++g_zero_rows;
+                }
                 continue;
             }
             ++d.cache_refused;
@@ -2146,6 +2174,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++d.multi_entries;
         }
     const auto c3 = std::chrono::steady_clock::now();
+    g_ns_zero += zero_ns.count();
     pt("run", njobs);
     if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
     else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
