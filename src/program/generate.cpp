@@ -13144,6 +13144,19 @@ int main(int argc, char** argv) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+            // 2026-10-10 the quality yardstick: STRATA_FOLLOW_LOGITS=path with --spec-follow (and --spec-oracle on the
+            // same file, so every window is accepted) appends each committed position's logits (F32, vocab each) -
+            // two runs over the same continuation compare position by position (KL, top-1)
+            if (!follow.empty()) {
+                static std::FILE* flog = [] { const char* v = std::getenv("STRATA_FOLLOW_LOGITS"); return v ? std::fopen(v, "wb") : nullptr; }();
+                if (flog != nullptr) {
+                    std::vector<float> row((size_t) ver.vocab());
+                    const size_t k0 = produced.size();
+                    for (int i = 0; i <= a && k0 + (size_t) i < follow.size(); ++i)
+                        if (ver.copy_logits(i, row.data())) std::fwrite(row.data(), sizeof(float), row.size(), flog);
+                    std::fflush(flog);
+                }
+            }
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();

@@ -3186,6 +3186,9 @@ std::atomic<uint64_t> g_cpu_bytes{0};
 std::atomic<int64_t> g_ns_prefetch{0}, g_ns_zero{0}, g_zero_rows{0};
 }  // namespace
 
+// STRATA_CAR_TEST's router weights: the verify window sets it to the call's rows (h_w_, [n_tok][k]) before the pool
+const float* g_car_weights = nullptr;
+
 void expert_pool_jobs_stats(double& ms_prefetch, double& ms_zero, int64_t& zero_rows) {
     ms_prefetch = (double) g_ns_prefetch.exchange(0) / 1e6;
     ms_zero = (double) g_ns_zero.exchange(0) / 1e6;
@@ -3391,12 +3394,44 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // recipe's CAR ("faithful" / "fast") would gain; the answers change, so it is not for use.
     static const int car_test = [] { const char* v = std::getenv("STRATA_CAR_TEST"); return v ? std::atoi(v) : 0; }();
     static const bool car_ram = [] { const char* v = std::getenv("STRATA_CAR_RAM"); return v && v[0] == '1'; }();
+    // STRATA_CAR_CONF=tau (> 0): only a token whose first R picks carry >= tau of its routing weight skips (a token
+    // that spreads its weight - an unsure one - keeps all of its experts)
+    static const float car_conf = [] { const char* v = std::getenv("STRATA_CAR_CONF"); return v ? (float) std::atof(v) : 0.0f; }();
+    static const float car_minw = [] { const char* v = std::getenv("STRATA_CAR_MINW"); return v ? (float) std::atof(v) : 0.0f; }();
     const FileExpertSource* car_fs = car_test > 0 ? dynamic_cast<const FileExpertSource*>(d.src) : nullptr;
     bool car_skip[kMaxWindowEntries] = {};
     if (car_fs != nullptr)
-        for (int64_t i = 0; i < n; ++i)
-            car_skip[i] = kind[i] < 0 && (i % k) >= car_test && ids[i] >= 0 && ids[i] < d.n_expert &&
-                          (car_ram || !car_fs->has_resident(d.layers, ids[i]));
+        for (int64_t t = 0; t < n_tok; ++t) {
+            if (car_conf > 0.0f) {
+                if (g_car_weights == nullptr) continue;
+                const float* w = g_car_weights + t * k;
+                float top = 0.0f, all = 0.0f;
+                for (int64_t j = 0; j < k; ++j) { all += w[j]; if (j < car_test) top += w[j]; }
+                if (!(all > 0.0f) || top < car_conf * all) continue;
+            }
+            // STRATA_CAR_MINW=theta (> 0): only an expert whose own weight is under theta of the token's skips
+            float wsum = 0.0f;
+            if (car_minw > 0.0f && g_car_weights != nullptr)
+                for (int64_t j = 0; j < k; ++j) wsum += g_car_weights[t * k + j];
+            for (int64_t j = car_test; j < k; ++j) {
+                const int64_t i = t * k + j;
+                if (car_minw > 0.0f && (g_car_weights == nullptr || !(wsum > 0.0f) || g_car_weights[i] >= car_minw * wsum)) continue;
+                car_skip[i] = kind[i] < 0 && ids[i] >= 0 && ids[i] < d.n_expert &&
+                              (car_ram || !car_fs->has_resident(d.layers, ids[i]));
+            }
+        }
+    static int64_t car_tok = 0, car_conf_tok = 0, car_skips = 0, car_cpu = 0;   // printed every 1,000 calls
+    if (car_fs != nullptr) {
+        for (int64_t i = 0; i < n; ++i) { car_skips += car_skip[i]; car_cpu += kind[i] < 0; }
+        for (int64_t t = 0; t < n_tok; ++t) {
+            ++car_tok;
+            for (int64_t j = 0; j < k; ++j) if (car_skip[t * k + j]) { ++car_conf_tok; break; }
+        }
+        static int64_t calls = 0;
+        if (++calls % 1000 == 0)
+            std::fprintf(stderr, "strata car test: %.1f%% of tokens skipped some expert, %.1f%% of the CPU entries skipped\n",
+                         100.0 * car_conf_tok / std::max<int64_t>(1, car_tok), 100.0 * car_skips / std::max<int64_t>(1, car_cpu));
+    }
     if (any_cpu) {   // CS-T: the experts the CPU computes, fetched together (the GGUF in place reads them on several threads)
         static thread_local std::vector<int64_t> miss;
         miss.clear();
