@@ -1995,7 +1995,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         const bool mm = use_mmq(l);
         cudaMemcpyAsync(xa, hq8, (size_t) Pn * N * 4, cudaMemcpyHostToDevice, cs);
         if (!mm) quantize_q8_1_rows(xa, Pn, N, q8a, cs);
-        hand_copy(acc, hostS, nullptr, HC * N, N, Pn);
+        cudaMemcpyAsync(acc, hostS + (size_t) PG * HC * N, (size_t) Pn * N * 4, cudaMemcpyHostToDevice, cs);   // the block outputs
         for (auto& v : by) v.clear();
         used.clear();
         const bool count_use = pf_usage.size() == (size_t) g.n_layers * NE;
@@ -2177,7 +2177,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         }
         if (!split) break;
         }   // the rounds
-        hand_copy(acc, nullptr, hostS, HC * N, N, Pn);
+        cudaMemcpyAsync(hostS + (size_t) PG * HC * N, acc, (size_t) Pn * N * 4, cudaMemcpyDeviceToHost, cs);
         kbvb_layer = -1;   // parts (where kb_f / vb_f are carved) held this layer's expert outputs
         return true;
     };
@@ -2233,6 +2233,23 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             }
         return true;
     };
+    // the walk's host state as four contiguous arrays (R | block outputs | post | comb, PG rows each): one plain copy
+    // each a chunk - the hand-off layout's 2-D copies moved post / comb 16 and 64 bytes a row (31,883 tokens: the
+    // state's traffic took 7.8 s)
+    auto walk_parts = [&](int64_t off, int64_t T, bool in) {
+        float* hR = hostS;
+        float* hB = hR + (size_t) PG * HC * N;
+        float* hP = hB + (size_t) PG * N;
+        float* hC = hP + (size_t) PG * HC;
+        auto cp = [&](float* dev, float* host, size_t n) {
+            if (in) cudaMemcpyAsync(dev, host, n * 4, cudaMemcpyHostToDevice, cs);
+            else cudaMemcpyAsync(host, dev, n * 4, cudaMemcpyDeviceToHost, cs);
+        };
+        cp(Rc, hR + (size_t) off * HC * N, (size_t) T * HC * N);
+        cp(boc, hB + (size_t) off * N, (size_t) T * N);
+        cp(postF, hP + (size_t) off * HC, (size_t) T * HC);
+        cp(combF, hC + (size_t) off * HC * HC, (size_t) T * HC * HC);
+    };
     const double setup_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
     try {
         if (walk) {
@@ -2245,7 +2262,8 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                         float* hs = hostS + (size_t) (c0 - g0) * HF;
                         auto tp = std::chrono::steady_clock::now();
                         if (!chunk_begin(c0, T, l == lb)) return false;
-                        if (l > lb) hand_parts(hs, nullptr, T);
+                        (void) hs;
+                        if (l > lb) walk_parts(c0 - g0, T, true);
                         double f0 = ms_ffn;
                         lap(ms_ffn, tp);
                         w_ms[0] += ms_ffn - f0;   // the state in (and the steps, the embedding)
@@ -2254,7 +2272,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                         f0 = ms_ffn;
                         lap(ms_ffn, tp);
                         w_ms[1] += ms_ffn - f0;   // router, shared expert, inputs out
-                        hand_parts(nullptr, hs, T);
+                        walk_parts(c0 - g0, T, false);
                         f0 = ms_ffn;
                         lap(ms_ffn, tp);
                         w_ms[2] += ms_ffn - f0;   // the state out
@@ -2269,7 +2287,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                     }
                 }
             }
-            hand_parts(hostS + (size_t) (last_c0 - last_g0) * HF, nullptr, last_T);   // the caller reads the last chunk
+            walk_parts(last_c0 - last_g0, last_T, true);   // the caller reads the last chunk
         } else {
             for (int64_t c0 = 0; c0 < n_all; c0 += C) {
                 const int64_t T = std::min<int64_t>(C, n_all - c0);
