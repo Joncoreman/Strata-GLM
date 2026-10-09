@@ -801,6 +801,22 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     static const bool pf_mhc_on = [] { const char* v = std::getenv("STRATA_GLM5_PF_MHC"); return !(v && v[0] == '0'); }();
     float* parts_end = parts + (size_t) CK * N;
     float *mhc_part = nullptr, *mhc_ss = nullptr;
+    // 2026-10-09: the MLA/DSA layers in sub-batches of mla_sb tokens (projections through cuBLAS, the indexer and the
+    // attention kernels given the whole sub-batch: each reads only blocks / cells at or before its own token's step, so
+    // storing the sub-batch's latents and keys first changes nothing).  Opt-in (STRATA_GLM5_PF_MLA=1): 4,400 tokens at
+    // 262K took the same time as the slices (attention 7.5-7.6 s either way; the MLA layers' 3.5 s are the attention
+    // kernel ~1.0, the indexer ~1.1, the projections ~0.6, wv_b + wo ~0.75 - compute, not launches); not checked on sm_86.
+    static const bool pf_mla_on = [] { const char* v = std::getenv("STRATA_GLM5_PF_MLA"); return v && v[0] == '1'; }();
+    int64_t mla_sb = 0, mla_ab = 0;
+    size_t mla_per_tok = 0;
+    float *ma_vb = nullptr, *ma_latT = nullptr;
+    // the indexer's scores / selection bounded by the sub-batch's filled blocks instead of the context's capacity (65,538
+    // at 262K); the same ids.  STRATA_GLM5_PF_ACTIVE=0: the capacity
+    static const bool pf_active = [] { const char* v = std::getenv("STRATA_GLM5_PF_ACTIVE"); return !(v && v[0] == '0'); }();
+    float *ma_qr = nullptr, *ma_kv = nullptr, *ma_rk = nullptr, *ma_rg = nullptr, *ma_qb = nullptr, *ma_qT = nullptr,
+          *ma_qaT = nullptr, *ma_qa = nullptr, *ma_lat = nullptr, *ma_iq = nullptr, *ma_iw = nullptr, *ma_sc = nullptr,
+          *ma_scr = nullptr;
+    int32_t* ma_sel = nullptr;
     {
         const size_t np = (size_t) C * m.n_slices * 24, ns = (size_t) C * m.n_slices;
         const size_t need = (np + ns + 63) & ~(size_t) 63;
@@ -844,6 +860,31 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                             (pf_kda_check && (!ck_state || !ck_state_ref || !ck_conv || !ck_y)))
                             kh = nullptr;   // no room: the slice recurrence
                     }
+                    if (wscr != nullptr && pf_mla_on && m.VD <= m.KVR) {
+                        // the MLA layers: projections over groups of mla_sb tokens (the weights dequantized once per
+                        // group), the indexer's scores / selection and the attention over sub-batches of mla_ab inside
+                        // (their scratch is ~4 MB a token); the largest pair that fits
+                        const size_t per_g = (size_t) m.QLR + m.KVR + 2 * m.ID + 2 * m.NH * m.QK + 2 * m.NH * m.KVR + m.IH * m.ID +
+                                             m.IH + m.NH * m.VD;
+                        const size_t per_a = (size_t) max_blocks_ + cap_ + mla_decode_attn_scratch_floats(cap_, m.NH) + 2 * m.NH * m.KVR;
+                        float* const p0 = p;
+                        for (int64_t g = std::min<int64_t>(256, C); g >= 16 && mla_sb == 0; g /= 2)
+                            for (int64_t a = std::min<int64_t>(64, g); a >= 8 && mla_sb == 0; a /= 2) {
+                                p = p0;
+                                ma_qr = take(g * m.QLR); ma_kv = take(g * m.KVR); ma_rk = take(g * m.ID); ma_rg = take(g * m.ID);
+                                ma_qb = take(g * m.NH * m.QK); ma_qT = take(g * m.NH * m.QK);
+                                ma_qaT = take(g * m.NH * m.KVR); ma_qa = take(g * m.NH * m.KVR);
+                                ma_iq = take(g * m.IH * m.ID); ma_iw = take(g * m.IH); ma_vb = take(g * m.NH * m.VD);
+                                ma_lat = take(a * m.NH * m.KVR); ma_latT = take(a * m.NH * m.KVR); ma_sc = take(a * max_blocks_);
+                                ma_sel = (int32_t*) take(a * cap_); ma_scr = take(a * mla_decode_attn_scratch_floats(cap_, m.NH));
+                                if (ma_scr != nullptr && ma_sel && ma_sc && ma_latT && ma_lat && ma_vb && ma_iw && ma_iq && ma_qa &&
+                                    ma_qaT && ma_qT && ma_qb && ma_rg && ma_rk && ma_kv && ma_qr) {
+                                    mla_sb = g;
+                                    mla_ab = a;
+                                }
+                            }
+                        mla_per_tok = per_g + per_a;
+                    }
                 }
             }
         }
@@ -852,8 +893,11 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     if (std::getenv("STRATA_GLM5_PF_PROF") != nullptr) {
         size_t fr = 0, tot = 0;
         cudaMemGetInfo(&fr, &tot);
-        std::fprintf(stderr, "strata glm5 prefill: MLA absorb %s, KDA projections %s (%zu MiB free after the scratch)\n",
-                     kb_f ? "batched (cuBLAS)" : "per head", kda_batch ? "batched (cuBLAS)" : "per slice", fr >> 20);
+        std::fprintf(stderr, "strata glm5 prefill: MLA absorb %s, KDA projections %s, MLA layers %lld tokens at a time, "
+                     "their attention %lld (%zu KiB a token; cap %lld, blocks %lld) (%zu MiB free after the scratch)\n",
+                     kb_f ? "batched (cuBLAS)" : "per head", kda_batch ? "batched (cuBLAS)" : "per slice",
+                     (long long) (mla_sb > 0 ? mla_sb : SL), (long long) (mla_sb > 0 ? mla_ab : SL), mla_per_tok * 4 >> 10,
+                     (long long) cap_, (long long) max_blocks_, fr >> 20);
     }
     uint8_t* pin = nullptr;
     const size_t pin_blobs = (size_t) 2 * B * max_blob;
@@ -1304,6 +1348,108 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         return false;
     }
     // one strided copy per part: device [t][w] <-> host [t][HF] at offset `at`
+    // one MLA/DSA layer over the chunk in sub-batches of mla_sb tokens (the mHC read already done for the chunk): the
+    // window's kernels in the window's order, each given the whole sub-batch; Q8_0 projections through cuBLAS (others
+    // a slice at a time).  The scores / selection / attention / wv_b go mla_ab tokens at a time inside (vbT reuses lat).
+    static const bool mla_prof = std::getenv("STRATA_GLM5_PF_PROF") != nullptr;
+    double ms_m[4] = {};   // projections, indexer, attention, output (STRATA_GLM5_PF_PROF)
+    auto mla_layer = [&](int64_t l, int64_t T) -> bool {
+        auto mt = std::chrono::steady_clock::now();
+        auto mlap = [&](int i) {
+            if (!mla_prof) return;
+            cudaStreamSynchronize(cs);
+            const auto t1 = std::chrono::steady_clock::now();
+            ms_m[i] += std::chrono::duration<double, std::milli>(t1 - mt).count();
+            mt = t1;
+        };
+        const WeightRef *wqa = wfind(wt, l, "attn_q_a.weight", err), *wqan = wfind(wt, l, "attn_q_a_norm.weight", err),
+                        *wqb = wfind(wt, l, "attn_q_b.weight", err), *wkb = wfind(wt, l, "attn_k_b.weight", err),
+                        *wvb = wfind(wt, l, "attn_v_b.weight", err), *wkv = wfind(wt, l, "attn_kv_a_mqa.weight", err),
+                        *wkvn = wfind(wt, l, "attn_kv_a_norm.weight", err), *wo = wfind(wt, l, "attn_output.weight", err),
+                        *wik = wfind(wt, l, "indexer.attn_k.weight", err), *wiqb = wfind(wt, l, "indexer.attn_q_b.weight", err),
+                        *wikn = wfind(wt, l, "indexer.k_norm.weight", err), *wikb = wfind(wt, l, "indexer.k_norm.bias", err),
+                        *wip = wfind(wt, l, "indexer.proj.weight", err), *wape = wfind(wt, l, "indexer_compressor_ape.weight", err),
+                        *wig = wfind(wt, l, "indexer_compressor_gate.weight", err);
+        if (!wqa || !wqan || !wqb || !wkb || !wvb || !wkv || !wkvn || !wo || !wik || !wiqb || !wikn || !wikb || !wip ||
+            !wape || !wig) return false;
+        if (wkb->native_type != 8 || wvb->native_type != 8) { err = "verify glm5 prefill: attn_k_b / attn_v_b are not Q8_0"; return false; }
+        const int64_t qi = m.dsa_index[(size_t) l];
+        const int64_t QLR = m.QLR, NH = m.NH, QK = m.QK, KVR = m.KVR, VD = m.VD, ID = m.ID, IH = m.IH;
+        uint8_t* lat_pool = m.latent + (size_t) qi * m.max_cells * m.lat_row;
+        float* tail = m.tail + (size_t) qi * 3 * 2 * ID;
+        uint16_t* pooled = m.pooled + (size_t) qi * (m.max_cells / 4 + 1) * ID;
+        if (kbvb_layer != l) {
+            dequant_q8_0((const uint8_t*) wkb->native_data, kb_f, NH * KVR * QK, cs);
+            dequant_q8_0((const uint8_t*) wvb->native_data, vb_f, NH * VD * KVR, cs);
+            kbvb_layer = l;
+        }
+        auto proj = [&](const WeightRef* w, int64_t in, int64_t out, const float* X, int64_t rows, float* Y) -> bool {
+            if (w->native_type == 8 && in % 32 == 0) return gemm_q8(w, in, out, X, rows, Y);
+            for (int64_t r0 = 0; r0 < rows; r0 += SL)
+                mmvq(w, X + (size_t) r0 * in, (int) in, Y + (size_t) r0 * out, (int) out, (int) std::min<int64_t>(SL, rows - r0), m.q8, cs);
+            return true;
+        };
+        const float one = 1.0f, zero = 0.0f;
+        const Glm5KpoolBuffers kb{tail, pooled};
+        static bool types_shown = false;
+        if (mla_prof && !types_shown) {
+            types_shown = true;
+            std::fprintf(stderr, "strata glm5 prefill: MLA weight types q_a %d kv_a %d idx_k %d idx_gate %d q_b %d idx_q_b %d out %d "
+                         "(8 = Q8_0, through cuBLAS)\n", wqa->native_type, wkv->native_type, wik->native_type, wig->native_type,
+                         wqb->native_type, wiqb->native_type, wo->native_type);
+        }
+        for (int64_t b0 = 0; b0 < T; b0 += mla_sb) {
+            const int n = (int) std::min<int64_t>(mla_sb, T - b0);
+            const float* X = xmc + (size_t) b0 * N;
+            int32_t* st = stepc + (size_t) b0 * kStepCount;
+            if (!proj(wqa, N, QLR, X, n, ma_qr) || !proj(wkv, N, KVR, X, n, ma_kv) || !proj(wik, N, ID, X, n, ma_rk) ||
+                !proj(wig, N, ID, X, n, ma_rg))
+                return false;
+            native_qsa_rms_norm_weighted(ma_qr, (const float*) wqan->data, ma_qr, (int) QLR, n, m.rms_eps, cs);
+            native_qsa_rms_norm_weighted(ma_kv, (const float*) wkvn->data, ma_kv, (int) KVR, n, m.rms_eps, cs);
+            if (m.lat_q4) glm5_latent_store_q4(ma_kv, lat_pool, m.page_table, st, kStepCount, 4, (int) KVR, n, cs);
+            else glm5_latent_store(ma_kv, (uint16_t*) lat_pool, m.page_table, st, kStepCount, 4, (int) KVR, n, cs);
+            if (!proj(wqb, QLR, NH * QK, ma_qr, n, ma_qb)) return false;
+            glm5_transpose_abd(ma_qb, ma_qT, n, (int) NH, (int) QK, cs);
+            cublasSgemmStridedBatched(pf_blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) KVR, n, (int) QK, &one,
+                                      kb_f, (int) QK, (long long) KVR * QK, ma_qT, (int) QK, (long long) n * QK, &zero,
+                                      ma_qaT, (int) KVR, (long long) n * KVR, (int) NH);
+            glm5_transpose_abd(ma_qaT, ma_qa, (int) NH, n, (int) KVR, cs);
+            mlap(0);
+            for (int t = 0; t < n; ++t)
+                glm5_kpool_append(ma_rk + (size_t) t * ID, ma_rg + (size_t) t * ID, st + (size_t) t * kStepCount + kStepPos,
+                                  (const float*) wikn->data, (const float*) wikb->data, (const float*) wape->data, m.ln_eps,
+                                  kb, m.max_cells, cs);
+            if (!proj(wiqb, QLR, IH * ID, ma_qr, n, ma_iq)) return false;
+            glm5_f32_gemv((const float*) wip->data, X, ma_iw, (int) N, (int) IH, n, 1.0f / std::sqrt((float) (ID * IH)), cs);
+            mlap(1);
+            for (int a0 = 0; a0 < n; a0 += (int) mla_ab) {   // the attention's sub-batches
+                const int na = std::min<int>((int) mla_ab, n - a0);
+                const int32_t* sa = st + (size_t) a0 * kStepCount;
+                // the sub-batch's last token has the most blocks: the scores' grid and the selection's kernel by that count
+                const int64_t active = (int64_t) h_steps[(size_t) (b0 + a0 + na - 1) * kStepCount + kStepNBid] + 1;
+                glm5_kpool_scores(ma_iq + (size_t) a0 * IH * ID, ma_iw + (size_t) a0 * IH, pooled, sa, na, max_blocks_, ma_sc, cs,
+                                  pf_active ? active : -1);
+                qsa_block_topk(ma_sc, sa, na, max_blocks_, cap_, s, ma_sel, cs, pf_active ? active : -1);
+                mlap(1);
+                const float* qa = ma_qa + (size_t) a0 * NH * KVR;
+                if (m.lat_q4) mla_decode_attn_batch_q4(qa, lat_pool, m.page_table, 4, ma_sel, sa, cap_, (int) NH, 1.0f / std::sqrt((float) QK), ma_scr, ma_lat, na, cs);
+                else mla_decode_attn_batch(qa, (const uint16_t*) lat_pool, m.page_table, 4, ma_sel, sa, cap_, (int) NH,
+                                           1.0f / std::sqrt((float) QK), ma_scr, ma_lat, na, cs);
+                mlap(2);
+                glm5_transpose_abd(ma_lat, ma_latT, na, (int) NH, (int) KVR, cs);
+                float* vbT = ma_lat;   // [NH][na][VD] (VD <= KVR)
+                cublasSgemmStridedBatched(pf_blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) VD, na, (int) KVR, &one,
+                                          vb_f, (int) KVR, (long long) VD * KVR, ma_latT, (int) KVR, (long long) na * KVR, &zero,
+                                          vbT, (int) VD, (long long) na * VD, (int) NH);
+                glm5_transpose_abd(vbT, ma_vb + (size_t) a0 * NH * VD, (int) NH, na, (int) VD, cs);
+                mlap(3);
+            }
+            if (!proj(wo, NH * VD, N, ma_vb, n, boc + (size_t) b0 * N)) return false;
+            mlap(3);
+        }
+        return true;
+    };
     auto hand_copy = [&](float* dev, const float* host_in, float* host_out, int64_t at, int64_t w, int64_t T) {
         if (host_in) cudaMemcpy2DAsync(dev, (size_t) w * 4, host_in + at, (size_t) HF * 4, (size_t) w * 4, (size_t) T,
                                        cudaMemcpyHostToDevice, cs);
@@ -1350,8 +1496,12 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                 } else if (mhc_part != nullptr) {
                     if (!mhc_read_all(l, "attn", l > 0, 0, T, "attn_norm.weight")) return false;
                     lap(ms_norm, tp);
-                    for (int64_t s0 = 0; s0 < T; s0 += SL)
-                        if (!attn(l, s0, (int) std::min<int64_t>(SL, T - s0))) return false;
+                    if (mla_sb > 0 && m.dsa_index[(size_t) l] >= 0) {
+                        if (!mla_layer(l, T)) return false;
+                    } else {
+                        for (int64_t s0 = 0; s0 < T; s0 += SL)
+                            if (!attn(l, s0, (int) std::min<int64_t>(SL, T - s0))) return false;
+                    }
                 } else {
                     for (int64_t s0 = 0; s0 < T; s0 += SL) {
                         const int n = (int) std::min<int64_t>(SL, T - s0);
@@ -1394,6 +1544,9 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                      (long long) n_all, (long long) lb, (long long) le - 1, ms_attn, ms_norm, ms_ffn,
                      prefill_ms_copy - copy0, (long long) prefill_streamed, (long long) prefill_direct,
                      (long long) prefill_resident);
+    if (prof && mla_sb > 0)
+        std::fprintf(stderr, "strata glm5 prefill prof: MLA layers %.0f ms of the attention (projections %.0f, indexer %.0f, "
+                             "attention %.0f, output %.0f)\n", ms_m[0] + ms_m[1] + ms_m[2] + ms_m[3], ms_m[0], ms_m[1], ms_m[2], ms_m[3]);
     if (prof)
         std::fprintf(stderr, "strata glm5 prefill prof: of the host blob copies - waiting for the GPU's previous half %.0f ms, "
                              "fetching the streamed blobs %.0f ms (threads: in blob() %.0f ms, copying %.0f ms, summed)\n",

@@ -342,10 +342,11 @@ void glm5_kpool_append(const float* raw_k, const float* gate, const int32_t* rel
 }
 
 void glm5_kpool_scores(const float* q, const float* w, const uint16_t* pooled, const int32_t* steps, int64_t nq,
-                       int64_t max_blocks, float* scores, void* stream) {
+                       int64_t max_blocks, float* scores, void* stream, int64_t active_blocks) {
     if (!q || !w || !pooled || !steps || !scores || nq <= 0 || max_blocks <= 0 || !stream)
         throw std::invalid_argument("glm5_kpool_scores: missing buffer or stream");
-    const dim3 grid((unsigned) ((max_blocks + 7) / 8), (unsigned) nq);
+    const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
+    const dim3 grid((unsigned) ((reach + 7) / 8), (unsigned) nq);
     glm5_kpool_scores_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(q, w, (const __nv_bfloat16*) pooled, steps,
                                                                        max_blocks, scores);
 }
