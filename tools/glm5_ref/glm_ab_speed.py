@@ -26,6 +26,7 @@ args = ["--serve", "--pack", PACK, "--native", NATIVE, "--prefill", "auto", "--s
         "--vram-reserve-mib", os.environ.get("VRES", "2200"), "--mmap-experts", "--resident-budget-gib", os.environ.get("RES", "105"),
         "--expert-profile", PACK + "/expert-profile-learned-2026-10-08b.bin", "--expert-cache", os.environ.get("CACHE", "0"),
         "--adapt-every", os.environ.get("ADAPT_EVERY", "1"), "--adapt-swaps", os.environ.get("ADAPT", "64")]
+args += os.environ.get("EXTRA", "").split()   # more engine flags for an A/B (space separated)
 if mode == "mn":
     args += ["--remote-stage", os.environ.get("STAGE_ADDR", "KITT3060:9300"), "--layer-split", f"{K1},{K2}"]
 elif mode == "mn2":   # both 3060s: GPU 0 runs [30, 37), GPU 1 [37, 44)
