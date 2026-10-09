@@ -7130,6 +7130,7 @@ int main(int argc, char** argv) {
                 for (size_t q = 0; q < swaps.size(); ++q) {
                     const uint8_t* b = srcp->blob(swaps[q].layer, swaps[q].in);
                     if (b == nullptr) continue;   // reported by the loop below
+                    if (src.pinned(swaps[q].layer, swaps[q].in)) continue;   // page-locked already: its DMA is async
                     const size_t nb = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(swaps[q].layer);
                     for (size_t off = 0; off < nb; off += (size_t) 1 << 20)
                         pieces.push_back({b + off, refill_stage + q * refill_stride + off, std::min((size_t) 1 << 20, nb - off)});
@@ -7148,7 +7149,7 @@ int main(int argc, char** argv) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
                 const uint8_t* b = srcp->blob(s.layer, s.in);
-                const uint8_t* from = staged_refill ? refill_stage + q * refill_stride : b;
+                const uint8_t* from = staged_refill && !src.pinned(s.layer, s.in) ? refill_stage + q * refill_stride : b;
                 // asynchronous: the copies run while the MTP drafts; the next window waits for them
                 if (slot < 0 || b == nullptr ||
                     cudaMemcpyAsync(xcache.device_slot(slot), from, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
