@@ -12675,6 +12675,15 @@ int main(int argc, char** argv) {
                 bool cancelled = false;
                 // STRATA_GLM5_PF_MIN (2026-10-10): the fewest new cells the chunk path takes (16); fewer go as verify windows
                 static const int64_t pf_min = [] { const char* v = std::getenv("STRATA_GLM5_PF_MIN"); return v ? std::atoll(v) : 16; }();
+                // STRATA_GLM5_PF_SEED_ROUNDS (2026-10-10, opt-in): after a prompt of >= 256 new cells, its routing counts go
+                // to the adaptive tier and up to this many rounds of swaps run before the decode (0 = off) - a long
+                // prompt's topic routes to experts the VRAM cache (filled by the profile) does not hold: decode after a
+                // 4,400-token summary prompt used 204-223 CPU experts a window instead of 157.  8 rounds (512 swaps):
+                // 198-200 a window, decode 8.4-9.0 -> 9.3-9.4 tok/s, but the first token ~1.1 s later (break-even at ~256
+                // answer tokens).  The counts alone (STRATA_GLM5_PF_SEED_BLOCK=0, the decode's rounds) did not help.
+                static const int pf_seed = [] { const char* v = std::getenv("STRATA_GLM5_PF_SEED_ROUNDS"); return v ? std::atoi(v) : 0; }();
+                const bool seed = pf_seed > 0 && o.adapt_swaps > 0 && gl_chain.empty() && np - reused >= 256 && pf_chunk > 0;
+                if (seed) ver.pf_usage.assign((size_t) g.n_layers * g.n_expert, 0.0f);
                 if (np - reused >= pf_min && pf_chunk > 0) {
                     ver.prefill_ms_total = 0;
                     // slots: the system part first (up to the first <|user|>), then its slot, then the rest
@@ -12719,6 +12728,22 @@ int main(int argc, char** argv) {
                         q += T;
                         cancelled = stop_req.load();
                     }
+                }
+                if (seed && ver.pf_usage.size() == drive.d.usage.size()) {   // the prompt's topic into the VRAM cache
+                    const Clock::time_point ts = Clock::now();
+                    for (size_t i = 0; i < drive.d.usage.size(); ++i) drive.d.usage[i] += ver.pf_usage[i];
+                    const int64_t s0 = swaps_total;
+                    // STRATA_GLM5_PF_SEED_BLOCK=0: only the counts - the decode's own rounds swap them in, asynchronously
+                    static const bool seed_block = [] { const char* v = std::getenv("STRATA_GLM5_PF_SEED_BLOCK"); return !(v && v[0] == '0'); }();
+                    for (int r = 0; seed_block && r < pf_seed; ++r) {
+                        const int64_t before = swaps_total;
+                        if (!adapt()) { std::printf("ERR the prompt's adaptive refill failed\n"); std::fflush(stdout); return 1; }
+                        apply_pending(true);
+                        if (swaps_total == before) break;
+                    }
+                    std::fprintf(stderr, "strata serve: the prompt's routing moved %lld experts into the VRAM cache in %.0f ms\n",
+                                 (long long) (swaps_total - s0), std::chrono::duration<double, std::milli>(Clock::now() - ts).count());
+                    ver.pf_usage.clear();
                 }
                 const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp).count();
                 live.assign(prompt.begin(), prompt.begin() + np);

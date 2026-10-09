@@ -1279,9 +1279,11 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         pf_moe_ms[0] += std::chrono::duration<double, std::milli>(tm - tm0).count();
         for (auto& v : by) v.clear();
         used.clear();
+        const bool count_use = pf_usage.size() == (size_t) g.n_layers * NE;
         for (int64_t i = 0; i < TK; ++i) {
             const int32_t e = h_ids[(size_t) i];
             if (e < 0 || e >= NE) continue;
+            if (count_use) pf_usage[(size_t) l * NE + e] += 1.0f;
             if (by[(size_t) e].empty()) used.push_back(e);
             by[(size_t) e].push_back((int32_t) i);
         }
@@ -1940,9 +1942,11 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         hand_copy(acc, hostS, nullptr, HC * N, N, Pn);
         for (auto& v : by) v.clear();
         used.clear();
+        const bool count_use = pf_usage.size() == (size_t) g.n_layers * NE;
         for (int64_t i = 0; i < Pn * K; ++i) {
             const int32_t e = hids[(size_t) i];
             if (e < 0 || e >= NE) continue;
+            if (count_use) pf_usage[(size_t) l * NE + e] += 1.0f;
             if (by[(size_t) e].empty()) used.push_back(e);
             by[(size_t) e].push_back((int32_t) i);
         }

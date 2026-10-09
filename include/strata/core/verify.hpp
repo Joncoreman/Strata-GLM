@@ -302,6 +302,9 @@ public:
     static bool glm5_slot_peek(const std::string& path, uint64_t fingerprint, std::vector<int32_t>& toks);
     double prefill_ms_copy = 0, prefill_ms_total = 0;
     int64_t prefill_streamed = 0, prefill_resident = 0, prefill_direct = 0;
+    /// 2026-10-10: when sized n_layers * n_expert by the caller, prefill_glm5 adds each routed (token, expert) of the
+    /// prompt here - the serve loop hands it to the adaptive tier before the decode (the prompt's topic)
+    std::vector<float> pf_usage;
     double pf_wait_ms = 0, pf_fetch_ms = 0, pf_blob_thread_ms = 0, pf_copy_thread_ms = 0;   // STRATA_GLM5_PF_PROF
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
