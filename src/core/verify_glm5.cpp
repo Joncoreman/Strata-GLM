@@ -39,6 +39,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <thread>
@@ -585,6 +586,113 @@ bool Verifier::glm5_state_zero(std::string& err) {
         return false;
     }
     return next_ == nullptr || next_->glm5_state_zero(err);
+}
+
+// ================================ SERVE: SLOTS ON DISK (2026-10-09) ================================
+// file = SlotHeader | tokens i32[n_cells] | KDA states + conv histories f32[gdn_n] | indexer tails f32[tail_n]
+//        | per DSA layer: latents [n_cells][lat_row] | per DSA layer: indexer blocks f32[n_cells/4 + 1][ID]
+// The latents and completed indexer blocks of cells below n_cells are never rewritten while the sequence grows, so
+// cells [0, n_cells) plus the recurrent state at n_cells are the whole sequence state there.
+namespace {
+struct SlotHeader {
+    char magic[8];
+    uint64_t fingerprint;
+    int64_t n_cells, n_dsa, lat_row, id, gdn_n, tail_n;
+};
+constexpr char kSlotMagic[8] = {'G', 'L', 'M', '5', 'S', 'L', 'T', '1'};
+}  // namespace
+
+bool Verifier::glm5_slot_write(const std::string& path, const int32_t* toks, int64_t n_cells, uint64_t fingerprint,
+                               std::string& err) {
+    if (glm_ == nullptr || remote_ != nullptr) { err = "glm5 slot: no local glm5 window"; return false; }
+    const Glm5& m = *glm_;
+    if (n_cells < 1 || n_cells > m.max_cells) { err = "glm5 slot: cells out of range"; return false; }
+    const OnDevice on_device(device_);
+    const int64_t nD = g_->n_qsa_layers();
+    const StateSpans s = glm5_spans(*g_, *ss_, m.tail, nD, m.ID);
+    SlotHeader h{};
+    std::memcpy(h.magic, kSlotMagic, 8);
+    h.fingerprint = fingerprint;
+    h.n_cells = n_cells; h.n_dsa = nD; h.lat_row = (int64_t) m.lat_row; h.id = m.ID;
+    h.gdn_n = (int64_t) s.gdn_n; h.tail_n = (int64_t) s.tail_n;
+    const size_t lat_bytes = (size_t) n_cells * m.lat_row, pool_rows = (size_t) n_cells / 4 + 1;
+    std::vector<uint8_t> buf(std::max<size_t>({s.gdn_n * 4, s.tail_n * 4, (size_t) nD * lat_bytes,
+                                               (size_t) nD * pool_rows * m.ID * 4}));
+    cudaStreamSynchronize(cs_);
+    const std::string tmp = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) { err = "glm5 slot: cannot write " + tmp; return false; }
+    bool ok = std::fwrite(&h, sizeof h, 1, f) == 1 && std::fwrite(toks, 4, (size_t) n_cells, f) == (size_t) n_cells;
+    ok = ok && cudaMemcpy(buf.data(), s.gdn, s.gdn_n * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+         std::fwrite(buf.data(), 4, s.gdn_n, f) == s.gdn_n;
+    ok = ok && cudaMemcpy(buf.data(), s.tail, s.tail_n * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+         std::fwrite(buf.data(), 4, s.tail_n, f) == s.tail_n;
+    // the latents of cells [0, n_cells) of every DSA layer (each layer's rows start max_cells rows apart)
+    ok = ok && cudaMemcpy2D(buf.data(), lat_bytes, m.latent, (size_t) m.max_cells * m.lat_row, lat_bytes, (size_t) nD,
+                            cudaMemcpyDeviceToHost) == cudaSuccess &&
+         std::fwrite(buf.data(), 1, (size_t) nD * lat_bytes, f) == (size_t) nD * lat_bytes;
+    const size_t pool_bytes = pool_rows * (size_t) m.ID * 4, pool_pitch = (size_t) (m.max_cells / 4 + 1) * m.ID * 4;
+    ok = ok && cudaMemcpy2D(buf.data(), pool_bytes, m.pooled, pool_pitch, pool_bytes, (size_t) nD,
+                            cudaMemcpyDeviceToHost) == cudaSuccess &&
+         std::fwrite(buf.data(), 1, (size_t) nD * pool_bytes, f) == (size_t) nD * pool_bytes;
+    ok = std::fclose(f) == 0 && ok;
+    if (!ok) { std::remove(tmp.c_str()); err = "glm5 slot: writing " + path + " failed"; return false; }
+    std::remove(path.c_str());
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) { err = "glm5 slot: cannot rename " + tmp; return false; }
+    return true;
+}
+
+static bool glm5_slot_head(FILE* f, uint64_t fingerprint, SlotHeader& h, std::vector<int32_t>& toks) {
+    if (std::fread(&h, sizeof h, 1, f) != 1 || std::memcmp(h.magic, kSlotMagic, 8) != 0 ||
+        h.fingerprint != fingerprint || h.n_cells < 1 || h.n_cells > (int64_t) 1 << 22)
+        return false;
+    toks.resize((size_t) h.n_cells);
+    return std::fread(toks.data(), 4, toks.size(), f) == toks.size();
+}
+
+bool Verifier::glm5_slot_peek(const std::string& path, uint64_t fingerprint, std::vector<int32_t>& toks) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) return false;
+    SlotHeader h{};
+    const bool ok = glm5_slot_head(f, fingerprint, h, toks);
+    std::fclose(f);
+    return ok;
+}
+
+bool Verifier::glm5_slot_read(const std::string& path, uint64_t fingerprint, std::vector<int32_t>& toks,
+                              std::string& err) {
+    if (glm_ == nullptr || remote_ != nullptr) { err = "glm5 slot: no local glm5 window"; return false; }
+    const Glm5& m = *glm_;
+    const OnDevice on_device(device_);
+    const int64_t nD = g_->n_qsa_layers();
+    const StateSpans s = glm5_spans(*g_, *ss_, m.tail, nD, m.ID);
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) { err = "glm5 slot: cannot read " + path; return false; }
+    SlotHeader h{};
+    if (!glm5_slot_head(f, fingerprint, h, toks) || h.n_dsa != nD || h.lat_row != (int64_t) m.lat_row ||
+        h.id != m.ID || h.gdn_n != (int64_t) s.gdn_n || h.tail_n != (int64_t) s.tail_n || h.n_cells > m.max_cells) {
+        std::fclose(f);
+        err = "glm5 slot: " + path + " was written for another model or setting";
+        return false;
+    }
+    const size_t lat_bytes = (size_t) h.n_cells * m.lat_row, pool_rows = (size_t) h.n_cells / 4 + 1;
+    const size_t pool_bytes = pool_rows * (size_t) m.ID * 4, pool_pitch = (size_t) (m.max_cells / 4 + 1) * m.ID * 4;
+    std::vector<uint8_t> buf(std::max<size_t>({s.gdn_n * 4, s.tail_n * 4, (size_t) nD * lat_bytes,
+                                               (size_t) nD * pool_bytes}));
+    cudaStreamSynchronize(cs_);
+    bool ok = std::fread(buf.data(), 4, s.gdn_n, f) == s.gdn_n &&
+              cudaMemcpy(s.gdn, buf.data(), s.gdn_n * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+    ok = ok && std::fread(buf.data(), 4, s.tail_n, f) == s.tail_n &&
+         cudaMemcpy(s.tail, buf.data(), s.tail_n * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+    ok = ok && std::fread(buf.data(), 1, (size_t) nD * lat_bytes, f) == (size_t) nD * lat_bytes &&
+         cudaMemcpy2D(m.latent, (size_t) m.max_cells * m.lat_row, buf.data(), lat_bytes, lat_bytes, (size_t) nD,
+                      cudaMemcpyHostToDevice) == cudaSuccess;
+    ok = ok && std::fread(buf.data(), 1, (size_t) nD * pool_bytes, f) == (size_t) nD * pool_bytes &&
+         cudaMemcpy2D(m.pooled, pool_pitch, buf.data(), pool_bytes, pool_bytes, (size_t) nD,
+                      cudaMemcpyHostToDevice) == cudaSuccess;
+    std::fclose(f);
+    if (!ok) { err = "glm5 slot: reading " + path + " failed"; return false; }
+    return true;
 }
 
 // ================================ THE PROMPT PATH (2026-10-08) ================================

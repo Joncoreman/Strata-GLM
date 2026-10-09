@@ -12463,6 +12463,80 @@ int main(int argc, char** argv) {
             };
             std::vector<int32_t> live, snap_toks;   // live: the cells whose state is committed; snap: the last prompt
             std::vector<float> snap;
+            // ---- SLOTS ON DISK (2026-10-09; one PC only - a stage engine's state cannot be read back) ----
+            // The prompt's state is kept in files (glm5_slot_write): at the end of every prompt of at least
+            // STRATA_GLM5_SLOT_MIN tokens (a conversation a side request such as opencode's title pushes out comes back
+            // from its file), and where the system part ends - the first <|user|> - so a NEW conversation over the same
+            // system prompt (opencode's ~13K tokens of instructions and tools) starts from there.  Files survive a
+            // restart.  STRATA_GLM5_SLOTS = how many are kept (8; 0 = off), STRATA_GLM5_SLOT_DIR = where.
+            struct Slot { std::string path; std::vector<int32_t> toks; bool prelude = false; int64_t used = 0; };
+            std::vector<Slot> slots;
+            int64_t slot_clock = 0;
+            const int slot_max = [] { const char* v = std::getenv("STRATA_GLM5_SLOTS"); return v ? std::atoi(v) : 8; }();
+            const int64_t slot_min = [] { const char* v = std::getenv("STRATA_GLM5_SLOT_MIN"); return v ? std::atoll(v) : 1024; }();
+            const std::string slot_dir = [] { const char* v = std::getenv("STRATA_GLM5_SLOT_DIR"); return std::string(v ? v : "glm5-slots"); }();
+            const bool slots_on = slot_max > 0 && gl_chain.empty();
+            const uint64_t slot_fp = [&] {   // the model, the pack and the latent format: a slot of another is never read
+                uint64_t hsh = 1469598103934665603ull;
+                const std::string id = "glm5-slot-1|" + o.native_preset + "|" + o.pack + "|" +
+                                       (std::getenv("STRATA_GLM5_KV") ? std::getenv("STRATA_GLM5_KV") : "q4") + "|" +
+                                       std::to_string(g.n_layers) + "|" + std::to_string(g.n_embd);
+                for (unsigned char c : id) { hsh ^= c; hsh *= 1099511628211ull; }
+                return hsh;
+            }();
+            if (slots_on) {
+                std::error_code ec;
+                std::filesystem::create_directories(slot_dir, ec);
+                for (const auto& e : std::filesystem::directory_iterator(slot_dir, ec)) {
+                    if (e.path().extension() != ".slot") continue;
+                    Slot sl;
+                    sl.path = e.path().string();
+                    sl.prelude = e.path().filename().string().rfind("p_", 0) == 0;
+                    if (strata::core::Verifier::glm5_slot_peek(sl.path, slot_fp, sl.toks)) slots.push_back(std::move(sl));
+                }
+                std::fprintf(stderr, "strata serve: slots on disk: %zu in %s (up to %d; prompts of %lld tokens or more)\n",
+                             slots.size(), slot_dir.c_str(), slot_max, (long long) slot_min);
+            }
+            const int32_t user_tok = 154827;   // <|user|>: where GLM-5.3's system part ends
+            auto slot_save = [&](const std::vector<int32_t>& toks, bool prelude) {
+                for (Slot& sl : slots) if (sl.toks == toks) { sl.used = ++slot_clock; return; }   // kept already
+                // a conversation slot this one extends is superseded (the prelude slots stay: new conversations need them)
+                for (size_t i = 0; i < slots.size();) {
+                    const Slot& sl = slots[i];
+                    if (!sl.prelude && !prelude && sl.toks.size() < toks.size() &&
+                        std::equal(sl.toks.begin(), sl.toks.end(), toks.begin())) {
+                        std::error_code ec;
+                        std::filesystem::remove(sl.path, ec);
+                        slots.erase(slots.begin() + (ptrdiff_t) i);
+                    } else {
+                        ++i;
+                    }
+                }
+                while ((int) slots.size() >= slot_max) {   // the least recently used goes
+                    size_t lru = 0;
+                    for (size_t i = 1; i < slots.size(); ++i) if (slots[i].used < slots[lru].used) lru = i;
+                    std::error_code ec;
+                    std::filesystem::remove(slots[lru].path, ec);
+                    slots.erase(slots.begin() + (ptrdiff_t) lru);
+                }
+                char name[64];
+                std::snprintf(name, sizeof name, "%s%lld_%llx.slot", prelude ? "p_" : "c_", (long long) toks.size(),
+                              (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count());
+                Slot sl;
+                sl.path = (std::filesystem::path(slot_dir) / name).string();
+                sl.toks = toks;
+                sl.prelude = prelude;
+                sl.used = ++slot_clock;
+                const Clock::time_point tw = Clock::now();
+                std::string e;
+                if (!ver.glm5_slot_write(sl.path, toks.data(), (int64_t) toks.size(), slot_fp, e)) {
+                    std::fprintf(stderr, "strata serve: %s (the request goes on without it)\n", e.c_str());
+                    return;
+                }
+                std::fprintf(stderr, "strata serve: slot %s (%zu tokens) written in %.0f ms\n", name, toks.size(),
+                             std::chrono::duration<double, std::milli>(Clock::now() - tw).count());
+                slots.push_back(std::move(sl));
+            };
             if (!ver.glm5_state_zero(err)) { std::fprintf(stderr, "strata serve: %s\n", err.c_str()); return 1; }
             std::printf("INFO engine=glm5 model=glm5-next\n");
             std::printf("READY %lld stop\n", (long long) o.max_context);
@@ -12529,7 +12603,33 @@ int main(int argc, char** argv) {
                 auto starts_with = [&](const std::vector<int32_t>& pre) {
                     return (int64_t) pre.size() <= n - 1 && std::equal(pre.begin(), pre.end(), prompt.begin());
                 };
-                if (!live.empty() && starts_with(live)) {
+                // the longest slot on disk this prompt starts with (it pays when it is longer than the GPU's own prefix)
+                Slot* best_slot = nullptr;
+                if (slots_on)
+                    for (Slot& sl : slots)
+                        if (starts_with(sl.toks) && (best_slot == nullptr || sl.toks.size() > best_slot->toks.size()))
+                            best_slot = &sl;
+                const size_t gpu_have = !live.empty() && starts_with(live) ? live.size()
+                                        : !snap_toks.empty() && starts_with(snap_toks) ? snap_toks.size() : 0;
+                if (best_slot != nullptr && best_slot->toks.size() > gpu_have) {
+                    const Clock::time_point tr = Clock::now();
+                    std::vector<int32_t> st;
+                    if (ver.glm5_slot_read(best_slot->path, slot_fp, st, err) && st == best_slot->toks) {
+                        live = st;
+                        best_slot->used = ++slot_clock;
+                        std::fprintf(stderr, "strata serve: slot %s (%zu tokens) read in %.0f ms\n",
+                                     std::filesystem::path(best_slot->path).filename().string().c_str(), st.size(),
+                                     std::chrono::duration<double, std::milli>(Clock::now() - tr).count());
+                    } else {   // a broken file: forget it and read the prompt
+                        std::fprintf(stderr, "strata serve: %s - read from the prompt instead\n", err.c_str());
+                        err.clear();
+                        std::error_code ec;
+                        std::filesystem::remove(best_slot->path, ec);
+                        slots.erase(slots.begin() + (best_slot - slots.data()));
+                        if (!ver.glm5_state_zero(err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
+                        live.clear();
+                    }
+                } else if (!live.empty() && starts_with(live)) {
                     // the live sequence goes on
                 } else if (!snap_toks.empty() && starts_with(snap_toks)) {
                     if (!ver.glm5_state_restore(snap, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
@@ -12545,8 +12645,27 @@ int main(int argc, char** argv) {
                 bool cancelled = false;
                 if (np - reused >= 16 && pf_chunk > 0) {
                     ver.prefill_ms_total = 0;
-                    if (!(gl_chain.empty() ? ver.prefill_glm5(prompt.data() + reused, np - reused, reused, pf_chunk, pf, err)
-                                           : mn_prefill(prompt.data() + reused, np - reused, reused, err))) {
+                    // slots: the system part first (up to the first <|user|>), then its slot, then the rest
+                    int64_t cut = reused;
+                    if (slots_on) {
+                        const auto u = std::find(prompt.begin() + reused, prompt.begin() + np, user_tok);
+                        if (u != prompt.begin() + np && u - prompt.begin() >= slot_min && (prompt.begin() + np) - u >= 16)
+                            cut = u - prompt.begin();
+                    }
+                    if (cut > reused) {
+                        if (!ver.prefill_glm5(prompt.data() + reused, cut - reused, reused, pf_chunk, pf, err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            std::fflush(stdout);
+                            if (err.find("do not fit") == std::string::npos && err.find("page-locked") == std::string::npos) return 1;
+                            err.clear();
+                            continue;
+                        }
+                        if (!ver.wait_commit(err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
+                        slot_save(std::vector<int32_t>(prompt.begin(), prompt.begin() + cut), true);
+                    }
+                    if (np - cut >= 1 &&
+                        !(gl_chain.empty() ? ver.prefill_glm5(prompt.data() + cut, np - cut, cut, pf_chunk, pf, err)
+                                           : mn_prefill(prompt.data() + cut, np - cut, cut, err))) {
                         std::printf("ERR %s\n", err.c_str());
                         std::fflush(stdout);
                         if (err.find("do not fit") == std::string::npos && err.find("page-locked") == std::string::npos) return 1;
@@ -12575,6 +12694,8 @@ int main(int argc, char** argv) {
                 if (gl_chain.empty()) {
                     if (!ver.glm5_state_save(snap, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
                     snap_toks = live;
+                    // slots: the whole prompt, when it is long enough to be worth a file and was not just read from one
+                    if (slots_on && !cancelled && np >= slot_min && np > reused) slot_save(live, false);
                 }
                 std::printf("PP %lld %lld %.1f %.1f\n", (long long) np, (long long) n, prompt_ms,
                             prompt_ms > 0 ? 1000.0 * (double) (np - reused) / prompt_ms : 0.0);

@@ -287,6 +287,15 @@ public:
     bool glm5_state_save(std::vector<float>& host, std::string& err);
     bool glm5_state_restore(const std::vector<float>& host, std::string& err);
     bool glm5_state_zero(std::string& err);
+    /// A sequence SLOT on disk (2026-10-09): the state above plus the latents and the indexer blocks of cells
+    /// [0, n_cells) - everything a later request whose prompt starts with `toks` needs to go on without reading them
+    /// again (a new opencode session over the same system prompt, or a conversation a side request pushed out).
+    /// `fingerprint` names the model and settings; a file written for another one is refused.  Read restores the state
+    /// and returns the slot's tokens; peek returns only the tokens (no GPU work).
+    bool glm5_slot_write(const std::string& path, const int32_t* toks, int64_t n_cells, uint64_t fingerprint,
+                         std::string& err);
+    bool glm5_slot_read(const std::string& path, uint64_t fingerprint, std::vector<int32_t>& toks, std::string& err);
+    static bool glm5_slot_peek(const std::string& path, uint64_t fingerprint, std::vector<int32_t>& toks);
     double prefill_ms_copy = 0, prefill_ms_total = 0;
     int64_t prefill_streamed = 0, prefill_resident = 0;
 
