@@ -797,6 +797,111 @@ __global__ void __launch_bounds__(THREADS) mla_chunk_tc_kernel(const float* __re
     }
 }
 
+// The same with 32 heads a block (2026-10-10): the chunk's latents decoded once for twice the heads (the 16-head
+// kernel decoded them four times a query and chunk).  S and P overlay the queries' room once Q . L^T is done; 98,816
+// bytes of dynamic shared memory (sm_120 allows 101,376).  8 warps: Q . L^T one 16x16 tile each, the softmax 4 heads
+// each, P . L 8 tiles each.
+constexpr int MGH2 = 32;
+constexpr size_t kMlaTc32Smem = (size_t) MGH2 * MHD * 2 + (size_t) CHUNK * MHD * 2 + (size_t) CHUNK * 8;
+template <bool Q4>
+__global__ void __launch_bounds__(THREADS) mla_chunk_tc32_kernel(const float* __restrict__ q, const void* __restrict__ pool,
+                                                                 const int32_t* __restrict__ page_table,
+                                                                 const int32_t* __restrict__ ids,
+                                                                 const int32_t* __restrict__ step, int n_head, int page_size,
+                                                                 float scale, float* __restrict__ part_acc,
+                                                                 float* __restrict__ part_m, float* __restrict__ part_l,
+                                                                 int n_chunks, int cap, long long scratch_stride) {
+    using namespace nvcuda;
+    extern __shared__ __align__(32) unsigned char smem[];
+    __half* sQ = reinterpret_cast<__half*>(smem);                                   // [MGH2][MHD]
+    __half* sL = sQ + MGH2 * MHD;                                                   // [CHUNK][MHD]
+    long long* srow = reinterpret_cast<long long*>(sL + CHUNK * MHD);               // [CHUNK]
+    float* sS = reinterpret_cast<float*>(smem);                                     // [MGH2][CHUNK] over sQ (after Q . L^T)
+    __half* sP = reinterpret_cast<__half*>(sS + MGH2 * CHUNK);                      // [MGH2][CHUNK]
+    q += (size_t) blockIdx.z * (size_t) n_head * MHD;
+    ids += (size_t) blockIdx.z * (size_t) cap;
+    step += (size_t) blockIdx.z * kStepCount;
+    part_acc += (size_t) blockIdx.z * (size_t) scratch_stride;
+    part_m += (size_t) blockIdx.z * (size_t) scratch_stride;
+    part_l += (size_t) blockIdx.z * (size_t) scratch_stride;
+    const int n_ids = __ldg(step + kStepWidth);
+    const int chunk = blockIdx.x, hg = blockIdx.y;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int c0 = chunk * CHUNK;
+    const int n_here = min(CHUNK, n_ids - c0);
+    const int h0 = hg * MGH2;
+    if (n_here <= 0) {
+        if (t < MGH2) { part_m[(size_t) chunk * n_head + h0 + t] = -FLT_MAX; part_l[(size_t) chunk * n_head + h0 + t] = 0.0f; }
+        return;
+    }
+    for (int i = t; i < MGH2 * MHD; i += THREADS) sQ[i] = __float2half(q[(size_t) h0 * MHD + i]);
+    if (t < CHUNK) {
+        long long r = -1;
+        if (t < n_here) {
+            const int cell = ids[c0 + t];
+            const long long page = (long long) page_table[cell / page_size];
+            if (page >= 0) r = page * page_size + (cell % page_size);
+        }
+        srow[t] = r;
+    }
+    __syncthreads();
+    for (int i = t; i < CHUNK * (MHD / 8); i += THREADS) {
+        const int c = i / (MHD / 8), d0 = (i % (MHD / 8)) * 8;
+        float v[8];
+        if (srow[c] >= 0) mla_load8<Q4>(pool, srow[c], d0, v);
+        else
+#pragma unroll
+            for (int k = 0; k < 8; ++k) v[k] = 0.0f;
+        __half* dst = sL + c * MHD + d0;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) dst[k] = __float2half(v[k]);
+    }
+    __syncthreads();
+    // S tile (hm, cn) = Q[16 hm ..][:] . L[16 cn ..][:]^T, one tile a warp; stored once every warp is done with sQ
+    const int hm = warp >> 2, cn = warp & 3;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> sacc;
+    wmma::fill_fragment(sacc, 0.0f);
+    {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+        for (int k = 0; k < MHD; k += 16) {
+            wmma::load_matrix_sync(fa, sQ + (hm * 16) * MHD + k, MHD);
+            wmma::load_matrix_sync(fb, sL + (cn * 16) * MHD + k, MHD);
+            wmma::mma_sync(sacc, fa, fb, sacc);
+        }
+    }
+    __syncthreads();
+    wmma::store_matrix_sync(sS + (hm * 16) * CHUNK + cn * 16, sacc, CHUNK, wmma::mem_row_major);
+    __syncthreads();
+    for (int h = warp; h < MGH2; h += WARPS) {
+        const bool va = lane < n_here && srow[lane] >= 0, vb = lane + 32 < n_here && srow[lane + 32] >= 0;
+        const float a = va ? sS[h * CHUNK + lane] * scale : -FLT_MAX, b = vb ? sS[h * CHUNK + lane + 32] * scale : -FLT_MAX;
+        const float m = warp_max(fmaxf(a, b));
+        const float ea = va ? __expf(a - m) : 0.0f;
+        const float eb = vb ? __expf(b - m) : 0.0f;
+        sP[h * CHUNK + lane] = __float2half(ea);
+        sP[h * CHUNK + lane + 32] = __float2half(eb);
+        const float l = warp_sum(ea + eb);
+        if (lane == 0) { part_m[(size_t) chunk * n_head + h0 + h] = m; part_l[(size_t) chunk * n_head + h0 + h] = l; }
+    }
+    __syncthreads();
+    float* acc_out = part_acc + ((size_t) chunk * n_head + h0) * MHD;
+    for (int tile = warp; tile < 2 * (MHD / 16); tile += WARPS) {   // (head half, 16-dim tile)
+        const int th = tile / (MHD / 16), nt = tile % (MHD / 16);
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.0f);
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fb;
+#pragma unroll
+        for (int k = 0; k < CHUNK; k += 16) {
+            wmma::load_matrix_sync(fa, sP + (th * 16) * CHUNK + k, CHUNK);
+            wmma::load_matrix_sync(fb, sL + k * MHD + nt * 16, MHD);
+            wmma::mma_sync(acc, fa, fb, acc);
+        }
+        wmma::store_matrix_sync(acc_out + (size_t) (th * 16) * MHD + nt * 16, acc, MHD, wmma::mem_row_major);
+    }
+}
+
 template <bool Q4>
 void mla_decode_attn_any(const float* q_abs, const void* latent_pool, const int32_t* page_table, int page_size,
                          const int32_t* ids, const int32_t* steps, int64_t cap, int n_head, float scale,
@@ -820,6 +925,14 @@ void mla_decode_attn_any(const float* q_abs, const void* latent_pool, const int3
         tc_ready = cudaFuncSetAttribute(mla_chunk_tc_kernel<Q4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kMlaTcSmem) == cudaSuccess;
         cudaGetLastError();
     }
+    // the 32-head kernel where its shared memory fits (STRATA_MLA_TC32=0: the 16-head one)
+    static const bool tc32_on = [] { const char* v = std::getenv("STRATA_MLA_TC32"); return !(v && v[0] == '0'); }();
+    static int tc32_ready = -1;
+    if (tc32_ready < 0 && tc_on && n_q >= 16) {
+        tc32_ready = tc32_on && n_head % MGH2 == 0 &&
+                     cudaFuncSetAttribute(mla_chunk_tc32_kernel<Q4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kMlaTc32Smem) == cudaSuccess;
+        cudaGetLastError();
+    }
     // STRATA_MLA_TC_CHECK=1 (a test): the first calls run the CUDA-core kernel too and print how far the outputs are apart
     static const bool tc_check = [] { const char* v = std::getenv("STRATA_MLA_TC_CHECK"); return v && v[0] == '1'; }();
     static int tc_checks = 0;
@@ -832,9 +945,14 @@ void mla_decode_attn_any(const float* q_abs, const void* latent_pool, const int3
             q_abs, latent_pool, page_table, ids, steps, n_head, page_size, scale, part_acc, part_m, part_l, n_chunks,
             (int) cap, stride);
         mla_merge_kernel<<<dim3((unsigned) n_head, (unsigned) n_q), MHD, 0, st>>>(part_acc, part_m, part_l, n_chunks, n_head, ref, stride);
-        mla_chunk_tc_kernel<Q4><<<dim3((unsigned) n_chunks, (unsigned) (n_head / MGH), (unsigned) n_q), THREADS, kMlaTcSmem, st>>>(
-            q_abs, latent_pool, page_table, ids, steps, n_head, page_size, scale, part_acc, part_m, part_l, n_chunks,
-            (int) cap, stride);
+        if (tc32_ready == 1)
+            mla_chunk_tc32_kernel<Q4><<<dim3((unsigned) n_chunks, (unsigned) (n_head / MGH2), (unsigned) n_q), THREADS, kMlaTc32Smem, st>>>(
+                q_abs, latent_pool, page_table, ids, steps, n_head, page_size, scale, part_acc, part_m, part_l, n_chunks,
+                (int) cap, stride);
+        else
+            mla_chunk_tc_kernel<Q4><<<dim3((unsigned) n_chunks, (unsigned) (n_head / MGH), (unsigned) n_q), THREADS, kMlaTcSmem, st>>>(
+                q_abs, latent_pool, page_table, ids, steps, n_head, page_size, scale, part_acc, part_m, part_l, n_chunks,
+                (int) cap, stride);
         mla_merge_kernel<<<dim3((unsigned) n_head, (unsigned) n_q), MHD, 0, st>>>(part_acc, part_m, part_l, n_chunks, n_head, out, stride);
         std::vector<float> a(on), b(on);
         cudaMemcpyAsync(a.data(), ref, on * 4, cudaMemcpyDeviceToHost, st);
@@ -846,7 +964,11 @@ void mla_decode_attn_any(const float* q_abs, const void* latent_pool, const int3
         std::fprintf(stderr, "mla tc check: %d queries, rel L2 %.5f\n", (int) n_q, n2 > 0 ? std::sqrt(d2 / n2) : 0.0);
         return;
     }
-    if (tc_on && n_q >= 16 && tc_ready)
+    if (tc_on && n_q >= 16 && tc_ready && tc32_ready == 1)
+        mla_chunk_tc32_kernel<Q4><<<dim3((unsigned) n_chunks, (unsigned) (n_head / MGH2), (unsigned) n_q), THREADS, kMlaTc32Smem, st>>>(
+            q_abs, latent_pool, page_table, ids, steps, n_head, page_size, scale, part_acc, part_m, part_l, n_chunks,
+            (int) cap, stride);
+    else if (tc_on && n_q >= 16 && tc_ready)
         mla_chunk_tc_kernel<Q4><<<dim3((unsigned) n_chunks, (unsigned) (n_head / MGH), (unsigned) n_q), THREADS, kMlaTcSmem, st>>>(
             q_abs, latent_pool, page_table, ids, steps, n_head, page_size, scale, part_acc, part_m, part_l, n_chunks,
             (int) cap, stride);

@@ -2236,20 +2236,32 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     // the walk's host state as four contiguous arrays (R | block outputs | post | comb, PG rows each): one plain copy
     // each a chunk - the hand-off layout's 2-D copies moved post / comb 16 and 64 bytes a row (31,883 tokens: the
     // state's traffic took 7.8 s)
-    auto walk_parts = [&](int64_t off, int64_t T, bool in) {
+    // parts: 1 R, 2 the block outputs, 4 post / comb (the state out splits them over two streams)
+    auto walk_parts = [&](int64_t off, int64_t T, bool in, int parts_ = 7, cudaStream_t st = nullptr) {
+        if (st == nullptr) st = cs;
         float* hR = hostS;
         float* hB = hR + (size_t) PG * HC * N;
         float* hP = hB + (size_t) PG * N;
         float* hC = hP + (size_t) PG * HC;
         auto cp = [&](float* dev, float* host, size_t n) {
-            if (in) cudaMemcpyAsync(dev, host, n * 4, cudaMemcpyHostToDevice, cs);
-            else cudaMemcpyAsync(host, dev, n * 4, cudaMemcpyDeviceToHost, cs);
+            if (in) cudaMemcpyAsync(dev, host, n * 4, cudaMemcpyHostToDevice, st);
+            else cudaMemcpyAsync(host, dev, n * 4, cudaMemcpyDeviceToHost, st);
         };
-        cp(Rc, hR + (size_t) off * HC * N, (size_t) T * HC * N);
-        cp(boc, hB + (size_t) off * N, (size_t) T * N);
-        cp(postF, hP + (size_t) off * HC, (size_t) T * HC);
-        cp(combF, hC + (size_t) off * HC * HC, (size_t) T * HC * HC);
+        if (parts_ & 1) cp(Rc, hR + (size_t) off * HC * N, (size_t) T * HC * N);
+        if (parts_ & 2) cp(boc, hB + (size_t) off * N, (size_t) T * N);
+        if (parts_ & 4) {
+            cp(postF, hP + (size_t) off * HC, (size_t) T * HC);
+            cp(combF, hC + (size_t) off * HC * HC, (size_t) T * HC * HC);
+        }
     };
+    // 2026-10-10: R, post and comb are final once the attention side is done - their copy out (on copy_s, idle between
+    // the walks) runs beside the router and the shared expert, which touch neither; the block outputs follow on cs.
+    // STRATA_GLM5_PF_STATE_OVL=0: all four on cs after the router
+    static const bool state_ovl = [] { const char* v = std::getenv("STRATA_GLM5_PF_STATE_OVL"); return !(v && v[0] == '0'); }();
+    cudaEvent_t ev_att = nullptr, ev_out = nullptr;
+    cudaEventCreateWithFlags(&ev_att, cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&ev_out, cudaEventDisableTiming);
+    struct EvGuard { cudaEvent_t a, b; ~EvGuard() { cudaEventDestroy(a); cudaEventDestroy(b); } } ev_guard{ev_att, ev_out};
     const double setup_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
     try {
         if (walk) {
@@ -2268,11 +2280,22 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                         lap(ms_ffn, tp);
                         w_ms[0] += ms_ffn - f0;   // the state in (and the steps, the embedding)
                         if (!attn_side(l, T, tp)) return false;
+                        if (state_ovl) {
+                            cudaEventRecord(ev_att, cs);
+                            cudaStreamWaitEvent(copy_s, ev_att, 0);
+                            walk_parts(c0 - g0, T, false, 1 | 4, copy_s);
+                            cudaEventRecord(ev_out, copy_s);
+                        }
                         if (l < g.n_dense_layers ? !dense_ffn(l, T) : !moe_route(l, T, c0 - g0)) return false;
                         f0 = ms_ffn;
                         lap(ms_ffn, tp);
                         w_ms[1] += ms_ffn - f0;   // router, shared expert, inputs out
-                        walk_parts(c0 - g0, T, false);
+                        if (state_ovl) {
+                            walk_parts(c0 - g0, T, false, 2);
+                            cudaStreamWaitEvent(cs, ev_out, 0);   // Rc / postF / combF are rewritten next
+                        } else {
+                            walk_parts(c0 - g0, T, false);
+                        }
                         f0 = ms_ffn;
                         lap(ms_ffn, tp);
                         w_ms[2] += ms_ffn - f0;   // the state out
