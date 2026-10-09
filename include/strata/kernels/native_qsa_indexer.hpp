@@ -70,6 +70,12 @@ void glm5_kpool_append(const float* raw_k, const float* gate, const int32_t* rel
 void glm5_kpool_append_batch(const float* raw_k, const float* gate, int64_t first_cell, int64_t n, const float* k_norm,
                              const float* k_norm_b, const float* ape, float epsilon, const Glm5KpoolBuffers& b,
                              int64_t max_cells, void* stream);
+/// The prompt path's scores as a GEMM (2026-10-10): the caller converts q to BF16 (glm5_f32_to_bf16) and computes
+/// S [nq * 32][tb] = q . pooled[b0 .. b0 + tb)^T with cuBLAS; this sums them as glm5_kpool_scores does
+/// (sum_h w_h relu(S), h ascending; the tail block n_bid gets kGlm5TailScore) into scores [nq][max_blocks].
+void glm5_f32_to_bf16(const float* x, uint16_t* y, int64_t n, void* stream);
+void glm5_kpool_scores_reduce(const float* S, const float* w, const int32_t* steps, int64_t nq, int64_t b0, int tb,
+                              int64_t max_blocks, float* scores, void* stream);
 /// scores [nq][max_blocks] for blocks 0..n_bid (steps[kStepNBid]); q [nq][32][128], w [nq][32].  active_blocks > 0: no
 /// query of the call has more than this many blocks (n_bid + 1), so the grid stops there (the prompt path; the same scores)
 void glm5_kpool_scores(const float* q, const float* w, const uint16_t* pooled, const int32_t* steps, int64_t nq,

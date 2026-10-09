@@ -779,7 +779,19 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     unsigned long long* dptr = (unsigned long long*) dalloc((size_t) 2 * B * 8);
     const int64_t plan_n = (B + 1) + 2 * CK + 1;
     int32_t* dplan = (int32_t*) dalloc((size_t) 2 * plan_n * 4);
-    void* gscratch = dalloc(native_expert_scratch_bytes(CK, g.n_ff));
+    // 2026-10-10: the experts' scratch for GE entries a launch (8,192; STRATA_GLM5_PF_LAUNCH_ROWS), not CK (32,768): with a
+    // 4K chunk at 262K the card had 0 MiB free after the prompt's buffers and some long prompts ran ~3x slower (WDDM
+    // paging); 880 -> ~220 MiB.  The launches' entries are capped to GE (more launches, the same arithmetic).
+    static const int64_t ge_env = [] { const char* v = std::getenv("STRATA_GLM5_PF_LAUNCH_ROWS"); return v ? std::atoll(v) : 8192; }();
+    const int64_t GE = std::max<int64_t>(std::min<int64_t>(CK, ge_env), C);
+    const size_t gscratch_bytes = [&] {
+        namespace mq_ = strata::prefill::mmq;
+        const size_t nat = native_expert_scratch_bytes(GE, g.n_ff);
+        const size_t mm = (((size_t) GE * 2 * g.n_ff * 4 + 255) & ~(size_t) 255) + ((mq_::q8_bytes(GE, N) + 255) & ~(size_t) 255) +
+                          ((mq_::q8_bytes(GE, g.n_ff) + 255) & ~(size_t) 255) + (size_t) GE * 4;
+        return std::max(nat, mm);
+    }();
+    void* gscratch = dalloc(gscratch_bytes);
     if (!tokc || !stepc || !nkeep || !embc || !Rc || !boc || !xmc || !shc || !postA || !combA || !postF || !combF || !logc ||
         !idsc || !wc || !parts || !q8c || !stage || !dptr || !dplan || !gscratch) {
         err = "verify glm5 prefill: the chunk buffers (" + std::to_string(C) + " tokens) do not fit in VRAM";
@@ -826,6 +838,12 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     int64_t mla_sb = 0, mla_ab = 0;
     size_t mla_per_tok = 0;
     float *ma_vb = nullptr, *ma_latT = nullptr;
+    // 2026-10-10: the indexer's scores of an attention sub-batch as S = Q . K^T (cublasGemmEx, BF16 in, F32 out) a tile
+    // of kScoreTile blocks at a time, then glm5_kpool_scores_reduce - the warp-per-block kernel's work grows with the
+    // context squared (31,883 tokens: 5.1 s).  Q rounds to BF16 (the keys are BF16).  STRATA_GLM5_PF_SCORE_GEMM=0: the kernel
+    constexpr int64_t kScoreTile = 8192;
+    float* ma_S = nullptr;
+    uint16_t* ma_q16 = nullptr;
     // the indexer's scores / selection bounded by the sub-batch's filled blocks instead of the context's capacity (65,538
     // at 262K); the same ids.  STRATA_GLM5_PF_ACTIVE=0: the capacity
     static const bool pf_active = [] { const char* v = std::getenv("STRATA_GLM5_PF_ACTIVE"); return !(v && v[0] == '0'); }();
@@ -899,6 +917,11 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                                     mla_ab = a;
                                 }
                             }
+                        if (mla_sb > 0 && m.IH == 32 && m.ID == 128) {   // the indexer's scores as a GEMM (optional room)
+                            ma_S = take((size_t) mla_ab * 32 * kScoreTile);
+                            ma_q16 = (uint16_t*) take((size_t) mla_ab * 32 * 128 / 2);
+                            if (!ma_S || !ma_q16) ma_S = nullptr;
+                        }
                         mla_per_tok = per_g + per_a;
                     }
                 }
@@ -1128,10 +1151,10 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     uint8_t *mm_xq = nullptr, *mm_hq = nullptr;
     int32_t* mm_iota = nullptr;
     if (pf_mmq_on && mmq::built()) {
-        const size_t a_gu = ((size_t) CK * 2 * NFF * 4 + 255) & ~(size_t) 255;
-        const size_t a_xq = (mmq::q8_bytes(CK, N) + 255) & ~(size_t) 255;
-        const size_t a_hq = (mmq::q8_bytes(CK, NFF) + 255) & ~(size_t) 255;
-        if (a_gu + a_xq + a_hq + (size_t) CK * 4 <= native_expert_scratch_bytes(CK, NFF)) {
+        const size_t a_gu = ((size_t) GE * 2 * NFF * 4 + 255) & ~(size_t) 255;
+        const size_t a_xq = (mmq::q8_bytes(GE, N) + 255) & ~(size_t) 255;
+        const size_t a_hq = (mmq::q8_bytes(GE, NFF) + 255) & ~(size_t) 255;
+        if (a_gu + a_xq + a_hq + (size_t) GE * 4 <= gscratch_bytes) {
             uint8_t* gs = (uint8_t*) gscratch;
             mm_gu = (float*) gs;
             mm_xq = gs + a_gu;
@@ -1388,7 +1411,12 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             int nb;
             {
                 std::lock_guard<std::mutex> lk(q_mu);
-                nb = (int) std::min<size_t>((size_t) B, q_hi - q_lo);
+                // up to B experts and GE entries (one expert has at most T <= C <= GE)
+                nb = 0;
+                int64_t ne_ = 0;
+                while (q_lo + (size_t) nb < q_hi && nb < B &&
+                       (nb == 0 || ne_ + (int64_t) by[(size_t) used[q_lo + (size_t) nb]].size() <= GE))
+                    ne_ += (int64_t) by[(size_t) used[q_lo + (size_t) nb++]].size();
                 b0 = q_lo;
                 q_lo += (size_t) nb;
             }
@@ -1527,7 +1555,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             if (mm)
                 run_mmq(l, dstage, nb, entries, max_rows, dpl, dpl + (B + 1) + CK, xmc, N, dpl + (B + 1), parts);
             else
-                native_expert_grouped(L, dp, dpl, dpl + (B + 1) + 2 * CK, dpl + (B + 1), dpl + (B + 1) + CK, B, CK,
+                native_expert_grouped(L, dp, dpl, dpl + (B + 1) + 2 * CK, dpl + (B + 1), dpl + (B + 1) + CK, B, GE,
                                       q8c, gscratch, parts, cs);
             cudaEventRecord(ev_done[hf], cs);   // the host waits for it before this half is filled again
         }
@@ -1541,12 +1569,15 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             // the lane took [q_hi, used.size()): rows [ro[q_hi - q_el], ro[end]) of its tables
             const int r_lo = ro[q_hi - q_el], r_hi = ro[used.size() - q_el], cpu_rows = r_hi - r_lo;
             pf_cpu_n += (int64_t) (used.size() - q_hi);
-            if (cpu_rows > 0) {
+            // in pieces that fit gscratch (rows of N floats and their index)
+            const int piece = (int) std::max<int64_t>(1, (int64_t) (gscratch_bytes / ((size_t) N * 4 + 4)) - 1);
+            for (int p0 = 0; p0 < cpu_rows; p0 += piece) {
+                const int pr = std::min(piece, cpu_rows - p0);
                 float* src = (float*) gscratch;
-                int32_t* idx = (int32_t*) (src + (size_t) cpu_rows * N);
-                cudaMemcpyAsync(src, cpu_out.data() + (size_t) r_lo * N, (size_t) cpu_rows * N * 4, cudaMemcpyHostToDevice, cs);
-                cudaMemcpyAsync(idx, cpu_dst.data() + r_lo, (size_t) cpu_rows * 4, cudaMemcpyHostToDevice, cs);
-                glm5_copy_rows(src, idx, parts, cpu_rows, (int) N, cs);
+                int32_t* idx = (int32_t*) (src + (size_t) pr * N);
+                cudaMemcpyAsync(src, cpu_out.data() + (size_t) (r_lo + p0) * N, (size_t) pr * N * 4, cudaMemcpyHostToDevice, cs);
+                cudaMemcpyAsync(idx, cpu_dst.data() + r_lo + p0, (size_t) pr * 4, cudaMemcpyHostToDevice, cs);
+                glm5_copy_rows(src, idx, parts, pr, (int) N, cs);
             }
         }
         native_moe_combine_multi(parts, wc, shc, boc, N, K, (int) T, cs);
@@ -1603,7 +1634,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         if (!wg || !wu || !wd || wg->native_type != 8 || wu->native_type != 8 || wd->native_type != 8) { err.clear(); return false; }
         const int64_t F = dense ? m.NFFD : m.NFF;
         const int64_t RB = std::min<int64_t>(T, F > 4096 ? 256 : 1024);
-        if ((size_t) 2 * RB * F * 4 > native_expert_scratch_bytes(CK, NFF)) return false;
+        if ((size_t) 2 * RB * F * 4 > gscratch_bytes) return false;
         float* G = (float*) gscratch;
         float* U = G + (size_t) RB * F;
         for (int64_t r0 = 0; r0 < T; r0 += RB) {
@@ -1714,7 +1745,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     // window's kernels in the window's order, each given the whole sub-batch; Q8_0 projections through cuBLAS (others
     // a slice at a time).  The scores / selection / attention / wv_b go mla_ab tokens at a time inside (vbT reuses lat).
     static const bool mla_prof = std::getenv("STRATA_GLM5_PF_PROF") != nullptr;
-    double ms_m[6] = {};   // projections, indexer q/w + scores, attention, output, key append, top-k (STRATA_GLM5_PF_PROF)
+    double ms_m[7] = {};   // projections, indexer scores, attention, output, key append, top-k, indexer q/w (STRATA_GLM5_PF_PROF)
     auto mla_layer = [&](int64_t l, int64_t T) -> bool {
         auto mt = std::chrono::steady_clock::now();
         auto mlap = [&](int i) {
@@ -1794,15 +1825,37 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             }
             mlap(4);
             if (!proj(wiqb, QLR, IH * ID, ma_qr, n, ma_iq)) return false;
-            glm5_f32_gemv((const float*) wip->data, X, ma_iw, (int) N, (int) IH, n, 1.0f / std::sqrt((float) (ID * IH)), cs);
-            mlap(1);
+            {   // the indexer's head weights (F32 [32][4096]) for the group in one cublasSgemm (glm5_f32_gemv: per token)
+                const float iw_scale = 1.0f / std::sqrt((float) (ID * IH));
+                if (!(pf_router_blas &&
+                      cublasSgemm(pf_blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) IH, n, (int) N, &iw_scale, (const float*) wip->data,
+                                  (int) N, X, (int) N, &zero, ma_iw, (int) IH) == CUBLAS_STATUS_SUCCESS))
+                    glm5_f32_gemv((const float*) wip->data, X, ma_iw, (int) N, (int) IH, n, iw_scale, cs);
+            }
+            mlap(6);
             for (int a0 = 0; a0 < n; a0 += (int) mla_ab) {   // the attention's sub-batches
                 const int na = std::min<int>((int) mla_ab, n - a0);
                 const int32_t* sa = st + (size_t) a0 * kStepCount;
                 // the sub-batch's last token has the most blocks: the scores' grid and the selection's kernel by that count
                 const int64_t active = (int64_t) h_steps[(size_t) (b0 + a0 + na - 1) * kStepCount + kStepNBid] + 1;
-                glm5_kpool_scores(ma_iq + (size_t) a0 * IH * ID, ma_iw + (size_t) a0 * IH, pooled, sa, na, max_blocks_, ma_sc, cs,
-                                  pf_active ? active : -1);
+                static const bool score_gemm = [] { const char* v = std::getenv("STRATA_GLM5_PF_SCORE_GEMM"); return !(v && v[0] == '0'); }();
+                if (score_gemm && ma_S != nullptr) {
+                    glm5_f32_to_bf16(ma_iq + (size_t) a0 * IH * ID, ma_q16, (int64_t) na * IH * ID, cs);
+                    for (int64_t t0 = 0; t0 < active; t0 += kScoreTile) {
+                        const int tb = (int) std::min<int64_t>(kScoreTile, active - t0);
+                        // S [na*32 rows][tb] (column j = query row, ld tb) = pooled[t0 .. t0+tb)^T-major . q
+                        if (cublasGemmEx(pf_blas, CUBLAS_OP_T, CUBLAS_OP_N, tb, na * (int) IH, (int) ID, &one,
+                                         pooled + (size_t) t0 * ID, CUDA_R_16BF, (int) ID, ma_q16, CUDA_R_16BF, (int) ID, &zero,
+                                         ma_S, CUDA_R_32F, tb, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) {
+                            err = "verify glm5 prefill: the indexer's score GEMM failed";
+                            return false;
+                        }
+                        glm5_kpool_scores_reduce(ma_S, ma_iw + (size_t) a0 * IH, sa, na, t0, tb, max_blocks_, ma_sc, cs);
+                    }
+                } else {
+                    glm5_kpool_scores(ma_iq + (size_t) a0 * IH * ID, ma_iw + (size_t) a0 * IH, pooled, sa, na, max_blocks_, ma_sc, cs,
+                                      pf_active ? active : -1);
+                }
                 mlap(1);
                 qsa_block_topk(ma_sc, sa, na, max_blocks_, cap_, s, ma_sel, cs, pf_active ? active : -1);
                 mlap(5);
@@ -1890,7 +1943,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             // floats at the front of parts: the group's FFN inputs (F32, MMQ quantizes its own rows) and their q8_1
             // image (the native kernels' layers)
             q8f = (int64_t) (((size_t) PG * N + (size_t) PG * q8row / 4 + 63) & ~(size_t) 63);
-            E_cap = std::min<int64_t>(CK, (CK * N - q8f - csrf) / N);           // expert output rows a launch
+            E_cap = std::min<int64_t>(GE, (CK * N - q8f - csrf) / N);           // expert output rows a launch
             hostS = (float*) halloc((size_t) PG * HF * 4, 0);
             hq8 = (uint8_t*) halloc((size_t) PG * N * 4, 1);   // the FFN inputs, F32
             hids = (int32_t*) halloc((size_t) PG * K * 4, 2);
@@ -2091,7 +2144,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             if (mm)
                 run_mmq(l, dstage, nb, entries, max_rows, dpl, dpl + (B + 1) + CK, xa, N, dpl + (B + 1), rows);
             else
-                native_expert_grouped(L, dp, dpl, dpl + (B + 1) + 2 * CK, dpl + (B + 1), dpl + (B + 1) + CK, B, CK,
+                native_expert_grouped(L, dp, dpl, dpl + (B + 1) + 2 * CK, dpl + (B + 1), dpl + (B + 1) + CK, B, GE,
                                       q8a, gscratch, rows, cs);
             glm5_scatter_add(rows, dc, dc + CK, dc + 2 * CK + 1, (const float*) (dc + 3 * CK + 1), nu, acc, (int) N, cs);
             cudaEventRecord(ev_done[hf], cs);
@@ -2221,9 +2274,12 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         if (FILE* fp = std::fopen(dp, "ab")) { std::fwrite(h.data(), 4, h.size(), fp); std::fclose(fp); }
     }
     prefill_ms_total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
-    if (prof)
-        std::fprintf(stderr, "strata glm5 prefill prof: setup (buffers, page-locked staging) %.0f ms of %.0f ms\n", setup_ms,
-                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count());
+    if (prof) {
+        size_t fr = 0, tot = 0;
+        cudaMemGetInfo(&fr, &tot);
+        std::fprintf(stderr, "strata glm5 prefill prof: setup (buffers, page-locked staging) %.0f ms of %.0f ms; VRAM free at the end %zu MiB\n",
+                     setup_ms, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count(), fr >> 20);
+    }
     if (prof)
         std::fprintf(stderr, "strata glm5 prefill prof: %lld tokens, layers %lld-%lld: attention %.0f ms, mHC/norm %.0f ms, "
                              "FFN/experts %.0f ms (host blob copies %.0f ms of it); streamed %lld (%lld straight from pinned "
@@ -2242,8 +2298,8 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                      "route %.0f ms, state out %.0f ms, routed experts %.0f ms\n", w_plan_ms, w_enq_ms, w_ms[0], w_ms[1], w_ms[2], w_ms[3]);
     if (prof && mla_sb > 0)
         std::fprintf(stderr, "strata glm5 prefill prof: MLA layers %.0f ms of the attention (projections %.0f, key append %.0f, "
-                             "indexer q/w + scores %.0f, top-k %.0f, attention %.0f, output %.0f)\n",
-                     ms_m[0] + ms_m[1] + ms_m[2] + ms_m[3] + ms_m[4] + ms_m[5], ms_m[0], ms_m[4], ms_m[1], ms_m[5], ms_m[2], ms_m[3]);
+                             "indexer q/w %.0f, scores %.0f, top-k %.0f, attention %.0f, output %.0f)\n",
+                     ms_m[0] + ms_m[1] + ms_m[2] + ms_m[3] + ms_m[4] + ms_m[5] + ms_m[6], ms_m[0], ms_m[4], ms_m[6], ms_m[1], ms_m[5], ms_m[2], ms_m[3]);
     if (prof)
         std::fprintf(stderr, "strata glm5 prefill prof: of the host blob copies - waiting for the GPU's previous half %.0f ms, "
                              "fetching the streamed blobs %.0f ms (threads: in blob() %.0f ms, copying %.0f ms, summed)\n",

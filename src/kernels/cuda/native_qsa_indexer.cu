@@ -331,6 +331,41 @@ __global__ void __launch_bounds__(256) glm5_kpool_scores_kernel(const float* __r
 }
 }  // namespace
 
+// ---- the prompt path's scores through a GEMM (2026-10-10): S = Q . K^T by cuBLAS (BF16, the caller), then this ----
+__global__ void glm5_f32_to_bf16_kernel(const float* __restrict__ x, __nv_bfloat16* __restrict__ y, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __float2bfloat16_rn(x[i]);
+}
+// scores[t][b0 + b] = sum_h w[t][h] relu(S[t * KH + h][b]) (h ascending) for b0 + b < n_bid(t), the tail score at n_bid
+__global__ void glm5_kpool_reduce_kernel(const float* __restrict__ S, const float* __restrict__ w,
+                                         const int32_t* __restrict__ steps, int64_t b0, int tb, int64_t max_blocks,
+                                         float* __restrict__ scores) {
+    const int t = blockIdx.y;
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= tb) return;
+    const int64_t ba = b0 + b;
+    const int n_bid = steps[(size_t) t * kStepCount + kStepNBid];
+    if (ba > n_bid || ba >= max_blocks) return;
+    float* out = scores + (size_t) t * max_blocks;
+    if (ba == n_bid) { out[ba] = kGlm5TailScore; return; }
+    const float* ww = w + (size_t) t * KH;
+    float acc = 0.f;
+#pragma unroll 4
+    for (int h = 0; h < KH; ++h) acc = fmaf(fmaxf(S[((size_t) t * KH + h) * tb + b], 0.f), ww[h], acc);
+    out[ba] = acc;
+}
+
+void glm5_f32_to_bf16(const float* x, uint16_t* y, int64_t n, void* stream) {
+    if (n <= 0) return;
+    glm5_f32_to_bf16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(x, (__nv_bfloat16*) y, n);
+}
+void glm5_kpool_scores_reduce(const float* S, const float* w, const int32_t* steps, int64_t nq, int64_t b0, int tb,
+                              int64_t max_blocks, float* scores, void* stream) {
+    if (nq <= 0 || tb <= 0) return;
+    glm5_kpool_reduce_kernel<<<dim3((unsigned) ((tb + 255) / 256), (unsigned) nq), 256, 0, (cudaStream_t) stream>>>(
+        S, w, steps, b0, tb, max_blocks, scores);
+}
+
 // ---- the prompt path's batched append (2026-10-10): cells first .. first + n - 1 in two launches, each cell's
 // arithmetic glm5_kpool_append_kernel's ----
 __device__ __forceinline__ float kpool_key(const float* __restrict__ raw_k, const float* __restrict__ kw,
