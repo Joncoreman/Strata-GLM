@@ -12261,6 +12261,63 @@ int main(int argc, char** argv) {
             ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
             return true;
         };
+        // 2026-10-10: the RAM tier follows the conversation too.  The profile picks which experts the RAM copy holds; a
+        // topic the profile did not see routes to file-tier ones every window (a summary prompt's decode read ~20 a
+        // window from the SSD: 35-38 ms of its ~107).  Between windows (no swap in flight), up to STRATA_GLM5_RAM_SWAPS
+        // file-tier experts routed clearly more than a RAM-held one of their layer take its place - read once from the
+        // file into an exchange buffer, then the adaptive tier's exchange (stage_exchange / commit_exchanges) moves it
+        // into the RAM copy; the evicted one is read from the file from then on.  0 = off.  A file-tier expert qualifies
+        // at a (decayed) count of STRATA_GLM5_RAM_MIN (1.0) and STRATA_GLM5_RAM_GAP (0.8) above its RAM victim: the
+        // adaptive tier's 2.0 / 1.5 let 0.2 a window through.  After a 4,400-token summary prompt, ~750 tokens: the SSD
+        // reads 45.8 -> 23.2 ms a window, decode 7.29 -> 8.48 tok/s (~2 swaps, 3 ms a window).
+        static const int ram_swaps = [] { const char* v = std::getenv("STRATA_GLM5_RAM_SWAPS"); return v ? std::atoi(v) : 8; }();
+        static const float ram_min = [] { const char* v = std::getenv("STRATA_GLM5_RAM_MIN"); return v ? (float) std::atof(v) : 1.0f; }();
+        static const float ram_gap = [] { const char* v = std::getenv("STRATA_GLM5_RAM_GAP"); return v ? (float) std::atof(v) : 0.8f; }();
+        int64_t ram_swaps_total = 0;
+        double ms_ram_swaps = 0;
+        auto ram_promote = [&]() -> bool {
+            if (ram_swaps <= 0 || !pending.empty() || drive.d.usage.empty() || !src.complement_ready() ||
+                src.exchange_capacity() < 1)
+                return true;
+            const Clock::time_point t0 = Clock::now();
+            struct RSwap { float gain; int32_t layer, in, out; };
+            std::vector<RSwap> sw;
+            std::vector<std::pair<float, int32_t>> cand, vict;
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                cand.clear();
+                vict.clear();
+                const float* u = drive.d.usage.data() + l * g.n_expert;
+                const int32_t* r = host_res.data() + l * g.n_expert;
+                for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                    if (r[e] >= 0) continue;   // on the GPU
+                    if (src.has_resident(l, e)) vict.emplace_back(u[e], e);
+                    else if (u[e] >= ram_min) cand.emplace_back(u[e], e);
+                }
+                if (cand.empty() || vict.empty()) continue;
+                std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
+                const size_t nc = std::min(cand.size(), vict.size());
+                std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
+                                  [](auto& a, auto& b) { return a.first < b.first; });
+                for (size_t i = 0; i < nc; ++i) {
+                    if (cand[i].first < vict[i].first + ram_gap) break;
+                    sw.push_back({cand[i].first - vict[i].first, (int32_t) l, vict[i].second, cand[i].second});
+                }
+            }
+            if (sw.empty()) return true;
+            std::sort(sw.begin(), sw.end(), [](const RSwap& a, const RSwap& b) { return a.gain > b.gain; });
+            const size_t n = std::min<size_t>(sw.size(), (size_t) std::min<int64_t>(ram_swaps, src.exchange_capacity()));
+            for (size_t q = 0; q < n; ++q) {
+                const RSwap& s = sw[q];
+                const uint8_t* b = srcp->blob(s.layer, s.out);   // the file tier: read now (a staging buffer)
+                uint8_t* xb = src.exchange_buffer((int64_t) q);
+                if (b == nullptr || xb == nullptr) return true;
+                std::memcpy(xb, b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
+                if (!src.stage_exchange(s.layer, s.in, s.out, (int64_t) q)) break;
+            }
+            ram_swaps_total += src.commit_exchanges();
+            ms_ram_swaps += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            return true;
+        };
         int64_t p = spec_pos;
         int32_t x = (int32_t) tok;
         // glm5-next MTP (STRATA_GLM5_MTP=1, 2026-10-08): the NextN layer drafts o.spec - 1 tokens per round
@@ -12781,6 +12838,7 @@ int main(int argc, char** argv) {
                     if (pos + T > o.max_context) { finish = "length"; break; }
                     drive.d.layers = 0; drive.d.experts = 0; drive.d.failed = false;
                     apply_pending(!adapt_nowait());
+                    ram_promote();
                     const bool adapt_due = !drive.d.usage.empty() && ((rounds_all + 1) % o.adapt_every) == 0;
                     adapt_armed = adapt_overlap && adapt_due;
                     if (!ver.run(T, win.data(), pos, gl_pool, gl_user, outw.data(), err) || drive.d.failed) {
@@ -12847,7 +12905,10 @@ int main(int argc, char** argv) {
                                      drive.d.ms_actq / w, drive.d.ms_jobs / w, drive.d.ms_run / w);
                     std::fprintf(stderr, "strata serve: adapt per window: %.2f ms (%.1f swaps), waiting for its copies %.2f ms\n",
                                  ms_adapt / w, (double) swaps_total / w, ms_pending_wait / w);
-                    ms_adapt = 0; swaps_total = 0; ms_pending_wait = 0;
+                    if (ram_swaps > 0)
+                        std::fprintf(stderr, "strata serve: RAM tier per window: %.2f ms (%.2f file -> RAM swaps)\n",
+                                     ms_ram_swaps / w, (double) ram_swaps_total / w);
+                    ms_adapt = 0; swaps_total = 0; ms_pending_wait = 0; ms_ram_swaps = 0; ram_swaps_total = 0;
                     double jp = 0, jz = 0; int64_t zr = 0;
                     strata::core::expert_pool_jobs_stats(jp, jz, zr);
                     if (cx > 0)
