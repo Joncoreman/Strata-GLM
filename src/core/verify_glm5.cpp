@@ -21,6 +21,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/glm5_kda_chunk.hpp"
 #include "strata/kernels/glm5_misc.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_moe.hpp"
@@ -787,6 +788,14 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     const size_t kBlasWs = (size_t) 8 << 20;         // cuBLAS's workspace, bytes
     float *kq = nullptr, *kk = nullptr, *kv_ = nullptr, *kf = nullptr, *kz = nullptr, *ky = nullptr, *kfa = nullptr,
           *kga = nullptr, *kbl = nullptr, *wscr = nullptr;
+    // stage 3 (2026-10-09): the KDA recurrence in Infernix's chunked form over the sub-batch (glm5_kda_chunk.hpp) instead
+    // of slices of <= 8 tokens.  STRATA_GLM5_PF_KDA_CHUNK=0 turns it off; STRATA_GLM5_PF_KDA_CHECK=1 also runs the slice
+    // path on the same inputs and prints, per layer, how far the outputs and the state are apart.
+    static const bool pf_kda_chunk = [] { const char* v = std::getenv("STRATA_GLM5_PF_KDA_CHUNK"); return !(v && v[0] == '0'); }();
+    static const bool pf_kda_check = [] { const char* v = std::getenv("STRATA_GLM5_PF_KDA_CHECK"); return v && v[0] == '1'; }();
+    float *kh = nullptr, *kgate = nullptr, *kbeta = nullptr, *kws = nullptr;
+    uint16_t* kv16 = nullptr;
+    float *ck_state = nullptr, *ck_state_ref = nullptr, *ck_conv = nullptr, *ck_y = nullptr;
     if (pf_blas_on) {
         if (pf_blas == nullptr && cublasCreate(&pf_blas) != CUBLAS_STATUS_SUCCESS) pf_blas = nullptr;
         if (pf_blas != nullptr) {
@@ -807,6 +816,20 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                     kfa = take((size_t) KSB * 128); kga = take((size_t) KSB * 128); kbl = take((size_t) KSB * m.H);
                     wscr = take((size_t) WSCR);
                     if (!kq || !kk || !kv_ || !kf || !kz || !ky || !kfa || !kga || !kbl) wscr = nullptr;
+                    if (wscr != nullptr && pf_kda_chunk) {   // stage 3: the chunked recurrence's buffers
+                        kh = take((size_t) KSB * m.C);
+                        kgate = take(di);
+                        kbeta = take((size_t) KSB * m.H);
+                        kv16 = (uint16_t*) take(di / 2 + 1);
+                        kws = take(glm5_kda_chunk_workspace_bytes((int) m.H, (int) KSB) / 4 + 1);
+                        if (pf_kda_check) {
+                            const size_t st_n = (size_t) m.S * m.H * m.S, cv_n = (size_t) m.C * 3;
+                            ck_state = take(st_n); ck_state_ref = take(st_n); ck_conv = take(cv_n); ck_y = take(di);
+                        }
+                        if (!kh || !kgate || !kbeta || !kv16 || !kws ||
+                            (pf_kda_check && (!ck_state || !ck_state_ref || !ck_conv || !ck_y)))
+                            kh = nullptr;   // no room: the slice recurrence
+                    }
                 }
             }
         }
@@ -1175,15 +1198,62 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                 !gemm_q8(wfa, N, 128, X, nb, kfa) || !gemm_q8(wga, N, 128, X, nb, kga) ||
                 !gemm_q8(wbe, N, H, X, nb, kbl) || !gemm_q8(wfb, 128, DI, kfa, nb, kf) || !gemm_q8(wgb, 128, DI, kga, nb, kz))
                 return false;
-            for (int64_t s0 = 0; s0 < nb; s0 += SL) {
-                const int n = (int) std::min<int64_t>(SL, nb - s0);
-                glm5_pack3(kq + (size_t) s0 * DI, kk + (size_t) s0 * DI, kv_ + (size_t) s0 * DI, qkv, (int) DI, n, cs);
-                gdn_conv_l2_multi(conv, qkv, m.convw + (size_t) gi * m.C * 4, hb, (int) m.C, (int) (2 * H), 1e-6f, n, cs, 0);
-                kda_gate_beta_multi(kf + (size_t) s0 * DI, (const float*) wdt->data, (const float*) wsa->data, m.lb,
-                                    kbl + (size_t) s0 * H, gate, beta, (int) H, n, cs);
-                gdn_step_norm_multi(state, hb, (int) m.C, gate, beta, kz + (size_t) s0 * DI, (const float*) wnm->data,
-                                    m.rms_eps, ky + (size_t) s0 * DI, (int) H, (int) H, n, nkeep + n, cs, 0, nullptr, true);
-                gdn_conv_commit(conv, qkv, (int) m.C, nkeep + n, cs);
+            const size_t st_n = (size_t) m.S * H * m.S, cv_n = (size_t) m.C * 3;
+            const bool chunked = kh != nullptr;
+            const bool checking = chunked && pf_kda_check;
+            if (checking) {   // the slice path below runs on copies; the chunked one then starts from the same state
+                cudaMemcpyAsync(ck_state, state, st_n * 4, cudaMemcpyDeviceToDevice, cs);
+                cudaMemcpyAsync(ck_conv, conv, cv_n * 4, cudaMemcpyDeviceToDevice, cs);
+            }
+            if (!chunked || checking) {
+                for (int64_t s0 = 0; s0 < nb; s0 += SL) {
+                    const int n = (int) std::min<int64_t>(SL, nb - s0);
+                    glm5_pack3(kq + (size_t) s0 * DI, kk + (size_t) s0 * DI, kv_ + (size_t) s0 * DI, qkv, (int) DI, n, cs);
+                    gdn_conv_l2_multi(conv, qkv, m.convw + (size_t) gi * m.C * 4, hb, (int) m.C, (int) (2 * H), 1e-6f, n, cs, 0);
+                    kda_gate_beta_multi(kf + (size_t) s0 * DI, (const float*) wdt->data, (const float*) wsa->data, m.lb,
+                                        kbl + (size_t) s0 * H, gate, beta, (int) H, n, cs);
+                    gdn_step_norm_multi(state, hb, (int) m.C, gate, beta, kz + (size_t) s0 * DI, (const float*) wnm->data,
+                                        m.rms_eps, ky + (size_t) s0 * DI, (int) H, (int) H, n, nkeep + n, cs, 0, nullptr, true);
+                    gdn_conv_commit(conv, qkv, (int) m.C, nkeep + n, cs);
+                }
+            }
+            if (checking) {   // keep the slice path's results, put the state back
+                cudaMemcpyAsync(ck_y, ky, (size_t) nb * DI * 4, cudaMemcpyDeviceToDevice, cs);
+                cudaMemcpyAsync(ck_state_ref, state, st_n * 4, cudaMemcpyDeviceToDevice, cs);
+                cudaMemcpyAsync(state, ck_state, st_n * 4, cudaMemcpyDeviceToDevice, cs);
+                cudaMemcpyAsync(conv, ck_conv, cv_n * 4, cudaMemcpyDeviceToDevice, cs);
+            }
+            if (chunked) {   // stage 3: the conv, the gates, the recurrence and the norm over the sub-batch at once
+                static const int sm_count = [] { int d = 0, c = 0; cudaGetDevice(&d); cudaDeviceGetAttribute(&c, cudaDevAttrMultiProcessorCount, d); return c; }();
+                glm5_kda_conv_chunk(conv, kq, kk, kv_, m.convw + (size_t) gi * m.C * 4, kh, (int) DI, (int) (2 * H), 1e-6f,
+                                    (int) nb, cs);
+                glm5_kda_gate_beta_chunk(kf, (const float*) wdt->data, (const float*) wsa->data, m.lb, kbl, kgate, kbeta,
+                                         (int) H, (int) nb, cs);
+                glm5_kda_chunk(kh, (int) m.C, kgate, kbeta, state, ky, (int) H, (int) nb, kv16, kws, sm_count, cs);
+                glm5_kda_out_norm(ky, kz, (const float*) wnm->data, m.rms_eps, (int) H, (int) nb, cs);
+            }
+            if (checking) {   // max |chunked - slice| over the outputs and the state, against the largest |slice|
+                std::vector<float> a((size_t) nb * DI), b((size_t) nb * DI), sa(st_n), sb(st_n);
+                cudaStreamSynchronize(cs);
+                cudaMemcpy(a.data(), ky, a.size() * 4, cudaMemcpyDeviceToHost);
+                cudaMemcpy(b.data(), ck_y, b.size() * 4, cudaMemcpyDeviceToHost);
+                cudaMemcpy(sa.data(), state, st_n * 4, cudaMemcpyDeviceToHost);
+                cudaMemcpy(sb.data(), ck_state_ref, st_n * 4, cudaMemcpyDeviceToHost);
+                auto cmp = [](const std::vector<float>& x, const std::vector<float>& r, double& dmax, double& rmax, double& rms) {
+                    dmax = rmax = 0; double se = 0, sr = 0;
+                    for (size_t i = 0; i < x.size(); ++i) {
+                        const double d = std::fabs((double) x[i] - r[i]);
+                        dmax = std::max(dmax, d); rmax = std::max(rmax, std::fabs((double) r[i]));
+                        se += d * d; sr += (double) r[i] * r[i];
+                    }
+                    rms = sr > 0 ? std::sqrt(se / sr) : 0;
+                };
+                double yd, yr, yrel, sd, sr, srel;
+                cmp(a, b, yd, yr, yrel);
+                cmp(sa, sb, sd, sr, srel);
+                std::fprintf(stderr, "strata glm5 KDA check: layer %lld tokens %lld-%lld: output max|d| %.3g (max|ref| %.3g, "
+                                     "rel rms %.3g); state max|d| %.3g (max|ref| %.3g, rel rms %.3g)\n", (long long) l,
+                             (long long) b0, (long long) (b0 + nb - 1), yd, yr, yrel, sd, sr, srel);
             }
             if (!gemm_q8(wo, DI, N, ky, nb, boc + (size_t) b0 * N)) return false;
         }
