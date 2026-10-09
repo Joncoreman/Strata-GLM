@@ -5,9 +5,12 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #include <cfloat>
+#include <cmath>
 #include <cstdio>
+#include <vector>
 #include <cstdlib>
 #include <cstring>
 
@@ -691,6 +694,109 @@ uint64_t mla_decode_attn_scratch_floats(int64_t cap, int64_t n_head) {
 }
 
 namespace {
+// ---- 2026-10-10: the same chunk on the tensor cores (the prompt path's MLA sub-batches; WMMA 16x16x16, FP16 operands,
+// F32 accumulators).  The 16 heads' queries and the chunk's 64 latents (q4_0 / fp16 -> fp16) in shared memory;
+// S = Q . L^T (4 warps, a 16-cell tile each), the softmax as mla_chunk_kernel's (the same part_m / part_l), P (fp16)
+// . L into part_acc straight from the fragments (8 warps, four 16-dim tiles each).  Not bitwise the CUDA-core kernel
+// (fp16 operands, another summation order); the merge is the same.  ~86 KB of dynamic shared memory.
+constexpr size_t kMlaTcSmem = (size_t) MGH * MHD * 2 + (size_t) CHUNK * MHD * 2 + (size_t) MGH * CHUNK * 4 +
+                              (size_t) MGH * CHUNK * 2 + (size_t) CHUNK * 8;
+template <bool Q4>
+__global__ void __launch_bounds__(THREADS) mla_chunk_tc_kernel(const float* __restrict__ q, const void* __restrict__ pool,
+                                                               const int32_t* __restrict__ page_table,
+                                                               const int32_t* __restrict__ ids,
+                                                               const int32_t* __restrict__ step, int n_head, int page_size,
+                                                               float scale, float* __restrict__ part_acc,
+                                                               float* __restrict__ part_m, float* __restrict__ part_l,
+                                                               int n_chunks, int cap, long long scratch_stride) {
+    using namespace nvcuda;
+    extern __shared__ __align__(32) unsigned char smem[];
+    __half* sQ = reinterpret_cast<__half*>(smem);                                   // [MGH][MHD]
+    __half* sL = sQ + MGH * MHD;                                                    // [CHUNK][MHD]
+    float* sS = reinterpret_cast<float*>(sL + CHUNK * MHD);                         // [MGH][CHUNK]
+    __half* sP = reinterpret_cast<__half*>(sS + MGH * CHUNK);                       // [MGH][CHUNK]
+    long long* srow = reinterpret_cast<long long*>(sP + MGH * CHUNK);               // [CHUNK]
+    q += (size_t) blockIdx.z * (size_t) n_head * MHD;
+    ids += (size_t) blockIdx.z * (size_t) cap;
+    step += (size_t) blockIdx.z * kStepCount;
+    part_acc += (size_t) blockIdx.z * (size_t) scratch_stride;
+    part_m += (size_t) blockIdx.z * (size_t) scratch_stride;
+    part_l += (size_t) blockIdx.z * (size_t) scratch_stride;
+    const int n_ids = __ldg(step + kStepWidth);
+    const int chunk = blockIdx.x, hg = blockIdx.y;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int c0 = chunk * CHUNK;
+    const int n_here = min(CHUNK, n_ids - c0);
+    const int h0 = hg * MGH;
+    if (n_here <= 0) {
+        if (t < MGH) { part_m[(size_t) chunk * n_head + h0 + t] = -FLT_MAX; part_l[(size_t) chunk * n_head + h0 + t] = 0.0f; }
+        return;
+    }
+    for (int i = t; i < MGH * MHD; i += THREADS) sQ[i] = __float2half(q[(size_t) h0 * MHD + i]);
+    if (t < CHUNK) {
+        long long r = -1;
+        if (t < n_here) {
+            const int cell = ids[c0 + t];
+            const long long page = (long long) page_table[cell / page_size];
+            if (page >= 0) r = page * page_size + (cell % page_size);
+        }
+        srow[t] = r;
+    }
+    __syncthreads();
+    for (int i = t; i < CHUNK * (MHD / 8); i += THREADS) {   // the latents, 8 values a step, zero for empty cells
+        const int c = i / (MHD / 8), d0 = (i % (MHD / 8)) * 8;
+        float v[8];
+        if (srow[c] >= 0) mla_load8<Q4>(pool, srow[c], d0, v);
+        else
+#pragma unroll
+            for (int k = 0; k < 8; ++k) v[k] = 0.0f;
+        __half* dst = sL + c * MHD + d0;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) dst[k] = __float2half(v[k]);
+    }
+    __syncthreads();
+    if (warp < CHUNK / 16) {   // S[:, 16 warp .. 16 warp + 16) = Q . L^T
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.0f);
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+        for (int k = 0; k < MHD; k += 16) {
+            wmma::load_matrix_sync(fa, sQ + k, MHD);
+            wmma::load_matrix_sync(fb, sL + (warp * 16) * MHD + k, MHD);
+            wmma::mma_sync(acc, fa, fb, acc);
+        }
+        wmma::store_matrix_sync(sS + warp * 16, acc, CHUNK, wmma::mem_row_major);
+    }
+    __syncthreads();
+    for (int h = warp; h < MGH; h += WARPS) {   // mla_chunk_kernel's softmax over the chunk's cells
+        const bool va = lane < n_here && srow[lane] >= 0, vb = lane + 32 < n_here && srow[lane + 32] >= 0;
+        const float a = va ? sS[h * CHUNK + lane] * scale : -FLT_MAX, b = vb ? sS[h * CHUNK + lane + 32] * scale : -FLT_MAX;
+        const float m = warp_max(fmaxf(a, b));
+        const float ea = va ? __expf(a - m) : 0.0f;
+        const float eb = vb ? __expf(b - m) : 0.0f;
+        sP[h * CHUNK + lane] = __float2half(ea);
+        sP[h * CHUNK + lane + 32] = __float2half(eb);
+        const float l = warp_sum(ea + eb);
+        if (lane == 0) { part_m[(size_t) chunk * n_head + h0 + h] = m; part_l[(size_t) chunk * n_head + h0 + h] = l; }
+    }
+    __syncthreads();
+    // part_acc[h][d] = sum_c P[h][c] L[c][d]: 32 tiles of 16 dims, four a warp
+    float* acc_out = part_acc + ((size_t) chunk * n_head + h0) * MHD;
+    for (int nt = warp; nt < MHD / 16; nt += WARPS) {
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.0f);
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fb;
+#pragma unroll
+        for (int k = 0; k < CHUNK; k += 16) {
+            wmma::load_matrix_sync(fa, sP + k, CHUNK);
+            wmma::load_matrix_sync(fb, sL + k * MHD + nt * 16, MHD);
+            wmma::mma_sync(acc, fa, fb, acc);
+        }
+        wmma::store_matrix_sync(acc_out + nt * 16, acc, MHD, wmma::mem_row_major);
+    }
+}
+
 template <bool Q4>
 void mla_decode_attn_any(const float* q_abs, const void* latent_pool, const int32_t* page_table, int page_size,
                          const int32_t* ids, const int32_t* steps, int64_t cap, int n_head, float scale,
@@ -706,9 +812,48 @@ void mla_decode_attn_any(const float* q_abs, const void* latent_pool, const int3
     float* part_m = scratch + (size_t) n_chunks * n_head * MHD;
     float* part_l = part_m + (size_t) n_chunks * n_head;
     cudaStream_t st = (cudaStream_t) stream;
-    mla_chunk_kernel<Q4><<<dim3((unsigned) n_chunks, (unsigned) (n_head / MGH), (unsigned) n_q), THREADS, 0, st>>>(
-        q_abs, latent_pool, page_table, ids, steps, n_head, page_size, scale, part_acc, part_m, part_l, n_chunks,
-        (int) cap, stride);
+    // the tensor-core chunk for the prompt path's sub-batches (>= 16 queries; the decode's windows, captured in graphs,
+    // keep the CUDA-core kernel).  STRATA_MLA_TC=0: the CUDA-core kernel everywhere
+    static const bool tc_on = [] { const char* v = std::getenv("STRATA_MLA_TC"); return !(v && v[0] == '0'); }();
+    static bool tc_ready = false;
+    if (tc_on && n_q >= 16 && !tc_ready) {
+        tc_ready = cudaFuncSetAttribute(mla_chunk_tc_kernel<Q4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kMlaTcSmem) == cudaSuccess;
+        cudaGetLastError();
+    }
+    // STRATA_MLA_TC_CHECK=1 (a test): the first calls run the CUDA-core kernel too and print how far the outputs are apart
+    static const bool tc_check = [] { const char* v = std::getenv("STRATA_MLA_TC_CHECK"); return v && v[0] == '1'; }();
+    static int tc_checks = 0;
+    if (tc_check && tc_on && n_q >= 16 && tc_ready && tc_checks < 6) {
+        ++tc_checks;
+        const size_t on = (size_t) n_q * n_head * MHD;
+        float* ref = nullptr;
+        cudaMalloc(&ref, on * 4);
+        mla_chunk_kernel<Q4><<<dim3((unsigned) n_chunks, (unsigned) (n_head / MGH), (unsigned) n_q), THREADS, 0, st>>>(
+            q_abs, latent_pool, page_table, ids, steps, n_head, page_size, scale, part_acc, part_m, part_l, n_chunks,
+            (int) cap, stride);
+        mla_merge_kernel<<<dim3((unsigned) n_head, (unsigned) n_q), MHD, 0, st>>>(part_acc, part_m, part_l, n_chunks, n_head, ref, stride);
+        mla_chunk_tc_kernel<Q4><<<dim3((unsigned) n_chunks, (unsigned) (n_head / MGH), (unsigned) n_q), THREADS, kMlaTcSmem, st>>>(
+            q_abs, latent_pool, page_table, ids, steps, n_head, page_size, scale, part_acc, part_m, part_l, n_chunks,
+            (int) cap, stride);
+        mla_merge_kernel<<<dim3((unsigned) n_head, (unsigned) n_q), MHD, 0, st>>>(part_acc, part_m, part_l, n_chunks, n_head, out, stride);
+        std::vector<float> a(on), b(on);
+        cudaMemcpyAsync(a.data(), ref, on * 4, cudaMemcpyDeviceToHost, st);
+        cudaMemcpyAsync(b.data(), out, on * 4, cudaMemcpyDeviceToHost, st);
+        cudaStreamSynchronize(st);
+        cudaFree(ref);
+        double d2 = 0, n2 = 0;
+        for (size_t i = 0; i < on; ++i) { const double d = (double) a[i] - b[i]; d2 += d * d; n2 += (double) a[i] * a[i]; }
+        std::fprintf(stderr, "mla tc check: %d queries, rel L2 %.5f\n", (int) n_q, n2 > 0 ? std::sqrt(d2 / n2) : 0.0);
+        return;
+    }
+    if (tc_on && n_q >= 16 && tc_ready)
+        mla_chunk_tc_kernel<Q4><<<dim3((unsigned) n_chunks, (unsigned) (n_head / MGH), (unsigned) n_q), THREADS, kMlaTcSmem, st>>>(
+            q_abs, latent_pool, page_table, ids, steps, n_head, page_size, scale, part_acc, part_m, part_l, n_chunks,
+            (int) cap, stride);
+    else
+        mla_chunk_kernel<Q4><<<dim3((unsigned) n_chunks, (unsigned) (n_head / MGH), (unsigned) n_q), THREADS, 0, st>>>(
+            q_abs, latent_pool, page_table, ids, steps, n_head, page_size, scale, part_acc, part_m, part_l, n_chunks,
+            (int) cap, stride);
     mla_merge_kernel<<<dim3((unsigned) n_head, (unsigned) n_q), MHD, 0, st>>>(part_acc, part_m, part_l, n_chunks, n_head,
                                                                             out, stride);
     const cudaError_t e = cudaGetLastError();

@@ -1714,7 +1714,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     // window's kernels in the window's order, each given the whole sub-batch; Q8_0 projections through cuBLAS (others
     // a slice at a time).  The scores / selection / attention / wv_b go mla_ab tokens at a time inside (vbT reuses lat).
     static const bool mla_prof = std::getenv("STRATA_GLM5_PF_PROF") != nullptr;
-    double ms_m[5] = {};   // projections, indexer, attention, output, key append (STRATA_GLM5_PF_PROF)
+    double ms_m[6] = {};   // projections, indexer q/w + scores, attention, output, key append, top-k (STRATA_GLM5_PF_PROF)
     auto mla_layer = [&](int64_t l, int64_t T) -> bool {
         auto mt = std::chrono::steady_clock::now();
         auto mlap = [&](int i) {
@@ -1803,8 +1803,9 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                 const int64_t active = (int64_t) h_steps[(size_t) (b0 + a0 + na - 1) * kStepCount + kStepNBid] + 1;
                 glm5_kpool_scores(ma_iq + (size_t) a0 * IH * ID, ma_iw + (size_t) a0 * IH, pooled, sa, na, max_blocks_, ma_sc, cs,
                                   pf_active ? active : -1);
-                qsa_block_topk(ma_sc, sa, na, max_blocks_, cap_, s, ma_sel, cs, pf_active ? active : -1);
                 mlap(1);
+                qsa_block_topk(ma_sc, sa, na, max_blocks_, cap_, s, ma_sel, cs, pf_active ? active : -1);
+                mlap(5);
                 const float* qa = ma_qa + (size_t) a0 * NH * KVR;
                 if (m.lat_q4) mla_decode_attn_batch_q4(qa, lat_pool, m.page_table, 4, ma_sel, sa, cap_, (int) NH, 1.0f / std::sqrt((float) QK), ma_scr, ma_lat, na, cs);
                 else mla_decode_attn_batch(qa, (const uint16_t*) lat_pool, m.page_table, 4, ma_sel, sa, cap_, (int) NH,
@@ -1860,7 +1861,8 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     static const bool pf_walk = [] { const char* v = std::getenv("STRATA_GLM5_PF_WALK"); return !(v && v[0] == '0'); }();
     // PG halves (in whole chunks) until its page-locked state fits beside the pinned RAM tier (12,795 tokens' 1 GiB did
     // not beside 99 GiB, 2026-10-09)
-    int64_t PG = std::min<int64_t>(n_all, C * HC);
+    static const int64_t pg_max = [] { const char* v = std::getenv("STRATA_GLM5_PF_GROUP_MAX"); return v ? std::atoll(v) : 0; }();
+    int64_t PG = std::min<int64_t>(n_all, pg_max > 0 ? std::min<int64_t>(pg_max, C * HC) : C * HC);
     const size_t q8row = (size_t) (N / 32) * 36;
     int64_t q8f = 0, E_cap = 0;
     const int64_t csrf = (int64_t) ((((size_t) 2 * (4 * CK + 1)) + 63) & ~(size_t) 63);  // 2 halves of the entry lists
@@ -1883,7 +1885,8 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         };
         auto hfree = [&] { for (void*& q : host_free.p) { if (q) cudaFreeHost(q); q = nullptr; } };
         walk = false;
-        for (; PG >= 2 * C || PG == n_all; PG = std::max<int64_t>(C, (PG / 2 + C - 1) / C * C)) {
+        // (one chunk smaller a try, not half: 31,883 tokens got 4 groups of 8,192 where 12,288 fits beside 98 GiB)
+        for (; PG >= 2 * C || PG == n_all; PG = std::max<int64_t>(C, (PG - 1) / C * C)) {
             // floats at the front of parts: the group's FFN inputs (F32, MMQ quantizes its own rows) and their q8_1
             // image (the native kernels' layers)
             q8f = (int64_t) (((size_t) PG * N + (size_t) PG * q8row / 4 + 63) & ~(size_t) 63);
@@ -2239,8 +2242,8 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                      "route %.0f ms, state out %.0f ms, routed experts %.0f ms\n", w_plan_ms, w_enq_ms, w_ms[0], w_ms[1], w_ms[2], w_ms[3]);
     if (prof && mla_sb > 0)
         std::fprintf(stderr, "strata glm5 prefill prof: MLA layers %.0f ms of the attention (projections %.0f, key append %.0f, "
-                             "indexer %.0f, attention %.0f, output %.0f)\n", ms_m[0] + ms_m[1] + ms_m[2] + ms_m[3] + ms_m[4],
-                     ms_m[0], ms_m[4], ms_m[1], ms_m[2], ms_m[3]);
+                             "indexer q/w + scores %.0f, top-k %.0f, attention %.0f, output %.0f)\n",
+                     ms_m[0] + ms_m[1] + ms_m[2] + ms_m[3] + ms_m[4] + ms_m[5], ms_m[0], ms_m[4], ms_m[1], ms_m[5], ms_m[2], ms_m[3]);
     if (prof)
         std::fprintf(stderr, "strata glm5 prefill prof: of the host blob copies - waiting for the GPU's previous half %.0f ms, "
                              "fetching the streamed blobs %.0f ms (threads: in blob() %.0f ms, copying %.0f ms, summed)\n",
