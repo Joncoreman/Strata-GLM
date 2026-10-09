@@ -37,6 +37,7 @@
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -767,6 +768,23 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         err = "verify glm5 prefill: the chunk buffers (" + std::to_string(C) + " tokens) do not fit in VRAM";
         return false;
     }
+    // 2026-10-09 (the prompt path rewrite, stage 1): the MLA layers' wk_b / wv_b per head as ONE strided-batched F32
+    // GEMM a slice instead of 2 x n_head native_mmvq launches (half of the prompt path's ~1.8M launches a 4K chunk).
+    // The layer's two Q8_0 tensors are dequantized once per chunk into F32 scratch.  STRATA_GLM5_PF_BLAS=0: as before.
+    static const bool pf_blas_on = [] { const char* v = std::getenv("STRATA_GLM5_PF_BLAS"); return !(v && v[0] == '0'); }();
+    static cublasHandle_t pf_blas = nullptr;
+    float* kb_f = nullptr;   // [NH][KVR][QK]
+    float* vb_f = nullptr;   // [NH][VD][KVR]
+    int64_t kbvb_layer = -1;
+    if (pf_blas_on) {
+        if (pf_blas == nullptr && cublasCreate(&pf_blas) != CUBLAS_STATUS_SUCCESS) pf_blas = nullptr;
+        if (pf_blas != nullptr) {
+            kb_f = (float*) dalloc((size_t) m.NH * m.KVR * m.QK * 4);
+            vb_f = (float*) dalloc((size_t) m.NH * m.VD * m.KVR * 4);
+            if (kb_f == nullptr || vb_f == nullptr) kb_f = vb_f = nullptr;   // no room: the per-head launches
+            else cublasSetStream(pf_blas, cs);
+        }
+    }
     uint8_t* pin = nullptr;
     const size_t pin_blobs = (size_t) 2 * B * max_blob;
     const size_t pin_bytes = pin_blobs + (size_t) 2 * plan_n * 4 + 64 + (size_t) 2 * B * 8;
@@ -891,8 +909,20 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         else glm5_latent_store(m.kv, (uint16_t*) lat_pool, m.page_table, st, kStepCount, 4, (int) KVR, n, cs);
         mmvq(wqb, m.qr, (int) QLR, m.qb, (int) (NH * QK), n, m.q8, cs);
         glm5_transpose_abd(m.qb, m.qT, n, (int) NH, (int) QK, cs);
-        native_quantize_q8_1(m.qT, m.q8, (int) (QK * NH * n), 1, cs);
-        {
+        // stage 1: this layer's wk_b / wv_b in F32 once per chunk (both Q8_0: [NH][KVR][QK] and [NH][VD][KVR])
+        const bool blas = kb_f != nullptr && wkb->native_type == 8 && wvb->native_type == 8;   // GGML_TYPE_Q8_0
+        if (blas && kbvb_layer != l) {
+            dequant_q8_0((const uint8_t*) wkb->native_data, kb_f, NH * KVR * QK, cs);
+            dequant_q8_0((const uint8_t*) wvb->native_data, vb_f, NH * VD * KVR, cs);
+            kbvb_layer = l;
+        }
+        const float one = 1.0f, zero = 0.0f;
+        if (blas) {   // qaT[h] (n x KVR, row-major) = qT[h] (n x QK) . wk_b[h]^T, every head in one call
+            cublasSgemmStridedBatched(pf_blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) KVR, n, (int) QK, &one,
+                                      kb_f, (int) QK, (long long) KVR * QK, m.qT, (int) QK, (long long) n * QK, &zero,
+                                      m.qaT, (int) KVR, (long long) n * KVR, (int) NH);
+        } else {
+            native_quantize_q8_1(m.qT, m.q8, (int) (QK * NH * n), 1, cs);
             const size_t row = (size_t) (QK / 32) * 34, qcol = (size_t) (QK / 32) * 36;
             for (int64_t h = 0; h < NH; ++h)
                 native_mmvq(wkb->native_type, (const uint8_t*) wkb->native_data + (size_t) h * KVR * row,
@@ -912,8 +942,12 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         else mla_decode_attn_batch(m.qa, (const uint16_t*) lat_pool, m.page_table, 4, sel_, st, cap_, (int) NH, 1.0f / std::sqrt((float) QK),
                               m.mla_scratch, m.lat, n, cs);
         glm5_transpose_abd(m.lat, m.latT, n, (int) NH, (int) KVR, cs);
-        native_quantize_q8_1(m.latT, m.q8, (int) (KVR * NH * n), 1, cs);
-        {
+        if (blas) {   // vbT[h] (n x VD) = latT[h] (n x KVR) . wv_b[h]^T, every head in one call
+            cublasSgemmStridedBatched(pf_blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) VD, n, (int) KVR, &one,
+                                      vb_f, (int) KVR, (long long) VD * KVR, m.latT, (int) KVR, (long long) n * KVR, &zero,
+                                      m.vbT, (int) VD, (long long) n * VD, (int) NH);
+        } else {
+            native_quantize_q8_1(m.latT, m.q8, (int) (KVR * NH * n), 1, cs);
             const size_t row = (size_t) (KVR / 32) * 34, qcol = (size_t) (KVR / 32) * 36;
             for (int64_t h = 0; h < NH; ++h)
                 native_mmvq(wvb->native_type, (const uint8_t*) wvb->native_data + (size_t) h * VD * row,

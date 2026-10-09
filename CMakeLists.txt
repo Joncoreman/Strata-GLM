@@ -474,7 +474,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
     src/core/remote_stage.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})   # cuBLAS: glm5 prefill (2026-10-09)
   if(WIN32)
     target_link_libraries(strata_engine PUBLIC ws2_32)   # multinode: the remote stage's TCP link
   endif()
