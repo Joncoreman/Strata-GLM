@@ -816,10 +816,10 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     float *mhc_part = nullptr, *mhc_ss = nullptr;
     // 2026-10-09: the MLA/DSA layers in sub-batches of mla_sb tokens (projections through cuBLAS, the indexer and the
     // attention kernels given the whole sub-batch: each reads only blocks / cells at or before its own token's step, so
-    // storing the sub-batch's latents and keys first changes nothing).  Opt-in (STRATA_GLM5_PF_MLA=1): 4,400 tokens at
-    // 262K took the same time as the slices (attention 7.5-7.6 s either way; the MLA layers' 3.5 s are the attention
-    // kernel ~1.0, the indexer ~1.1, the projections ~0.6, wv_b + wo ~0.75 - compute, not launches); not checked on sm_86.
-    static const bool pf_mla_on = [] { const char* v = std::getenv("STRATA_GLM5_PF_MLA"); return v && v[0] == '1'; }();
+    // storing the sub-batch's latents and keys first changes nothing).  With F32 cuBLAS projections it took the slices'
+    // time (4,400 tokens: attention 7.5-7.6 s either way); with the MMQ projections (gemm_q8) it is the faster path:
+    // 12,795 tokens, attention 16.1 -> 11.8 s, the prompt 56.3 -> 48.9 s.  STRATA_GLM5_PF_MLA=0: per slice.
+    static const bool pf_mla_on = [] { const char* v = std::getenv("STRATA_GLM5_PF_MLA"); return !(v && v[0] == '0'); }();
     int64_t mla_sb = 0, mla_ab = 0;
     size_t mla_per_tok = 0;
     float *ma_vb = nullptr, *ma_latT = nullptr;
@@ -1327,8 +1327,25 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
 
     // stage 2: Y (rows x out, row-major) = X (rows x in) . W^T for a Q8_0 weight W [out][in], through cuBLAS in F32;
     // W dequantized a slice of rows at a time into `wscr`
+    // 2026-10-09: through MMQ when it has a tile for the matrix (the same int8 tensor cores as the experts; the
+    // activations rounded to q8_1 as the window's mmvq rounds them) - no F32 copy of the weights; wscr then holds the
+    // q8_1 rows, the bounds and the row table.  STRATA_GLM5_PF_MMQ=0: the dequantize + cublasSgemm below
     auto gemm_q8 = [&](const WeightRef* w, int64_t in, int64_t out, const float* X, int64_t rows, float* Y) -> bool {
         if (w->native_type != 8 || in % 32 != 0) { err = "verify glm5 prefill: a KDA projection is not Q8_0"; return false; }
+        const size_t xqb = (mmq::q8_bytes(rows, in) + 255) & ~(size_t) 255;
+        if (mq && xqb + (size_t) (rows + 2) * 4 <= (size_t) WSCR * 4 && mmq::fits(8, out)) {
+            uint8_t* xq = (uint8_t*) wscr;
+            int32_t* bnd = (int32_t*) (xq + xqb);
+            int32_t* ids = bnd + 2;
+            mmq::quantize(X, nullptr, xq, 8, in, in, rows, cs);
+            glm5_set2(bnd, 0, (int32_t) rows, cs);
+            mmq::iota(ids, rows, cs);
+            mmq::Product p;
+            p.w = w->native_data; p.type = 8; p.w_rows = out; p.w_cols = in; p.expert_bytes = mmq::matrix_bytes(8, out, in);
+            p.n = 1; p.xq = xq; p.bounds = bnd; p.ids = ids; p.total_rows = rows; p.max_rows = rows; p.dst = Y; p.ld_dst = out;
+            mq->run(p, cs);
+            return true;
+        }
         const size_t row_bytes = (size_t) in / 32 * 34;
         const int64_t R = std::max<int64_t>(1, std::min<int64_t>(out, WSCR / in));
         const float one = 1.0f, zero = 0.0f;

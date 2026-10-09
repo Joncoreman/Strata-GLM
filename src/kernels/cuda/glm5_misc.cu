@@ -134,6 +134,13 @@ void glm5_swiglu_rows(float* gu, int64_t rows, int n_ff, float limit, void* stre
     check("glm5_swiglu_rows");
 }
 
+static __global__ void set2_kernel(int32_t* dst, int32_t a, int32_t b) { dst[0] = a; dst[1] = b; }
+
+void glm5_set2(int32_t* dst, int32_t a, int32_t b, void* stream) {
+    set2_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(dst, a, b);
+    check("glm5_set2");
+}
+
 // the layer walk's combine: token u_tok[u] += sum over its entries j (in order) of e_w[j] * rows[e_row[j]]
 static __global__ void scatter_add_kernel(const float* __restrict__ rows, const int32_t* __restrict__ u_tok,
                                           const int32_t* __restrict__ u_off, const int32_t* __restrict__ e_row,
