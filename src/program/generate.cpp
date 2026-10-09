@@ -12275,11 +12275,15 @@ int main(int argc, char** argv) {
         static const float ram_gap = [] { const char* v = std::getenv("STRATA_GLM5_RAM_GAP"); return v ? (float) std::atof(v) : 0.8f; }();
         int64_t ram_swaps_total = 0;
         double ms_ram_swaps = 0;
+        // the prompt's routing counts (Verifier::pf_usage), for these RAM-tier decisions only, scaled to a window's and
+        // decayed every window (STRATA_GLM5_RAM_SEED=0: none) - the topic's file-tier experts move in from the first window
+        std::vector<float> ram_bias;
         auto ram_promote = [&]() -> bool {
             if (ram_swaps <= 0 || !pending.empty() || drive.d.usage.empty() || !src.complement_ready() ||
                 src.exchange_capacity() < 1)
                 return true;
             const Clock::time_point t0 = Clock::now();
+            const bool biased = ram_bias.size() == drive.d.usage.size();
             struct RSwap { float gain; int32_t layer, in, out; };
             std::vector<RSwap> sw;
             std::vector<std::pair<float, int32_t>> cand, vict;
@@ -12287,11 +12291,13 @@ int main(int argc, char** argv) {
                 cand.clear();
                 vict.clear();
                 const float* u = drive.d.usage.data() + l * g.n_expert;
+                const float* bz = biased ? ram_bias.data() + l * g.n_expert : nullptr;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] >= 0) continue;   // on the GPU
-                    if (src.has_resident(l, e)) vict.emplace_back(u[e], e);
-                    else if (u[e] >= ram_min) cand.emplace_back(u[e], e);
+                    const float ue = u[e] + (bz ? bz[e] : 0.0f);
+                    if (src.has_resident(l, e)) vict.emplace_back(ue, e);
+                    else if (ue >= ram_min) cand.emplace_back(ue, e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -12315,6 +12321,7 @@ int main(int argc, char** argv) {
                 if (!src.stage_exchange(s.layer, s.in, s.out, (int64_t) q)) break;
             }
             ram_swaps_total += src.commit_exchanges();
+            if (biased) for (float& v : ram_bias) v *= 0.9f;
             ms_ram_swaps += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             return true;
         };
@@ -12740,7 +12747,11 @@ int main(int argc, char** argv) {
                 // answer tokens).  The counts alone (STRATA_GLM5_PF_SEED_BLOCK=0, the decode's rounds) did not help.
                 static const int pf_seed = [] { const char* v = std::getenv("STRATA_GLM5_PF_SEED_ROUNDS"); return v ? std::atoi(v) : 0; }();
                 const bool seed = pf_seed > 0 && o.adapt_swaps > 0 && gl_chain.empty() && np - reused >= 256 && pf_chunk > 0;
-                if (seed) ver.pf_usage.assign((size_t) g.n_layers * g.n_expert, 0.0f);
+                // (4,400-token summary prompt, ~750 tokens: no bias 8.33 tok/s (SSD 23.1 ms a window), x10 8.85 (19.4), x30
+                // 9.15 (18.6))
+                static const float ram_seed = [] { const char* v = std::getenv("STRATA_GLM5_RAM_SEED"); return v ? (float) std::atof(v) : 30.0f; }();
+                const bool rseed = ram_seed > 0.f && ram_swaps > 0 && gl_chain.empty() && np - reused >= 256 && pf_chunk > 0;
+                if (seed || rseed) ver.pf_usage.assign((size_t) g.n_layers * g.n_expert, 0.0f);
                 if (np - reused >= pf_min && pf_chunk > 0) {
                     ver.prefill_ms_total = 0;
                     // slots: the system part first (up to the first <|user|>), then its slot, then the rest
@@ -12785,6 +12796,12 @@ int main(int argc, char** argv) {
                         q += T;
                         cancelled = stop_req.load();
                     }
+                }
+                if (rseed && ver.pf_usage.size() == drive.d.usage.size()) {   // the RAM tier's bias: frequency x ram_seed
+                    const float k = ram_seed / (float) (np - reused);
+                    ram_bias.resize(ver.pf_usage.size());
+                    for (size_t i = 0; i < ram_bias.size(); ++i) ram_bias[i] = ver.pf_usage[i] * k;
+                    if (!seed) ver.pf_usage.clear();
                 }
                 if (seed && ver.pf_usage.size() == drive.d.usage.size()) {   // the prompt's topic into the VRAM cache
                     const Clock::time_point ts = Clock::now();
