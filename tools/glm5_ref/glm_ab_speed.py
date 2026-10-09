@@ -15,7 +15,8 @@ NEW = 256
 LONG = int(os.environ.get("LONG", "0"))   # N > 0: summarize the first N characters of docs (a long prompt)
 msg_args = []
 if LONG > 0:
-    docs = "".join(p.read_text(encoding="utf-8", errors="replace") for p in sorted((WT / "docs").glob("*.md")))
+    DOCS = Path(os.environ.get("DOCS", str(WT / "docs")))   # DOCS=...: another tree's docs (the same prompt for two builds)
+    docs = "".join(p.read_text(encoding="utf-8", errors="replace") for p in sorted(DOCS.glob("*.md")))
     msg_file = OUT / "prompt_msg.txt"   # through a file: a long prompt overflows Windows' 32K command line
     msg_file.write_text("Summarize the following documents in Japanese, in ten bullet points.\n\n" + docs[:LONG], encoding="utf-8")
     msg_args = ["@" + str(msg_file)]

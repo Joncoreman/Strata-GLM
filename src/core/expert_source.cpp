@@ -3385,11 +3385,23 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     }
     const auto c2 = std::chrono::steady_clock::now();
+    // 2026-10-10 SPEED TEST ONLY (STRATA_CAR_TEST=R, default 0 = off): a CPU entry of rank >= R in its token whose
+    // expert is in neither VRAM nor the RAM copy (a file-tier read) is not computed - its row stays zero, the other
+    // weights are NOT renormalised.  STRATA_CAR_RAM=1: RAM-copy ones of rank >= R too.  Estimates what the 2x3090
+    // recipe's CAR ("faithful" / "fast") would gain; the answers change, so it is not for use.
+    static const int car_test = [] { const char* v = std::getenv("STRATA_CAR_TEST"); return v ? std::atoi(v) : 0; }();
+    static const bool car_ram = [] { const char* v = std::getenv("STRATA_CAR_RAM"); return v && v[0] == '1'; }();
+    const FileExpertSource* car_fs = car_test > 0 ? dynamic_cast<const FileExpertSource*>(d.src) : nullptr;
+    bool car_skip[kMaxWindowEntries] = {};
+    if (car_fs != nullptr)
+        for (int64_t i = 0; i < n; ++i)
+            car_skip[i] = kind[i] < 0 && (i % k) >= car_test && ids[i] >= 0 && ids[i] < d.n_expert &&
+                          (car_ram || !car_fs->has_resident(d.layers, ids[i]));
     if (any_cpu) {   // CS-T: the experts the CPU computes, fetched together (the GGUF in place reads them on several threads)
         static thread_local std::vector<int64_t> miss;
         miss.clear();
         for (int64_t i = 0; i < n_tok * k; ++i)
-            if (kind[i] < 0 && ids[i] >= 0 && ids[i] < d.n_expert &&
+            if (kind[i] < 0 && !car_skip[i] && ids[i] >= 0 && ids[i] < d.n_expert &&
                 std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
                 miss.push_back(ids[i]);
         int64_t rows = 0;
@@ -3428,6 +3440,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     zero_ns += std::chrono::steady_clock::now() - z0;
                     ++g_zero_rows;
                 }
+                continue;
+            }
+            if (car_skip[i]) {   // STRATA_CAR_TEST: not computed, a zero row
+                std::memset(row, 0, (size_t) HW * sizeof(float));
                 continue;
             }
             ++d.cache_refused;
