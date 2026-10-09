@@ -1200,7 +1200,42 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         }
         return v != 0;
     };
+    // 2026-10-10: the next MoE layer's file-tier experts read ahead into the page cache - threads touch their mapped
+    // pages while this layer computes, so the fetch's blob() later finds them cached instead of faulting them in one
+    // page run at a time on this thread.  Every layer's experts are nearly all used from a few hundred tokens on (and
+    // a short prompt would read many it does not use): chunks / groups of >= 256 tokens.  STRATA_GLM5_PF_TOUCH = the
+    // threads (8; 0 = off).
+    static const int pf_touch_th = [] { const char* v = std::getenv("STRATA_GLM5_PF_TOUCH"); return v ? std::atoi(v) : 8; }();
+    std::vector<std::thread> touch_th;
+    struct JoinTouch {
+        std::vector<std::thread>& t;
+        ~JoinTouch() { for (auto& x : t) if (x.joinable()) x.join(); }
+    } touch_join{touch_th};
+    std::atomic<uint32_t> touch_sink{0};
+    auto touch_next = [&](int64_t ln, int64_t T) {
+        for (auto& t : touch_th) t.join();
+        touch_th.clear();
+        const int64_t l_last = l_end < 0 ? g.n_layers : l_end;
+        if (pf_touch_th <= 0 || !f.ram || !f.stable || T < 256 || ln >= l_last || ln < g.n_dense_layers) return;
+        auto list = std::make_shared<std::vector<int32_t>>();
+        for (int32_t e = 0; e < (int32_t) NE; ++e)
+            if (!(f.host_res && f.host_res[(size_t) ln * NE + e] >= 0) && f.ram(f.ctx, ln, e) == nullptr) list->push_back(e);
+        if (list->empty()) return;
+        auto next = std::make_shared<std::atomic<size_t>>(0);
+        const uint64_t bbn = lay.blob_bytes(ln);
+        for (int w = 0; w < pf_touch_th; ++w)
+            touch_th.emplace_back([&f, &touch_sink, list, next, bbn, ln] {
+                uint32_t s = 0;
+                for (size_t k; (k = next->fetch_add(1)) < list->size();) {
+                    const volatile uint8_t* p = f.stable(f.ctx, ln, (*list)[k]);
+                    if (p == nullptr) continue;
+                    for (uint64_t off = 0; off < bbn; off += 4096) s += p[off];
+                }
+                touch_sink += s;
+            });
+    };
     auto moe = [&](int64_t l, int64_t T) -> bool {
+        touch_next(l + 1, T);
         const WeightRef *wr = wfind(wt, l, "ffn_gate_inp.weight", err), *wb = wfind(wt, l, "exp_probs_b.bias", err),
                         *wsg = wfind(wt, l, "ffn_gate_shexp.weight", err), *wsu = wfind(wt, l, "ffn_up_shexp.weight", err),
                         *wsd = wfind(wt, l, "ffn_down_shexp.weight", err);
@@ -1840,6 +1875,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     std::vector<std::pair<int32_t, int32_t>> ent;   // (token, entry) of a launch, sorted by token
     double w_plan_ms = 0, w_enq_ms = 0;   // STRATA_GLM5_PF_PROF: the walk's host-side parts
     auto moe_walk = [&](int64_t l, int64_t Pn) -> bool {
+        touch_next(l + 1, Pn);
         if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "verify glm5 prefill: the router failed on the GPU"; return false; }
         float* acc = Rc;
         float* xa = parts;                                       // the group's FFN inputs
