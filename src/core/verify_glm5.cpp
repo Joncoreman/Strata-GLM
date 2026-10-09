@@ -19,6 +19,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/remote_stage.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/glm5_kda_chunk.hpp"
@@ -46,6 +47,7 @@
 #include <chrono>
 #include <numeric>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <cmath>
 #include <cstdio>
@@ -1169,6 +1171,35 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         dn.dst = out; dn.ld_dst = N;
         mq->run(dn, cs);
     };
+    // 2026-10-10: the prompt path's CPU lane.  A short prompt still streams about half of every layer's experts (85
+    // tokens: 6,059 blobs, ~62 GB, 1.4 s of PCIe at the least) though most of them have one or two tokens.  Those
+    // lightest RAM-tier experts are computed on host threads with the windows' CPU kernels (ggml-cpu's arithmetic,
+    // native_expert.hpp) while the GPU streams the rest; their rows are copied into `parts` before the combine.
+    // Chunks of <= 1,024 tokens only (beyond, the fetch's threads would compete for the cores).  85 tokens, warm:
+    // 2.7 -> 1.7-1.8 s (the GPU's loop then waits on PCIe: 2,409 blobs ~ 0.54 s).
+    // STRATA_GLM5_PF_CPU = the most tokens an expert may have for the CPU (8; 0 = off), STRATA_GLM5_PF_CPU_SHARE = the
+    // largest share of the streamed experts it takes (0.9), STRATA_GLM5_PF_CPU_THREADS (22).
+    static const int pf_cpu_rows = [] { const char* v = std::getenv("STRATA_GLM5_PF_CPU"); return v ? std::min(16, std::atoi(v)) : 8; }();
+    static const double pf_cpu_share = [] { const char* v = std::getenv("STRATA_GLM5_PF_CPU_SHARE"); return v ? std::atof(v) : 0.9; }();
+    static const int pf_cpu_threads = [] { const char* v = std::getenv("STRATA_GLM5_PF_CPU_THREADS"); return v ? std::max(1, std::atoi(v)) : 22; }();
+    namespace kc = strata::kernels::cpu;
+    std::vector<int8_t> cpu_fmt_ok((size_t) g.n_layers, -1);
+    std::vector<kc::NativeFmt> cpu_fmt((size_t) g.n_layers);
+    std::vector<float> cpu_x, cpu_out;
+    std::vector<int32_t> cpu_dst;
+    int64_t pf_cpu_n = 0;
+    double pf_cpu_join_ms = 0;
+    double pf_moe_ms[4] = {};   // STRATA_GLM5_PF_PROF, the chunk path's moe: router+shared on the GPU, split, loop, tail
+    auto cpu_layer_ok = [&](int64_t l) -> bool {
+        if (!kc::native_experts_available()) return false;
+        int8_t& v = cpu_fmt_ok[(size_t) l];
+        if (v < 0) {
+            const auto& fm = lay.fmt[(size_t) l];
+            std::string e2;
+            v = (int8_t) kc::native_fmt(fm.gu_type, fm.d_type, fm.n_embd, fm.n_ff, cpu_fmt[(size_t) l], e2, m.clamp_exp);
+        }
+        return v != 0;
+    };
     auto moe = [&](int64_t l, int64_t T) -> bool {
         const WeightRef *wr = wfind(wt, l, "ffn_gate_inp.weight", err), *wb = wfind(wt, l, "exp_probs_b.bias", err),
                         *wsg = wfind(wt, l, "ffn_gate_shexp.weight", err), *wsu = wfind(wt, l, "ffn_up_shexp.weight", err),
@@ -1187,7 +1218,15 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         }
         quantize_q8_1_rows(xmc, T, N, q8c, cs);
         cudaMemcpyAsync(h_ids.data(), idsc, (size_t) TK * 4, cudaMemcpyDeviceToHost, cs);
+        const auto tm0 = std::chrono::steady_clock::now();
         if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "verify glm5 prefill: the router failed on the GPU"; return false; }
+        auto tm = std::chrono::steady_clock::now();
+        auto mlap2 = [&](int i) {
+            const auto t1 = std::chrono::steady_clock::now();
+            pf_moe_ms[i] += std::chrono::duration<double, std::milli>(t1 - tm).count();
+            tm = t1;
+        };
+        pf_moe_ms[0] += std::chrono::duration<double, std::milli>(tm - tm0).count();
         for (auto& v : by) v.clear();
         used.clear();
         for (int64_t i = 0; i < TK; ++i) {
@@ -1201,9 +1240,108 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         L.swiglu_limit = m.clamp_exp;
         const uint64_t bb = lay.blob_bytes(l);
         const bool mm = use_mmq(l);
-        for (size_t bi = 0, b0 = 0; b0 < used.size(); ++bi, b0 += B) {
+        // the CPU lane, work stealing: `used` holds the residents first, then the streamed experts by rows, most first;
+        // the GPU's launches take from the front, the lane's threads from the back - the lightest - while those have at
+        // most pf_cpu_rows rows (and within pf_cpu_share of the streamed ones), until the two meet.  A fixed split was
+        // either idle or late by turns (85 tokens: 1.7-2.4 s).  The blobs are looked up on the lane's threads (1,500
+        // lookups on this thread took 0.7 s).
+        // the lane also takes file-tier experts, read through the stable mapping by its threads (many SSD reads in
+        // flight): 85 tokens 2.2-2.3 -> 1.7-1.9 s, 720 tokens 8.7 -> 7.1 s.  STRATA_GLM5_PF_CPU_FILE=0: RAM tier only
+        static const bool lane_file = [] { const char* v = std::getenv("STRATA_GLM5_PF_CPU_FILE"); return !(v && v[0] == '0'); }();
+        const bool lane = pf_cpu_rows > 0 && pf_cpu_share > 0 && T <= 1024 && f.ram && f.blob && cpu_layer_ok(l);
+        size_t q_lo = 0, q_hi = used.size(), q_el = used.size();   // the lane's eligible tail is [q_el, used.size())
+        std::mutex q_mu;
+        std::vector<int32_t> ro;
+        if (lane) {
+            // 0 = VRAM resident, 1 = streamed only, 2 = the lane may take it (RAM tier, few rows)
+            std::vector<int8_t> cls((size_t) NE, 1);
+            size_t n_res = 0, n_el = 0;
+            for (int32_t e : used) {
+                int8_t c = 1;
+                if (f.host_res && f.host_res[(size_t) l * NE + e] >= 0) c = 0;
+                else if ((int) by[(size_t) e].size() <= pf_cpu_rows && (lane_file || f.ram(f.ctx, l, e) != nullptr)) c = 2;
+                cls[(size_t) e] = c;
+                n_res += c == 0;
+                n_el += c == 2;
+            }
+            std::stable_sort(used.begin(), used.end(), [&](int32_t a, int32_t b) {
+                const int8_t ca = cls[(size_t) a], cb = cls[(size_t) b];
+                if (ca != cb) return ca < cb;
+                return by[(size_t) a].size() > by[(size_t) b].size();
+            });
+            const size_t cap = (size_t) ((double) (used.size() - n_res) * pf_cpu_share);
+            q_el = used.size() - std::min(n_el, cap);
+        }
+        mlap2(1);
+        std::atomic<bool> cpu_failed{false};
+        std::vector<std::thread> cpu_th;
+        struct JoinAll {
+            std::vector<std::thread>& t;
+            ~JoinAll() { for (auto& x : t) if (x.joinable()) x.join(); }
+        } cpu_join{cpu_th};   // an early return below still waits for the lane
+        if (q_el < used.size()) {
+            cpu_dst.clear();
+            ro.assign(used.size() - q_el + 1, 0);
+            for (size_t k = q_el; k < used.size(); ++k) {
+                ro[k - q_el] = (int32_t) cpu_dst.size();
+                for (int32_t i : by[(size_t) used[k]]) cpu_dst.push_back(i);
+            }
+            ro[used.size() - q_el] = (int32_t) cpu_dst.size();
+            cpu_x.resize((size_t) T * N);
+            cudaMemcpy(cpu_x.data(), xmc, (size_t) T * N * 4, cudaMemcpyDeviceToHost);
+            cpu_out.resize(cpu_dst.size() * (size_t) N);
+            const kc::NativeFmt* cf = &cpu_fmt[(size_t) l];
+            const int nth = std::min<int>(pf_cpu_threads, (int) (used.size() - q_el));
+            for (int w = 0; w < nth; ++w)
+                cpu_th.emplace_back([&, cf] {
+                    const int MR = 16;
+                    std::vector<uint8_t> abuf((size_t) MR * cf->act_bytes + 64), hbuf((size_t) MR * cf->h_bytes + 64);
+                    uint8_t* ab = (uint8_t*) (((uintptr_t) abuf.data() + 63) & ~(uintptr_t) 63);
+                    uint8_t* hbq = (uint8_t*) (((uintptr_t) hbuf.data() + 63) & ~(uintptr_t) 63);
+                    std::vector<float> ff((size_t) MR * cf->n_ff);
+                    const void* act[MR];
+                    const void* hq[MR];
+                    float* ffp[MR];
+                    float* outp[MR];
+                    for (;;) {
+                        size_t k;
+                        {
+                            std::lock_guard<std::mutex> lk(q_mu);
+                            if (q_hi <= q_lo || q_hi <= q_el) break;
+                            k = --q_hi;
+                        }
+                        const int32_t e = used[k];
+                        const int r0 = ro[k - q_el], nt = std::min(MR, ro[k - q_el + 1] - r0);
+                        // (the stable pointer: blob() may hand out a staging buffer the next lookup recycles)
+                        const uint8_t* blob = lane_file ? (f.stable ? f.stable(f.ctx, l, e) : nullptr) : f.ram(f.ctx, l, e);
+                        if (blob == nullptr) { cpu_failed = true; continue; }
+                        for (int t = 0; t < nt; ++t) {
+                            const int tok = cpu_dst[(size_t) (r0 + t)] / (int) K;
+                            kc::native_quant_act(*cf, cpu_x.data() + (size_t) tok * N, ab + (size_t) t * cf->act_bytes);
+                            act[t] = ab + (size_t) t * cf->act_bytes;
+                            ffp[t] = ff.data() + (size_t) t * cf->n_ff;
+                            outp[t] = cpu_out.data() + (size_t) (r0 + t) * N;
+                        }
+                        kc::native_gu_rows(*cf, blob, act, nt, ffp, 0, (int) cf->n_ff);
+                        for (int t = 0; t < nt; ++t) {
+                            kc::native_quant_h(*cf, ffp[t], hbq + (size_t) t * cf->h_bytes);
+                            hq[t] = hbq + (size_t) t * cf->h_bytes;
+                        }
+                        kc::native_down_rows(*cf, blob, hq, nt, outp, 0, (int) cf->n_embd);
+                    }
+                });
+        }
+        for (size_t bi = 0;; ++bi) {
+            size_t b0;
+            int nb;
+            {
+                std::lock_guard<std::mutex> lk(q_mu);
+                nb = (int) std::min<size_t>((size_t) B, q_hi - q_lo);
+                b0 = q_lo;
+                q_lo += (size_t) nb;
+            }
+            if (nb <= 0) break;
             const int hf = (int) (bi & 1);
-            const int nb = (int) std::min<size_t>(B, used.size() - b0);
             uint8_t* dstage = stage + (size_t) hf * B * max_blob;
             uint8_t* hstage = pin + (size_t) hf * B * max_blob;
             int32_t* start = pplan + (size_t) hf * plan_n;
@@ -1263,7 +1401,27 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                 // 4,400 tokens in chunks of 4,096: the copies into the staging took 89 s summed over 16 threads (18 s).
                 std::atomic<bool> direct[32];
                 for (int k = 0; k < ns; ++k) direct[k] = false;
-                for (int k = 0; k < ns; ++k)
+                // 2026-10-10, a short prompt (<= 1,024 tokens) with PF_DIRECT: the lookups on this thread (~0.1 ms each)
+                // and threads only for the blobs to copy - a thread a blob waited for a core while the CPU lane held
+                // them (85 tokens: the fetch took 0.92 s, its threads 0.32 s)
+                // (blob() on this thread also for the file tier: reading those on threads instead was slower - 85 tokens
+                // 1.7 -> 2.3 s, 720 tokens 6.8 -> 8.1 s; the source's own read-ahead serves them in order)
+                const bool serial = pf_direct && T <= 1024;
+                for (int k = 0; serial && k < ns; ++k) {
+                    const auto a = std::chrono::steady_clock::now();
+                    const uint8_t* hb = f.blob ? f.blob(f.ctx, l, stream_e[k]) : nullptr;
+                    us_blob += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - a).count();
+                    if (hb == nullptr) { failed = true; break; }
+                    cudaPointerAttributes at{};
+                    if (cudaPointerGetAttributes(&at, hb) == cudaSuccess && at.type == cudaMemoryTypeHost) {
+                        hsrc[k] = hb;
+                        direct[k] = true;
+                    } else {
+                        cudaGetLastError();
+                        std::memcpy(hstage + (size_t) k * max_blob, hb, (size_t) bb);
+                    }
+                }
+                for (int k = 0; !serial && k < ns; ++k)
                     th.emplace_back([&, k] {
                         const auto a = std::chrono::steady_clock::now();
                         const uint8_t* hb = f.blob ? f.blob(f.ctx, l, stream_e[k]) : nullptr;
@@ -1320,8 +1478,28 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                                       q8c, gscratch, parts, cs);
             cudaEventRecord(ev_done[hf], cs);   // the host waits for it before this half is filled again
         }
+        mlap2(2);
+        if (!cpu_th.empty()) {   // the CPU lane's rows into parts (through gscratch: the GPU's experts are queued before)
+            const auto tj = std::chrono::steady_clock::now();
+            for (auto& t : cpu_th) t.join();
+            cpu_th.clear();
+            if (cpu_failed) { err = "verify glm5 prefill: an expert of layer " + std::to_string(l) + " is in no tier (CPU lane)"; return false; }
+            pf_cpu_join_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tj).count();
+            // the lane took [q_hi, used.size()): rows [ro[q_hi - q_el], ro[end]) of its tables
+            const int r_lo = ro[q_hi - q_el], r_hi = ro[used.size() - q_el], cpu_rows = r_hi - r_lo;
+            pf_cpu_n += (int64_t) (used.size() - q_hi);
+            if (cpu_rows > 0) {
+                float* src = (float*) gscratch;
+                int32_t* idx = (int32_t*) (src + (size_t) cpu_rows * N);
+                cudaMemcpyAsync(src, cpu_out.data() + (size_t) r_lo * N, (size_t) cpu_rows * N * 4, cudaMemcpyHostToDevice, cs);
+                cudaMemcpyAsync(idx, cpu_dst.data() + r_lo, (size_t) cpu_rows * 4, cudaMemcpyHostToDevice, cs);
+                glm5_copy_rows(src, idx, parts, cpu_rows, (int) N, cs);
+            }
+        }
         native_moe_combine_multi(parts, wc, shc, boc, N, K, (int) T, cs);
         kbvb_layer = -1;   // parts (where kb_f / vb_f are carved) now holds this layer's expert outputs
+        static const bool moe_prof = std::getenv("STRATA_GLM5_PF_PROF") != nullptr;
+        if (moe_prof) { cudaStreamSynchronize(cs); mlap2(3); }
         return true;
     };
 
@@ -1935,6 +2113,12 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                      (long long) n_all, (long long) lb, (long long) le - 1, ms_attn, ms_norm, ms_ffn,
                      prefill_ms_copy - copy0, (long long) prefill_streamed, (long long) prefill_direct,
                      (long long) prefill_resident);
+    if (prof && !walk)
+        std::fprintf(stderr, "strata glm5 prefill prof: moe - router+shared (GPU) %.0f ms, split %.0f ms, expert loop %.0f ms, "
+                     "lane join + combine %.0f ms\n", pf_moe_ms[0], pf_moe_ms[1], pf_moe_ms[2], pf_moe_ms[3]);
+    if (prof && pf_cpu_n > 0)
+        std::fprintf(stderr, "strata glm5 prefill prof: CPU lane %lld experts, the GPU then waited %.0f ms for it\n",
+                     (long long) pf_cpu_n, pf_cpu_join_ms);
     if (prof && walk)
         std::fprintf(stderr, "strata glm5 prefill prof: walk host side - entry lists %.0f ms, launches %.0f ms\n", w_plan_ms, w_enq_ms);
     if (prof && mla_sb > 0)

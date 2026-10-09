@@ -12450,6 +12450,11 @@ int main(int argc, char** argv) {
             pf.cache_blob = (uint64_t) thits.blob;
             pf.ctx = srcp;
             pf.blob = [](void* c, int64_t l, int64_t e) -> const uint8_t* { return ((strata::core::ExpertSource*) c)->blob(l, e); };
+            pf.ram = [](void* c, int64_t l, int64_t e) -> const uint8_t* {
+                auto* fs = dynamic_cast<strata::core::FileExpertSource*>((strata::core::ExpertSource*) c);
+                return fs != nullptr && fs->complement_ready() ? fs->resident_blob(l, e) : nullptr;
+            };
+            pf.stable = [](void* c, int64_t l, int64_t e) -> const uint8_t* { return ((strata::core::ExpertSource*) c)->blob_stable(l, e); };
             // multinode (2026-10-08): each chunk through [0, K1) here, the stage engines' ranges, then [Kn, end) here
             std::vector<std::vector<float>> mn_hand;
             auto mn_prefill = [&](const int32_t* toks, int64_t n_tok, int64_t p0, std::string& e) -> bool {
@@ -12654,7 +12659,9 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 // the prompt's cells [reused, n - 1)
                 bool cancelled = false;
-                if (np - reused >= 16 && pf_chunk > 0) {
+                // STRATA_GLM5_PF_MIN (2026-10-10): the fewest new cells the chunk path takes (16); fewer go as verify windows
+                static const int64_t pf_min = [] { const char* v = std::getenv("STRATA_GLM5_PF_MIN"); return v ? std::atoll(v) : 16; }();
+                if (np - reused >= pf_min && pf_chunk > 0) {
                     ver.prefill_ms_total = 0;
                     // slots: the system part first (up to the first <|user|>), then its slot, then the rest
                     int64_t cut = reused;
@@ -12846,6 +12853,11 @@ int main(int argc, char** argv) {
                 pf.cache_blob = (uint64_t) thits.blob;
                 pf.ctx = srcp;
                 pf.blob = [](void* c, int64_t l, int64_t e) -> const uint8_t* { return ((strata::core::ExpertSource*) c)->blob(l, e); };
+                pf.ram = [](void* c, int64_t l, int64_t e) -> const uint8_t* {
+                    auto* fs = dynamic_cast<strata::core::FileExpertSource*>((strata::core::ExpertSource*) c);
+                    return fs != nullptr && fs->complement_ready() ? fs->resident_blob(l, e) : nullptr;
+                };
+                pf.stable = [](void* c, int64_t l, int64_t e) -> const uint8_t* { return ((strata::core::ExpertSource*) c)->blob_stable(l, e); };
                 if (ver.prefill_glm5(toks32.data(), np, 0, pf_chunk, pf, err)) {
                     std::fprintf(stderr, "strata generate: glm5 prefill %lld tokens in chunks of %d, %.1f ms (%.1f tok/s); "
                                          "experts streamed %lld, resident %lld, host copy submission %.1f ms\n",

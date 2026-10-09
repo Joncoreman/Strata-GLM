@@ -54,11 +54,28 @@ p = subprocess.Popen([str(EXE)] + args, cwd=WT, env=env, stdin=subprocess.PIPE, 
 t0 = time.time()
 toks, sent = [], 0
 REPEAT = int(os.environ.get("REPEAT", "1"))   # 2: a second request (its reset makes the stage print the first's split)
+# WARM=1 (2026-10-10): a different short question first (16 tokens out, not measured), then the measured request - the
+# measured prompt then pays no first-request costs (what a running server's second question sees)
+WARM = os.environ.get("WARM", "0") == "1"
+if WARM:
+    warm_ids = subprocess.run([sys.executable, str(Path(__file__).parent / "tok_chat.py"),
+                               "Explain in two sentences why the sky is blue."], capture_output=True, text=True,
+                              check=True).stdout.strip()
+warming = False
 for line in p.stdout:
     line = line.strip()
     if line.startswith("READY"):
         print(f"ready in {time.time() - t0:.0f} s", flush=True)
+        if WARM:
+            p.stdin.write(f"GEN 16 {warm_ids}\n"); p.stdin.flush(); warming = True
+            continue
         p.stdin.write(f"GEN {NEW} {ids}\n"); p.stdin.flush(); sent = 1
+    elif warming and (line.startswith("DONE") or line.startswith("ERR")):
+        print("warm-up: " + " ".join(line.split()[:5]), flush=True)
+        warming = False
+        p.stdin.write(f"GEN {NEW} {ids}\n"); p.stdin.flush(); sent = 1
+    elif warming:
+        continue
     elif line.startswith("T "):
         toks.append(int(line[2:]))
     elif line.startswith("DONE") or line.startswith("ERR"):

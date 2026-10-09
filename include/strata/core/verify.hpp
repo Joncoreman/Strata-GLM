@@ -273,6 +273,10 @@ public:
         uint64_t cache_blob = 0;
         void* ctx = nullptr;
         const uint8_t* (*blob)(void* ctx, int64_t layer, int64_t expert) = nullptr;
+        /// 2026-10-10: the blob when the RAM tier holds it, else nullptr - never reads a file (cheap)
+        const uint8_t* (*ram)(void* ctx, int64_t layer, int64_t expert) = nullptr;
+        /// 2026-10-10: a pointer no later lookup recycles (ExpertSource::blob_stable) - for threads that hold it
+        const uint8_t* (*stable)(void* ctx, int64_t layer, int64_t expert) = nullptr;
     };
     /// The prompt's cells [pos0, pos0 + n) in chunks of `chunk` tokens, the state written as commits would (KDA state
     /// and conv history, the latent cache, the indexer pool).  Per layer the attention runs in slices of 8 tokens (the

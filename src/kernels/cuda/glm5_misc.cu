@@ -134,6 +134,20 @@ void glm5_swiglu_rows(float* gu, int64_t rows, int n_ff, float limit, void* stre
     check("glm5_swiglu_rows");
 }
 
+static __global__ void copy_rows_kernel(const float* __restrict__ src, const int32_t* __restrict__ idx,
+                                        float* __restrict__ dst, int n_embd) {
+    const int r = blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < n_embd) dst[(size_t) idx[r] * n_embd + c] = src[(size_t) r * n_embd + c];
+}
+
+void glm5_copy_rows(const float* src, const int32_t* idx, float* dst, int n_rows, int n_embd, void* stream) {
+    if (n_rows <= 0) return;
+    copy_rows_kernel<<<dim3((unsigned) ((n_embd + 255) / 256), (unsigned) n_rows), 256, 0, (cudaStream_t) stream>>>(
+        src, idx, dst, n_embd);
+    check("glm5_copy_rows");
+}
+
 static __global__ void set2_kernel(int32_t* dst, int32_t a, int32_t b) { dst[0] = a; dst[1] = b; }
 
 void glm5_set2(int32_t* dst, int32_t a, int32_t b, void* stream) {
