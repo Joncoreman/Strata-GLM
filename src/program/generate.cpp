@@ -1641,6 +1641,16 @@ int main(int argc, char** argv) {
         SetUnhandledExceptionFilter(crash_trace_filter);
         AddVectoredExceptionHandler(1, crash_trace_vectored);
     }
+    // 2026-10-09, after Infernix (Apache-2.0, src/core/power_throttling.cpp): Windows' power throttling (EcoQoS) may
+    // run a process without a foreground window - a server the dashboard starts hidden - on slower cores at lower
+    // clocks; Infernix measured 37.6 -> 98.7 tok/s from exempting itself.  STRATA_POWER_THROTTLING=1 leaves it on.
+    if (std::getenv("STRATA_POWER_THROTTLING") == nullptr) {
+        PROCESS_POWER_THROTTLING_STATE pt{};
+        pt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        pt.StateMask = 0;   // controlled, and off: never throttled
+        SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof pt);
+    }
 #endif
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
