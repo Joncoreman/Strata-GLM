@@ -796,11 +796,25 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     float *kh = nullptr, *kgate = nullptr, *kbeta = nullptr, *kws = nullptr;
     uint16_t* kv16 = nullptr;
     float *ck_state = nullptr, *ck_state_ref = nullptr, *ck_conv = nullptr, *ck_y = nullptr;
+    // 2026-10-09: the mHC reads over a whole chunk (fused_mhc_read_batch) instead of slices of <= 8 tokens - their
+    // partial dots at the END of `parts` (the scratch below is carved before it).  STRATA_GLM5_PF_MHC=0: per slice.
+    static const bool pf_mhc_on = [] { const char* v = std::getenv("STRATA_GLM5_PF_MHC"); return !(v && v[0] == '0'); }();
+    float* parts_end = parts + (size_t) CK * N;
+    float *mhc_part = nullptr, *mhc_ss = nullptr;
+    {
+        const size_t np = (size_t) C * m.n_slices * 24, ns = (size_t) C * m.n_slices;
+        const size_t need = (np + ns + 63) & ~(size_t) 63;
+        if (pf_mhc_on && need < (size_t) CK * N / 2) {
+            mhc_part = parts_end - need;
+            mhc_ss = mhc_part + np;
+            parts_end = mhc_part;
+        }
+    }
     if (pf_blas_on) {
         if (pf_blas == nullptr && cublasCreate(&pf_blas) != CUBLAS_STATUS_SUCCESS) pf_blas = nullptr;
         if (pf_blas != nullptr) {
             float* p = parts;
-            float* const end = parts + (size_t) CK * N;
+            float* const end = parts_end;
             auto take = [&](size_t n) -> float* { float* r = p; p += (n + 63) & ~(size_t) 63; return p <= end ? r : nullptr; };
             float* ws = take(kBlasWs / 4);
             kb_f = take((size_t) m.NH * m.KVR * m.QK);
@@ -898,6 +912,31 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         a.fn = fn->native_data; a.scale = (const float*) sc->data; a.base = (const float*) bs->data; a.w_norm = (const float*) wn->data;
         a.part = m.part; a.ss_part = m.ssp;
         fused_mhc_read_multi(a, cs);
+        return true;
+    };
+    // tokens [s0, s0 + n) in one batched read (the same per-token arithmetic as mhc_read); per slice when off
+    auto mhc_read_all = [&](int64_t l, const char* which, bool apply, int64_t s0, int64_t n, const char* norm) -> bool {
+        if (mhc_part == nullptr) {
+            for (int64_t t0 = s0; t0 < s0 + n; t0 += SL)
+                if (!mhc_read(l, which, apply, t0, (int) std::min<int64_t>(SL, s0 + n - t0), norm)) return false;
+            return true;
+        }
+        const std::string w = std::string("hc_") + which + "_";
+        const WeightRef *fn = wfind(wt, l, (w + "fn.weight").c_str(), err), *sc = wfind(wt, l, (w + "scale.weight").c_str(), err),
+                        *bs = wfind(wt, l, (w + "base.weight").c_str(), err), *wn = wfind(wt, l, norm, err);
+        if (!fn || !sc || !bs || !wn || !fn->native_data) { if (err.empty()) err = "verify glm5 prefill: mHC weights"; return false; }
+        const bool attn_side = which[0] == 'a';
+        MhcBatch b;
+        b.R = Rt(s0); b.R_out = Rt(s0); b.apply = apply;
+        b.out_prev = boc + (size_t) s0 * N;
+        b.post_prev = (attn_side ? postF : postA) + s0 * 4; b.comb_prev = (attn_side ? combF : combA) + s0 * 16;
+        b.post_out = (attn_side ? postA : postF) + s0 * 4; b.comb_out = (attn_side ? combA : combF) + s0 * 16;
+        b.fn = fn->native_data; b.scale = (const float*) sc->data; b.base = (const float*) bs->data;
+        b.w_norm = (const float*) wn->data; b.y = xmc + (size_t) s0 * N;
+        b.part = mhc_part; b.ss_part = mhc_ss;
+        b.n_tok = (int) n; b.n_embd = (int) N; b.n_slices = m.n_slices;
+        b.rms_eps = m.rms_eps; b.hc_eps = m.hc_eps; b.iters = m.iters;
+        fused_mhc_read_batch(b, cs);
         return true;
     };
     // the window's attention block on slice [s0, s0 + n) of the chunk, as a commit of those tokens
@@ -1189,10 +1228,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         const int64_t DI = m.DI, H = m.H;
         for (int64_t b0 = 0; b0 < T; b0 += KSB) {
             const int64_t nb = std::min<int64_t>(KSB, T - b0);
-            for (int64_t s0 = b0; s0 < b0 + nb; s0 += SL) {
-                const int n = (int) std::min<int64_t>(SL, b0 + nb - s0);
-                if (!mhc_read(l, "attn", l > 0, s0, n, "attn_norm.weight")) return false;
-            }
+            if (!mhc_read_all(l, "attn", l > 0, b0, nb, "attn_norm.weight")) return false;
             const float* X = xmc + (size_t) b0 * N;
             if (!gemm_q8(wq, N, DI, X, nb, kq) || !gemm_q8(wk, N, DI, X, nb, kk) || !gemm_q8(wv, N, DI, X, nb, kv_) ||
                 !gemm_q8(wfa, N, 128, X, nb, kfa) || !gemm_q8(wga, N, 128, X, nb, kga) ||
@@ -1311,6 +1347,11 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             for (int64_t l = lb; l < le; ++l) {
                 if (kda_batch && m.kda_index[(size_t) l] >= 0) {
                     if (!kda_layer(l, T)) return false;
+                } else if (mhc_part != nullptr) {
+                    if (!mhc_read_all(l, "attn", l > 0, 0, T, "attn_norm.weight")) return false;
+                    lap(ms_norm, tp);
+                    for (int64_t s0 = 0; s0 < T; s0 += SL)
+                        if (!attn(l, s0, (int) std::min<int64_t>(SL, T - s0))) return false;
                 } else {
                     for (int64_t s0 = 0; s0 < T; s0 += SL) {
                         const int n = (int) std::min<int64_t>(SL, T - s0);
@@ -1318,10 +1359,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                     }
                 }
                 lap(ms_attn, tp);
-                for (int64_t s0 = 0; s0 < T; s0 += SL) {
-                    const int n = (int) std::min<int64_t>(SL, T - s0);
-                    if (!mhc_read(l, "ffn", true, s0, n, "ffn_norm.weight")) return false;
-                }
+                if (!mhc_read_all(l, "ffn", true, 0, T, "ffn_norm.weight")) return false;
                 lap(ms_norm, tp);
                 if (l < g.n_dense_layers) {
                     const WeightRef *wg = wfind(wt, l, "ffn_gate.weight", err), *wu = wfind(wt, l, "ffn_up.weight", err),

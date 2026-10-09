@@ -215,7 +215,146 @@ __global__ void mhc_exit_mean_kernel(MhcMulti m) {
     m.y[t][i] = v * (1.f / HC);
 }
 
+// ---- the prompt path's batched read (2026-10-09): mhc_down / mhc_up per token, the tokens at fixed strides ----
+__device__ __forceinline__ float fold_b(const MhcBatch& m, int t, int d, int i) {
+    const float* R = m.R + (size_t)t * HC * m.n_embd;
+    if (!m.apply) return R[d * m.n_embd + i];
+    const float* c = m.comb_prev + t * HC * HC + d * HC;
+    float v = m.out_prev[(size_t)t * m.n_embd + i] * m.post_prev[t * HC + d];
+#pragma unroll
+    for (int s = 0; s < HC; ++s) v += c[s] * R[s * m.n_embd + i];
+    return v;
+}
+
+// mhc_down_kernel for one (slice, token): grid (n_slices, n_tok)
+__global__ void __launch_bounds__(DOWN_THREADS) mhc_down_batch_kernel(MhcBatch m) {
+    __shared__ float xs[SLICE];
+    __shared__ float red[DOWN_THREADS / 32];
+    __shared__ float inv_rms;
+    const int slice = blockIdx.x, t = blockIdx.y;
+    const int base = slice * SLICE;
+    const int d = base / m.n_embd, i0 = base % m.n_embd;
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    const int D = HC * m.n_embd;
+    float ss = 0.f;
+    for (int j = threadIdx.x; j < D; j += DOWN_THREADS) {
+        const float v = fold_b(m, t, j / m.n_embd, j % m.n_embd);
+        ss += v * v;
+    }
+    ss = warp_sum(ss);
+    if (lane == 0) red[wid] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.f;
+        for (int w = 0; w < DOWN_THREADS / 32; ++w) s += red[w];
+        inv_rms = rsqrtf(s / (float)D + m.rms_eps);
+        if (slice == 0) m.ss_part[(size_t)t * m.n_slices] = s;
+    }
+    __syncthreads();
+    for (int j = threadIdx.x; j < SLICE; j += DOWN_THREADS) xs[j] = fold_b(m, t, d, i0 + j) * inv_rms;
+    __syncthreads();
+    const int nb_row = HC * m.n_embd / QK;
+    for (int r = wid; r < MIX; r += DOWN_THREADS / 32) {
+        const Q8_0 blk = static_cast<const Q8_0*>(m.fn)[(size_t)r * nb_row + base / QK + lane];
+        const float dw = __half2float(blk.d);
+        const float* x = xs + lane * QK;
+        float amax = 0.f;
+#pragma unroll
+        for (int k = 0; k < QK; ++k) amax = fmaxf(amax, fabsf(x[k]));
+        const float dx = amax / 127.0f;
+        int sumi = 0;
+        if (amax != 0.0f) {
+#pragma unroll
+            for (int k = 0; k < QK; ++k) sumi += (int)blk.qs[k] * (int)roundf(x[k] / dx);
+        }
+        float acc = dw * (dx * (float)sumi);
+        acc = warp_sum(acc);
+        if (lane == 0) m.part[((size_t)t * m.n_slices + slice) * MIX + r] = acc;
+    }
+}
+
+// mhc_up_kernel, the tokens at fixed strides
+__global__ void __launch_bounds__(UP_THREADS) mhc_up_batch_kernel(MhcBatch m) {
+    __shared__ float coef[HC + HC + HC * HC];
+    __shared__ float red[UP_THREADS / 32];
+    __shared__ float inv_y;
+    const int t = blockIdx.x;
+    const int n = m.n_embd;
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    __shared__ float mixes[MIX + 1];
+    if (threadIdx.x < MIX) {
+        float v = 0.f;
+        for (int s = 0; s < m.n_slices; ++s) v += m.part[((size_t)t * m.n_slices + s) * MIX + threadIdx.x];
+        mixes[threadIdx.x] = v;
+    }
+    __syncthreads();
+    if (wid == 0) {
+        if (lane < HC) {
+            coef[lane] = sigm(mixes[lane] * m.scale[0] + m.base[lane]) + m.hc_eps;
+            coef[HC + lane] = 2.f * sigm(mixes[HC + lane] * m.scale[1] + m.base[HC + lane]);
+        }
+        const int k = lane & (HC * HC - 1), d = k % HC, s = k / HC;
+        float c = mixes[2 * HC + k] * m.scale[2] + m.base[2 * HC + k];
+        float mx = -3.402823466e+38f;
+#pragma unroll
+        for (int j = 0; j < HC; ++j) mx = fmaxf(mx, __shfl_sync(0xffffffffu, c, s * HC + j));
+        c = expf(c - mx);
+        float sum = 0.f;
+#pragma unroll
+        for (int j = 0; j < HC; ++j) sum += __shfl_sync(0xffffffffu, c, s * HC + j);
+        c = c * (1.f / sum) + m.hc_eps;
+        for (int it = 0; it < m.iters; ++it) {
+            if (it > 0) {
+                float r = m.hc_eps;
+#pragma unroll
+                for (int j = 0; j < HC; ++j) r += __shfl_sync(0xffffffffu, c, s * HC + j);
+                c *= 1.f / r;
+            }
+            float q = m.hc_eps;
+#pragma unroll
+            for (int j = 0; j < HC; ++j) q += __shfl_sync(0xffffffffu, c, d + HC * j);
+            c *= 1.f / q;
+        }
+        if (lane < HC * HC) coef[2 * HC + d * HC + s] = c;
+    }
+    __syncthreads();
+    float* y = m.y + (size_t)t * n;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < n; i += UP_THREADS) {
+        float r[HC];
+#pragma unroll
+        for (int d = 0; d < HC; ++d) r[d] = fold_b(m, t, d, i);
+        if (m.apply) {
+#pragma unroll
+            for (int d = 0; d < HC; ++d) m.R_out[(size_t)t * HC * n + d * n + i] = r[d];
+        }
+        float b = 0.f;
+#pragma unroll
+        for (int h = 0; h < HC; ++h) b = fmaf(coef[h], r[h], b);
+        y[i] = b;
+        ss += b * b;
+    }
+    ss = warp_sum(ss);
+    if (lane == 0) red[wid] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.f;
+        for (int w = 0; w < UP_THREADS / 32; ++w) s += red[w];
+        inv_y = rsqrtf(s / (float)n + m.rms_eps);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += UP_THREADS) y[i] = y[i] * inv_y * m.w_norm[i];
+    if (threadIdx.x < HC) m.post_out[t * HC + threadIdx.x] = coef[HC + threadIdx.x];
+    if (threadIdx.x < HC * HC) m.comb_out[t * HC * HC + threadIdx.x] = coef[2 * HC + threadIdx.x];
+}
+
 }  // namespace
+
+void fused_mhc_read_batch(const MhcBatch& m, void* stream) {
+    cudaStream_t st = (cudaStream_t)stream;
+    mhc_down_batch_kernel<<<dim3((unsigned)m.n_slices, (unsigned)m.n_tok), DOWN_THREADS, 0, st>>>(m);
+    mhc_up_batch_kernel<<<(unsigned)m.n_tok, UP_THREADS, 0, st>>>(m);
+}
 
 bool fused_mhc_supported(int64_t n_embd, int64_t hc, int64_t mix_rows) {
     return hc == HC && mix_rows == MIX && n_embd > 0 && (HC * n_embd) % SLICE == 0 && n_embd % SLICE == 0;

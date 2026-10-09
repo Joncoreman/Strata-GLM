@@ -103,6 +103,32 @@ struct MhcMulti {
     int iters = 20;                            ///< hyper_connection.sinkhorn_iterations
 };
 
+/// The prompt path's mHC read over many tokens at once (2026-10-09): the same per-token arithmetic as MhcMulti's (bit for
+/// bit), the tokens laid out at fixed strides instead of a pointer array of <= kFusedGrMaxT, so a whole chunk is two
+/// launches.  Token t: R + t*4*n_embd (R_out the same layout), out_prev / y + t*n_embd, post/comb by t.  part holds
+/// [n_tok][n_slices][24] floats, ss_part [n_tok][n_slices].
+struct MhcBatch {
+    const float* R = nullptr;
+    float* R_out = nullptr;
+    bool apply = false;
+    const float* out_prev = nullptr;
+    const float* post_prev = nullptr;
+    const float* comb_prev = nullptr;
+    const void* fn = nullptr;
+    const float* scale = nullptr;
+    const float* base = nullptr;
+    const float* w_norm = nullptr;
+    float* y = nullptr;
+    float* post_out = nullptr;
+    float* comb_out = nullptr;
+    float* part = nullptr;
+    float* ss_part = nullptr;
+    int n_tok = 0, n_embd = 0, n_slices = 0;
+    float rms_eps = 1e-5f, hc_eps = 1e-6f;
+    int iters = 20;
+};
+void fused_mhc_read_batch(const MhcBatch& m, void* stream);
+
 bool fused_mhc_supported(int64_t n_embd, int64_t hc, int64_t mix_rows);
 int fused_mhc_slices(int64_t n_embd);
 /// Two kernels: the split projection (+ folded write) and the per-token epilogue (Sinkhorn, R', block norm).
