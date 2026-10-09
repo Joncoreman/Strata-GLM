@@ -175,8 +175,15 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // SiLU here.  The dots are the ones iq256_gu_rows uses.  STRATA_GLM_IQ256=0 keeps ggml's per-token dots.
     static const bool glm_mt = [] { const char* v = std::getenv("STRATA_GLM_IQ256"); return v == nullptr || std::atoi(v) != 0; }();
     // two tokens at least even under STRATA_IQ_MT_MIN=1 (the 3060 stage's setting): one token is slower here than
-    // ggml's dot (the stage's round trip 22 -> 33 ms, 2026-10-09)
-    if (f.swiglu_limit > 0.f && glm_mt && avx2 && !cpu512 && nt >= std::max(mt_min, 2) && nt <= 8 && iq256_supported(f.gu_type)) {
+    // ggml's dot (the stage's round trip 22 -> 33 ms, 2026-10-09).  STRATA_GLM_IQ256_ONE=1 (2026-10-10): one token too
+    // (an AVX-VNNI CPU runs these rows with vpdpbusd; ggml's IQ3_S / IQ4_XS dots stay on maddubs)
+    // On by default where the CPU has AVX-VNNI (Core Ultra 9 285K: decode 13.9 / 14.7 -> 15.1 / 15.5 tok/s); =0 / =1 force
+    static const int glm_min = [] {
+        const char* v = std::getenv("STRATA_GLM_IQ256_ONE");
+        const bool one = v ? v[0] == '1' : cpu_avxvnni_ok();
+        return one ? 1 : 2;
+    }();
+    if (f.swiglu_limit > 0.f && glm_mt && avx2 && !cpu512 && nt >= std::max(mt_min, glm_min) && nt <= 8 && iq256_supported(f.gu_type)) {
         thread_local std::vector<float> gb, ub;
         const size_t span = (size_t) r1;
         if (gb.size() < span * nt) { gb.resize(span * nt); ub.resize(span * nt); }
@@ -225,7 +232,12 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     // clamped-SwiGLU models so the Qwen packs keep their rounding.  STRATA_GLM_IQ256=0 keeps ggml's dots.
     static const bool glm_mt = [] { const char* v = std::getenv("STRATA_GLM_IQ256"); return v == nullptr || std::atoi(v) != 0; }();
     static const bool cpu512 = cpu_avx512_ok();
-    if (f.swiglu_limit > 0.f && glm_mt && !cpu512 && nt >= std::max(mt_min, 2) && iq256_supported(f.d_type) &&
+    static const int glm_min = [] {   // as in native_gu_rows: one token too where the CPU has AVX-VNNI
+        const char* v = std::getenv("STRATA_GLM_IQ256_ONE");
+        const bool one = v ? v[0] == '1' : cpu_avxvnni_ok();
+        return one ? 1 : 2;
+    }();
+    if (f.swiglu_limit > 0.f && glm_mt && !cpu512 && nt >= std::max(mt_min, glm_min) && iq256_supported(f.d_type) &&
         std::getenv("STRATA_NO_IQ256") == nullptr) {
         iq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
