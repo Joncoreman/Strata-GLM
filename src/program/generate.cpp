@@ -12155,7 +12155,8 @@ int main(int argc, char** argv) {
         // Plan v0.3 P6: the VRAM tier follows the conversation.  Candidates are missing experts routed at least
         // twice (decayed); each is paired with its layer's least-routed resident expert and swapped when it was
         // routed clearly more often.  Copies run between rounds, when the GPU is idle.
-        auto adapt = [&]() -> bool {
+        // l_end: only the layers below it (the multinode head's front layers while it waits for its stage; -1 = all)
+        auto adapt = [&](int64_t l_end = -1) -> bool {
             const Clock::time_point ta = Clock::now();
             ++adapt_rounds;
             // STRATA_TRACE_ADAPT: why an adapt round did or did not swap.  Default off, one getenv, and it
@@ -12172,7 +12173,8 @@ int main(int argc, char** argv) {
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
-            for (int64_t l = 0; l < g.n_layers; ++l) {
+            const int64_t l_stop = l_end < 0 ? g.n_layers : std::min<int64_t>(l_end, g.n_layers);
+            for (int64_t l = 0; l < l_stop; ++l) {
                 cand.clear();
                 vict.clear();
                 const float* u = drive.d.usage.data() + l * g.n_expert;
@@ -12468,6 +12470,23 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: glm5-next ready (context %lld, prompt chunks of %d)\n",
                          (long long) o.max_context, pf_chunk);
             int64_t rounds_all = 0;
+            // 2026-10-09: with a stage link the adaptive round runs while the head waits for its first stage - the
+            // head's front layers [0, K1) are done for this window and the next window waits for the round's copies,
+            // so only those layers swap there (the tail layers [Kn, end) still run after the reply).
+            // STRATA_MN_ADAPT_OVERLAP=0: the round after the window, as before.
+            const bool adapt_overlap = !gl_links.empty() && !split_at.empty() &&
+                                       [] { const char* v = std::getenv("STRATA_MN_ADAPT_OVERLAP"); return v == nullptr || std::atoi(v) != 0; }();
+            bool adapt_armed = false, adapt_failed = false;
+            if (adapt_overlap) {
+                gl_links.front()->on_wait = [&] {
+                    if (!adapt_armed) return;
+                    adapt_armed = false;
+                    if (!adapt(split_at.front())) adapt_failed = true;
+                };
+                std::fprintf(stderr, "strata serve: the adaptive round runs while the head waits for its stage "
+                                     "(layers below %lld; STRATA_MN_ADAPT_OVERLAP=0 to run it after the window)\n",
+                             (long long) split_at.front());
+            }
             for (;;) {
                 std::string line;
                 {
@@ -12584,8 +12603,15 @@ int main(int argc, char** argv) {
                     if (pos + T > o.max_context) { finish = "length"; break; }
                     drive.d.layers = 0; drive.d.experts = 0; drive.d.failed = false;
                     apply_pending(!adapt_nowait());
+                    const bool adapt_due = !drive.d.usage.empty() && ((rounds_all + 1) % o.adapt_every) == 0;
+                    adapt_armed = adapt_overlap && adapt_due;
                     if (!ver.run(T, win.data(), pos, gl_pool, gl_user, outw.data(), err) || drive.d.failed) {
                         std::printf("ERR %s\n", err.empty() ? "the expert pool failed" : err.c_str());
+                        std::fflush(stdout);
+                        return 1;
+                    }
+                    if (adapt_failed) {
+                        std::printf("ERR an adaptive refill failed\n");
                         std::fflush(stdout);
                         return 1;
                     }
@@ -12605,7 +12631,9 @@ int main(int argc, char** argv) {
                         eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) t) != o.eos_ids.end();
                     }
                     std::fflush(stdout);
-                    if (!drive.d.usage.empty() && (rounds_all % o.adapt_every) == 0 && !adapt()) return 1;
+                    // the round after the window: without the overlap, or when the window never reached the stage
+                    if (adapt_due && (!adapt_overlap || adapt_armed) && !adapt()) return 1;
+                    adapt_armed = false;
                     if (eos) { finish = "stop"; break; }
                     xt = outw[(size_t) a];
                     pos += a + 1;
@@ -12656,9 +12684,13 @@ int main(int argc, char** argv) {
                     strata::core::StageLink& lk = *gl_links[r];
                     if (lk.windows > 0)
                         std::fprintf(stderr, "strata serve: time stage %zu: %lld windows; per window round trip %.2f ms "
-                                             "(the stage's compute included)\n", r + 1, (long long) lk.windows,
-                                     lk.ms_net / (double) lk.windows);
+                                             "(the stage's compute included; the head's work meanwhile %.2f ms, then still "
+                                             "waiting %.2f ms)\n", r + 1,
+                                     (long long) lk.windows, lk.ms_net / (double) lk.windows,
+                                     lk.ms_on_wait / (double) lk.windows, lk.ms_after_wait / (double) lk.windows);
                     lk.ms_net = 0;
+                    lk.ms_on_wait = 0;
+                    lk.ms_after_wait = 0;
                     lk.windows = 0;
                 }
             }

@@ -320,7 +320,20 @@ bool StageLink::window(int T, int64_t pos0, const int32_t* tokens, const float* 
     std::memcpy(head.data() + 16, tokens, sizeof(int32_t) * (size_t) T);
     const size_t hb = sizeof(float) * (size_t) T * (size_t) h_.hf;
     std::vector<uint8_t> r;
-    if (!call(StageMsg::Window, head.data(), head.size(), hand_in, hb, r, err)) return false;
+    if (!on_wait) {
+        if (!call(StageMsg::Window, head.data(), head.size(), hand_in, hb, r, err)) return false;
+    } else {   // as call(), with the head's own work between the request and the reply
+        if (!s_.send(StageMsg::Window, head.data(), head.size(), hand_in, hb, err)) return false;
+        const auto tw = std::chrono::steady_clock::now();
+        on_wait();
+        const auto ta = std::chrono::steady_clock::now();
+        ms_on_wait += std::chrono::duration<double, std::milli>(ta - tw).count();
+        StageMsg rt = StageMsg::Err;
+        if (!s_.recv(rt, r, err)) return false;
+        ms_after_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ta).count();
+        if (rt == StageMsg::Err) { err = "the remote stage: " + std::string(r.begin(), r.end()); return false; }
+        if (rt != StageMsg::Ok) { err = "stage link: an unexpected reply"; return false; }
+    }
     if (r.size() != hb) { err = "stage link: a Window reply of the wrong size"; return false; }
     std::memcpy(hand_out, r.data(), hb);
     pending_commit_ = 0;

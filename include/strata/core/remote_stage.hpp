@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -88,6 +89,11 @@ public:
 
     double ms_net = 0;     ///< wall time of the Window calls (the stage's compute included)
     int64_t windows = 0;
+    /// called once per Window after the request is sent and before the reply is read: the head's own work that fits
+    /// in the stage's compute time (2026-10-09, glm5-next: the adaptive round of the head's front layers)
+    std::function<void()> on_wait;
+    double ms_on_wait = 0;  ///< wall time spent in on_wait (inside ms_net)
+    double ms_after_wait = 0;  ///< the reply's wait after on_wait returned (0 = on_wait outlasted the stage)
     double ms_commit = 0;  ///< wall time of the Commit calls (one round trip each)
     int64_t commits = 0;
     const StageSocket& socket() const { return s_; }
