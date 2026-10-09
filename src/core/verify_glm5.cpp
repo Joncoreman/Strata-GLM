@@ -1474,61 +1474,324 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         acc += std::chrono::duration<double, std::milli>(t1 - t0).count();
         t0 = t1;
     };
-    try {
-        for (int64_t c0 = 0; c0 < n_all; c0 += C) {
-            const int64_t T = std::min<int64_t>(C, n_all - c0);
-            auto tp = std::chrono::steady_clock::now();
-            for (int64_t t = 0; t < T; ++t) qsa_step_fill(h_steps.data() + (size_t) t * kStepCount, pos0 + c0 + t, s);
-            cudaMemcpyAsync(tokc, tokens + c0, (size_t) T * 4, cudaMemcpyHostToDevice, cs);
-            cudaMemcpyAsync(stepc, h_steps.data(), (size_t) T * kStepCount * 4, cudaMemcpyHostToDevice, cs);
-            if (lb > 0) {
-                hand_parts(hand_in, nullptr, T);
-            } else {
-                const NativeEmbed* ne = native_embed();
-                if (ne == nullptr) { err = "verify glm5 prefill: needs the native token embedding"; return false; }
-                ne->gather_dev(tokc, T, embc, cs);
-                broadcast_streams(embc, Rc, N, (int) HC, (int) T, cs);
-            }
-            lap(ms_ffn, tp);
-            for (int64_t l = lb; l < le; ++l) {
-                if (kda_batch && m.kda_index[(size_t) l] >= 0) {
-                    if (!kda_layer(l, T)) return false;
-                } else if (mhc_part != nullptr) {
-                    if (!mhc_read_all(l, "attn", l > 0, 0, T, "attn_norm.weight")) return false;
-                    lap(ms_norm, tp);
-                    if (mla_sb > 0 && m.dsa_index[(size_t) l] >= 0) {
-                        if (!mla_layer(l, T)) return false;
-                    } else {
-                        for (int64_t s0 = 0; s0 < T; s0 += SL)
-                            if (!attn(l, s0, (int) std::min<int64_t>(SL, T - s0))) return false;
-                    }
+    // ---- the layer walk (2026-10-09, after Infernix's prefill_walk): a prompt of more than one chunk goes layer by layer
+    // over all its chunks, so each layer's experts are streamed ONCE per group of PG tokens instead of once per chunk
+    // (4,400 tokens in 4,096 + 304: 19,835 blobs instead of ~10,700).  Between layers a chunk's state (the hand-off
+    // layout: R, the block output, post/comb) waits in page-locked host memory.  Per chunk: attention, the FFN's mHC
+    // read, the router and the shared expert (into boc), the q8_1 inputs to the host; per layer then: every routed
+    // expert once over the group's tokens, its outputs added to the shared ones in expert order (another summation
+    // order than native_moe_combine_multi: not bitwise the chunk path).  Group: PG <= C * HC tokens (the sums live
+    // in Rc); the q8_1 inputs, the per-token entry lists and the expert outputs share `parts`.
+    // One PC only (layers 0..n), STRATA_GLM5_PF_WALK=0: the chunk path.
+    static const bool pf_walk = [] { const char* v = std::getenv("STRATA_GLM5_PF_WALK"); return !(v && v[0] == '0'); }();
+    // PG halves (in whole chunks) until its page-locked state fits beside the pinned RAM tier (12,795 tokens' 1 GiB did
+    // not beside 99 GiB, 2026-10-09)
+    int64_t PG = std::min<int64_t>(n_all, C * HC);
+    const size_t q8row = (size_t) (N / 32) * 36;
+    int64_t q8f = 0, E_cap = 0;
+    const int64_t csrf = (int64_t) ((((size_t) 2 * (4 * CK + 1)) + 63) & ~(size_t) 63);  // 2 halves of the entry lists
+    float* hostS = nullptr;
+    uint8_t* hq8 = nullptr;
+    int32_t* hids = nullptr;
+    float* hw = nullptr;
+    int32_t* pcsr = nullptr;   // page-locked [2][u_tok E | u_off E+1 | e_row E | e_w E] (E = CK)
+    struct HostFree {
+        void* p[5];
+        ~HostFree() { for (void* q : p) if (q) cudaFreeHost(q); }
+    } host_free{{nullptr, nullptr, nullptr, nullptr, nullptr}};
+    bool walk = pf_walk && lb == 0 && le == g.n_layers && n_all > C;
+    if (walk) {
+        auto halloc = [&](size_t bytes, int i) -> void* {
+            void* p = nullptr;
+            if (cudaHostAlloc(&p, bytes, cudaHostAllocDefault) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+            host_free.p[i] = p;
+            return p;
+        };
+        auto hfree = [&] { for (void*& q : host_free.p) { if (q) cudaFreeHost(q); q = nullptr; } };
+        walk = false;
+        for (; PG >= 2 * C || PG == n_all; PG = std::max<int64_t>(C, (PG / 2 + C - 1) / C * C)) {
+            q8f = (int64_t) (((size_t) PG * q8row / 4 + 63) & ~(size_t) 63);   // floats of parts: the q8_1 inputs
+            E_cap = std::min<int64_t>(CK, (CK * N - q8f - csrf) / N);           // expert output rows a launch
+            hostS = (float*) halloc((size_t) PG * HF * 4, 0);
+            hq8 = (uint8_t*) halloc((size_t) PG * q8row, 1);
+            hids = (int32_t*) halloc((size_t) PG * K * 4, 2);
+            hw = (float*) halloc((size_t) PG * K * 4, 3);
+            pcsr = (int32_t*) halloc((size_t) 2 * (4 * CK + 1) * 4, 4);
+            if (hostS && hq8 && hids && hw && pcsr && E_cap >= std::min<int64_t>(PG, C)) { walk = true; break; }
+            hfree();
+            if (PG <= 2 * C) break;
+        }
+        if (std::getenv("STRATA_GLM5_PF_PROF") != nullptr)
+            std::fprintf(stderr, "strata glm5 prefill: layer walk %s (groups of %lld tokens, %lld expert rows a launch, %zu MiB "
+                         "page-locked)\n", walk ? "on" : "off (no page-locked memory)", (long long) PG, (long long) E_cap,
+                         ((size_t) PG * HF * 4 + (size_t) PG * q8row + (size_t) PG * K * 8) >> 20);
+    }
+    // walk: the chunk's router, shared expert (into boc) and q8_1 inputs; ids / weights / inputs to the host at token off
+    auto moe_route = [&](int64_t l, int64_t T, int64_t off) -> bool {
+        const WeightRef *wr = wfind(wt, l, "ffn_gate_inp.weight", err), *wb = wfind(wt, l, "exp_probs_b.bias", err),
+                        *wsg = wfind(wt, l, "ffn_gate_shexp.weight", err), *wsu = wfind(wt, l, "ffn_up_shexp.weight", err),
+                        *wsd = wfind(wt, l, "ffn_down_shexp.weight", err);
+        if (!wr || !wb || !wsg || !wsu || !wsd) return false;
+        glm5_f32_gemv((const float*) wr->data, xmc, logc, (int) N, (int) NE, (int) T, 1.0f, cs);
+        router_sigmoid_topk(logc, (const float*) wb->data, (int) T, (int) NE, (int) K, m.wscale, idsc, wc, cs);
+        NativeSharedWeights nsw;
+        nsw.gate_type = wsg->native_type; nsw.gate_data = wsg->native_data; nsw.up_type = wsu->native_type;
+        nsw.up_data = wsu->native_data; nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data; nsw.q8_1 = m.q8;
+        for (int64_t s0 = 0; s0 < T; s0 += SL) {
+            const int n = (int) std::min<int64_t>(SL, T - s0);
+            shared_expert_multi(n, xmc + (size_t) s0 * N, nullptr, nsw, nullptr, sh_gate_, sh_up_, sh_g_,
+                                boc + (size_t) s0 * N, N, m.NFF, cs, nullptr, 0, m.clamp_sh);
+        }
+        quantize_q8_1_rows(xmc, T, N, q8c, cs);
+        cudaMemcpyAsync(hids + (size_t) off * K, idsc, (size_t) T * K * 4, cudaMemcpyDeviceToHost, cs);
+        cudaMemcpyAsync(hw + (size_t) off * K, wc, (size_t) T * K * 4, cudaMemcpyDeviceToHost, cs);
+        cudaMemcpyAsync(hq8 + (size_t) off * q8row, q8c, (size_t) T * q8row, cudaMemcpyDeviceToHost, cs);
+        return true;
+    };
+    // walk: layer l's routed experts over the group's Pn tokens, each streamed once; the sums (shared + routed, in the
+    // host's block-output slots) go through Rc
+    std::vector<std::pair<int32_t, int32_t>> ent;   // (token, entry) of a launch, sorted by token
+    double w_plan_ms = 0, w_enq_ms = 0;   // STRATA_GLM5_PF_PROF: the walk's host-side parts
+    auto moe_walk = [&](int64_t l, int64_t Pn) -> bool {
+        if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "verify glm5 prefill: the router failed on the GPU"; return false; }
+        float* acc = Rc;
+        uint8_t* q8a = (uint8_t*) parts;
+        int32_t* dcsr = (int32_t*) (parts + q8f);
+        float* rows = parts + q8f + csrf;
+        cudaMemcpyAsync(q8a, hq8, (size_t) Pn * q8row, cudaMemcpyHostToDevice, cs);
+        hand_copy(acc, hostS, nullptr, HC * N, N, Pn);
+        for (auto& v : by) v.clear();
+        used.clear();
+        for (int64_t i = 0; i < Pn * K; ++i) {
+            const int32_t e = hids[(size_t) i];
+            if (e < 0 || e >= NE) continue;
+            if (by[(size_t) e].empty()) used.push_back(e);
+            by[(size_t) e].push_back((int32_t) i);
+        }
+        const auto& fm = lay.fmt[(size_t) l];
+        NativeExpertLayout L = native_expert_layout(fm.gu_type, fm.d_type, fm.n_embd, fm.n_ff);
+        L.swiglu_limit = m.clamp_exp;
+        const uint64_t bb = lay.blob_bytes(l);
+        const size_t half_i = (size_t) 4 * CK + 1;
+        for (size_t bi = 0, b0 = 0; b0 < used.size(); ++bi) {
+            const int hf = (int) (bi & 1);
+            int nb = 0;
+            int64_t ne_ = 0;
+            while (b0 + (size_t) nb < used.size() && nb < B &&
+                   ne_ + (int64_t) by[(size_t) used[b0 + (size_t) nb]].size() <= E_cap)
+                ne_ += (int64_t) by[(size_t) used[b0 + (size_t) nb++]].size();
+            if (nb == 0) { err = "verify glm5 prefill: an expert's tokens exceed the walk's launch"; return false; }
+            uint8_t* dstage = stage + (size_t) hf * B * max_blob;
+            uint8_t* hstage = pin + (size_t) hf * B * max_blob;
+            int32_t* start = pplan + (size_t) hf * plan_n;
+            int32_t* dst = start + (B + 1);
+            int32_t* tok = dst + CK;
+            int32_t* count = tok + CK;
+            unsigned long long* hptr = pptr + (size_t) hf * B;
+            int32_t* hc = pcsr + (size_t) hf * half_i;   // u_tok | u_off | e_row | e_w
+            int32_t *u_tok = hc, *u_off = hc + CK, *e_row = hc + 2 * CK + 1;
+            float* e_w = (float*) (hc + 3 * CK + 1);
+            const auto tc = std::chrono::steady_clock::now();
+            cudaEventSynchronize(ev_copied[hf]);
+            cudaEventSynchronize(ev_done[hf]);
+            pf_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count();
+            const auto tpl = std::chrono::steady_clock::now();
+            int ns = 0;
+            int32_t stream_e[32];
+            int entries = 0;
+            ent.clear();
+            for (int j = 0; j < nb; ++j) {
+                const int32_t e = used[b0 + (size_t) j];
+                const int32_t slot = f.host_res ? f.host_res[(size_t) l * NE + e] : -1;
+                if (slot >= 0) {
+                    hptr[j] = (unsigned long long) (f.cache_base + (f.slot_off ? (size_t) f.slot_off[slot]
+                                                                                : (size_t) slot * f.cache_blob));
+                    ++prefill_resident;
                 } else {
-                    for (int64_t s0 = 0; s0 < T; s0 += SL) {
-                        const int n = (int) std::min<int64_t>(SL, T - s0);
-                        if (!mhc_read(l, "attn", l > 0, s0, n, "attn_norm.weight") || !attn(l, s0, n)) return false;
-                    }
+                    hptr[j] = (unsigned long long) (dstage + (size_t) ns * max_blob);
+                    stream_e[ns++] = e;
+                    ++prefill_streamed;
                 }
-                lap(ms_attn, tp);
-                if (!mhc_read_all(l, "ffn", true, 0, T, "ffn_norm.weight")) return false;
-                lap(ms_norm, tp);
-                if (l < g.n_dense_layers) {
-                    const WeightRef *wg = wfind(wt, l, "ffn_gate.weight", err), *wu = wfind(wt, l, "ffn_up.weight", err),
-                                    *wd = wfind(wt, l, "ffn_down.weight", err);
-                    if (!wg || !wu || !wd) return false;
-                    NativeSharedWeights nw;
-                    nw.gate_type = wg->native_type; nw.gate_data = wg->native_data; nw.up_type = wu->native_type;
-                    nw.up_data = wu->native_data; nw.down_type = wd->native_type; nw.down_data = wd->native_data; nw.q8_1 = m.q8;
-                    for (int64_t s0 = 0; s0 < T; s0 += SL) {
-                        const int n = (int) std::min<int64_t>(SL, T - s0);
-                        shared_expert_multi(n, xmc + (size_t) s0 * N, nullptr, nw, nullptr, m.dg, m.du, sh_g_,
-                                            boc + (size_t) s0 * N, N, m.NFFD, cs, nullptr, 0, m.clamp_sh);
-                    }
-                } else if (!moe(l, T)) {
-                    return false;
+                start[j] = entries;
+                for (int32_t i : by[(size_t) e]) {
+                    dst[entries] = entries; tok[entries] = (int32_t) (i / K);
+                    e_w[entries] = hw[(size_t) i];
+                    ent.emplace_back((int32_t) (i / K), entries);
+                    ++entries;
                 }
-                lap(ms_ffn, tp);
             }
-            if (le < g.n_layers) hand_parts(nullptr, hand_out, T);   // synced below, before the caller sends it
+            start[nb] = entries;
+            count[0] = nb;
+            std::stable_sort(ent.begin(), ent.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            int nu = 0;
+            std::vector<float> w_sorted((size_t) entries);
+            for (int j = 0; j < entries; ++j) {
+                if (j == 0 || ent[(size_t) j].first != ent[(size_t) j - 1].first) { u_tok[nu] = ent[(size_t) j].first; u_off[nu++] = j; }
+                e_row[j] = ent[(size_t) j].second;
+                w_sorted[(size_t) j] = e_w[ent[(size_t) j].second];
+            }
+            u_off[nu] = entries;
+            std::memcpy(e_w, w_sorted.data(), (size_t) entries * 4);
+            w_plan_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tpl).count();
+            if (ns > 0) {
+                bool failed = false;
+                std::vector<std::thread> th;
+                th.reserve((size_t) ns);
+                std::atomic<int64_t> us_blob{0}, us_copy{0};
+                const auto tf = std::chrono::steady_clock::now();
+                std::atomic<bool> direct[32];
+                for (int k = 0; k < ns; ++k) direct[k] = false;
+                for (int k = 0; k < ns; ++k)
+                    th.emplace_back([&, k] {
+                        const auto a = std::chrono::steady_clock::now();
+                        const uint8_t* hb = f.blob ? f.blob(f.ctx, l, stream_e[k]) : nullptr;
+                        const auto b = std::chrono::steady_clock::now();
+                        if (hb == nullptr) { failed = true; return; }
+                        cudaPointerAttributes at{};
+                        if (pf_direct && cudaPointerGetAttributes(&at, hb) == cudaSuccess && at.type == cudaMemoryTypeHost) {
+                            hsrc[k] = hb;
+                            direct[k] = true;
+                        } else {
+                            cudaGetLastError();
+                            std::memcpy(hstage + (size_t) k * max_blob, hb, (size_t) bb);
+                        }
+                        us_blob += std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+                        us_copy += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - b).count();
+                    });
+                for (auto& t : th) t.join();
+                pf_fetch_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count();
+                pf_blob_thread_ms += (double) us_blob.load() / 1000.0;
+                pf_copy_thread_ms += (double) us_copy.load() / 1000.0;
+                if (failed) { err = "verify glm5 prefill: an expert of layer " + std::to_string(l) + " is in no tier"; return false; }
+                for (int k = 0; k < ns;) {
+                    if (direct[k]) {
+                        cudaMemcpyAsync(dstage + (size_t) k * max_blob, hsrc[k], (size_t) bb, cudaMemcpyHostToDevice, copy_s);
+                        ++prefill_direct;
+                        ++k;
+                        continue;
+                    }
+                    int e = k + 1;
+                    while (e < ns && !direct[e]) ++e;
+                    cudaMemcpyAsync(dstage + (size_t) k * max_blob, hstage + (size_t) k * max_blob,
+                                    (size_t) (e - k - 1) * max_blob + bb, cudaMemcpyHostToDevice, copy_s);
+                    k = e;
+                }
+            }
+            cudaEventRecord(ev_copied[hf], copy_s);
+            prefill_ms_copy += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count();
+            int32_t* dpl = dplan + (size_t) hf * plan_n;
+            unsigned long long* dp = dptr + (size_t) hf * B;
+            int32_t* dc = dcsr + (size_t) hf * half_i;
+            const auto tq = std::chrono::steady_clock::now();
+            cudaMemcpyAsync(dpl, start, (size_t) (nb + 1) * 4, cudaMemcpyHostToDevice, cs);
+            cudaMemcpyAsync(dpl + (B + 1), dst, (size_t) entries * 4, cudaMemcpyHostToDevice, cs);
+            cudaMemcpyAsync(dpl + (B + 1) + CK, tok, (size_t) entries * 4, cudaMemcpyHostToDevice, cs);
+            cudaMemcpyAsync(dpl + (B + 1) + 2 * CK, count, 4, cudaMemcpyHostToDevice, cs);
+            cudaMemcpyAsync(dp, hptr, (size_t) nb * 8, cudaMemcpyHostToDevice, cs);
+            cudaMemcpyAsync(dc, hc, half_i * 4, cudaMemcpyHostToDevice, cs);
+            cudaStreamWaitEvent(cs, ev_copied[hf], 0);
+            native_expert_grouped(L, dp, dpl, dpl + (B + 1) + 2 * CK, dpl + (B + 1), dpl + (B + 1) + CK, B, CK,
+                                  q8a, gscratch, rows, cs);
+            glm5_scatter_add(rows, dc, dc + CK, dc + 2 * CK + 1, (const float*) (dc + 3 * CK + 1), nu, acc, (int) N, cs);
+            cudaEventRecord(ev_done[hf], cs);
+            w_enq_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tq).count();
+            b0 += (size_t) nb;
+        }
+        hand_copy(acc, nullptr, hostS, HC * N, N, Pn);
+        kbvb_layer = -1;   // parts (where kb_f / vb_f are carved) held this layer's expert outputs
+        return true;
+    };
+    // the chunk's steps on the host (h_steps) and the device (stepc); its tokens' embedding into Rc when `embed`
+    auto chunk_begin = [&](int64_t c0, int64_t T, bool embed) -> bool {
+        for (int64_t t = 0; t < T; ++t) qsa_step_fill(h_steps.data() + (size_t) t * kStepCount, pos0 + c0 + t, s);
+        cudaMemcpyAsync(stepc, h_steps.data(), (size_t) T * kStepCount * 4, cudaMemcpyHostToDevice, cs);
+        if (embed) {
+            cudaMemcpyAsync(tokc, tokens + c0, (size_t) T * 4, cudaMemcpyHostToDevice, cs);
+            const NativeEmbed* ne = native_embed();
+            if (ne == nullptr) { err = "verify glm5 prefill: needs the native token embedding"; return false; }
+            ne->gather_dev(tokc, T, embc, cs);
+            broadcast_streams(embc, Rc, N, (int) HC, (int) T, cs);
+        }
+        return true;
+    };
+    // layer l's attention block and the FFN's mHC read for the chunk in Rc (xmc = the FFN input after it)
+    auto attn_side = [&](int64_t l, int64_t T, std::chrono::steady_clock::time_point& tp) -> bool {
+        if (kda_batch && m.kda_index[(size_t) l] >= 0) {
+            if (!kda_layer(l, T)) return false;
+        } else if (mhc_part != nullptr) {
+            if (!mhc_read_all(l, "attn", l > 0, 0, T, "attn_norm.weight")) return false;
+            lap(ms_norm, tp);
+            if (mla_sb > 0 && m.dsa_index[(size_t) l] >= 0) {
+                if (!mla_layer(l, T)) return false;
+            } else {
+                for (int64_t s0 = 0; s0 < T; s0 += SL)
+                    if (!attn(l, s0, (int) std::min<int64_t>(SL, T - s0))) return false;
+            }
+        } else {
+            for (int64_t s0 = 0; s0 < T; s0 += SL) {
+                const int n = (int) std::min<int64_t>(SL, T - s0);
+                if (!mhc_read(l, "attn", l > 0, s0, n, "attn_norm.weight") || !attn(l, s0, n)) return false;
+            }
+        }
+        lap(ms_attn, tp);
+        if (!mhc_read_all(l, "ffn", true, 0, T, "ffn_norm.weight")) return false;
+        lap(ms_norm, tp);
+        return true;
+    };
+    auto dense_ffn = [&](int64_t l, int64_t T) -> bool {
+        const WeightRef *wg = wfind(wt, l, "ffn_gate.weight", err), *wu = wfind(wt, l, "ffn_up.weight", err),
+                        *wd = wfind(wt, l, "ffn_down.weight", err);
+        if (!wg || !wu || !wd) return false;
+        NativeSharedWeights nw;
+        nw.gate_type = wg->native_type; nw.gate_data = wg->native_data; nw.up_type = wu->native_type;
+        nw.up_data = wu->native_data; nw.down_type = wd->native_type; nw.down_data = wd->native_data; nw.q8_1 = m.q8;
+        for (int64_t s0 = 0; s0 < T; s0 += SL) {
+            const int n = (int) std::min<int64_t>(SL, T - s0);
+            shared_expert_multi(n, xmc + (size_t) s0 * N, nullptr, nw, nullptr, m.dg, m.du, sh_g_,
+                                boc + (size_t) s0 * N, N, m.NFFD, cs, nullptr, 0, m.clamp_sh);
+        }
+        return true;
+    };
+    try {
+        if (walk) {
+            int64_t last_c0 = 0, last_T = 0, last_g0 = 0;
+            for (int64_t g0 = 0; g0 < n_all; g0 += PG) {
+                const int64_t Pn = std::min<int64_t>(PG, n_all - g0);
+                for (int64_t l = lb; l < le; ++l) {
+                    for (int64_t c0 = g0; c0 < g0 + Pn; c0 += C) {
+                        const int64_t T = std::min<int64_t>(C, g0 + Pn - c0);
+                        float* hs = hostS + (size_t) (c0 - g0) * HF;
+                        auto tp = std::chrono::steady_clock::now();
+                        if (!chunk_begin(c0, T, l == lb)) return false;
+                        if (l > lb) hand_parts(hs, nullptr, T);
+                        lap(ms_ffn, tp);                        if (!attn_side(l, T, tp)) return false;
+                        if (l < g.n_dense_layers ? !dense_ffn(l, T) : !moe_route(l, T, c0 - g0)) return false;
+                        hand_parts(nullptr, hs, T);
+                        lap(ms_ffn, tp);
+                        last_c0 = c0; last_T = T; last_g0 = g0;
+                    }
+                    if (l >= g.n_dense_layers) {
+                        auto tp = std::chrono::steady_clock::now();
+                        if (!moe_walk(l, Pn)) return false;
+                        lap(ms_ffn, tp);
+                    }
+                }
+            }
+            hand_parts(hostS + (size_t) (last_c0 - last_g0) * HF, nullptr, last_T);   // the caller reads the last chunk
+        } else {
+            for (int64_t c0 = 0; c0 < n_all; c0 += C) {
+                const int64_t T = std::min<int64_t>(C, n_all - c0);
+                auto tp = std::chrono::steady_clock::now();
+                if (!chunk_begin(c0, T, lb == 0)) return false;
+                if (lb > 0) hand_parts(hand_in, nullptr, T);
+                lap(ms_ffn, tp);
+                for (int64_t l = lb; l < le; ++l) {
+                    if (!attn_side(l, T, tp)) return false;
+                    if (l < g.n_dense_layers ? !dense_ffn(l, T) : !moe(l, T)) return false;
+                    lap(ms_ffn, tp);
+                }
+                if (le < g.n_layers) hand_parts(nullptr, hand_out, T);   // synced below, before the caller sends it
+            }
         }
     } catch (const std::exception& e) {
         err = std::string("verify glm5 prefill: ") + e.what();
@@ -1544,6 +1807,8 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                      (long long) n_all, (long long) lb, (long long) le - 1, ms_attn, ms_norm, ms_ffn,
                      prefill_ms_copy - copy0, (long long) prefill_streamed, (long long) prefill_direct,
                      (long long) prefill_resident);
+    if (prof && walk)
+        std::fprintf(stderr, "strata glm5 prefill prof: walk host side - entry lists %.0f ms, launches %.0f ms\n", w_plan_ms, w_enq_ms);
     if (prof && mla_sb > 0)
         std::fprintf(stderr, "strata glm5 prefill prof: MLA layers %.0f ms of the attention (projections %.0f, indexer %.0f, "
                              "attention %.0f, output %.0f)\n", ms_m[0] + ms_m[1] + ms_m[2] + ms_m[3], ms_m[0], ms_m[1], ms_m[2], ms_m[3]);

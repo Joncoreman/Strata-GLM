@@ -114,4 +114,25 @@ void glm5_latent_store(const float* kv, uint16_t* pool, const int32_t* page_tabl
     check("glm5_latent_store");
 }
 
+// the layer walk's combine: token u_tok[u] += sum over its entries j (in order) of e_w[j] * rows[e_row[j]]
+static __global__ void scatter_add_kernel(const float* __restrict__ rows, const int32_t* __restrict__ u_tok,
+                                          const int32_t* __restrict__ u_off, const int32_t* __restrict__ e_row,
+                                          const float* __restrict__ e_w, float* __restrict__ acc, int n_embd) {
+    const int u = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= n_embd) return;
+    float* a = acc + (size_t) u_tok[u] * n_embd + col;
+    float v = *a;
+    for (int j = u_off[u]; j < u_off[u + 1]; ++j) v += rows[(size_t) e_row[j] * n_embd + col] * e_w[j];
+    *a = v;
+}
+
+void glm5_scatter_add(const float* rows, const int32_t* u_tok, const int32_t* u_off, const int32_t* e_row, const float* e_w,
+                      int n_u, float* acc, int n_embd, void* stream) {
+    if (n_u <= 0) return;
+    scatter_add_kernel<<<dim3((unsigned) ((n_embd + 255) / 256), (unsigned) n_u), 256, 0, (cudaStream_t) stream>>>(
+        rows, u_tok, u_off, e_row, e_w, acc, n_embd);
+    check("glm5_scatter_add");
+}
+
 }  // namespace strata::kernels

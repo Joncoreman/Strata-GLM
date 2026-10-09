@@ -16,7 +16,9 @@ LONG = int(os.environ.get("LONG", "0"))   # N > 0: summarize the first N charact
 msg_args = []
 if LONG > 0:
     docs = "".join(p.read_text(encoding="utf-8", errors="replace") for p in sorted((WT / "docs").glob("*.md")))
-    msg_args = ["Summarize the following documents in Japanese, in ten bullet points.\n\n" + docs[:LONG]]
+    msg_file = OUT / "prompt_msg.txt"   # through a file: a long prompt overflows Windows' 32K command line
+    msg_file.write_text("Summarize the following documents in Japanese, in ten bullet points.\n\n" + docs[:LONG], encoding="utf-8")
+    msg_args = ["@" + str(msg_file)]
     NEW = 64
 ids = subprocess.run([sys.executable, str(Path(__file__).parent / "tok_chat.py")] + msg_args, capture_output=True,
                      text=True, check=True).stdout.strip()
