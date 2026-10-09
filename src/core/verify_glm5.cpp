@@ -37,12 +37,14 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <chrono>
+#include <numeric>
 #include <cstring>
 #include <thread>
 #include <cmath>
@@ -725,7 +727,18 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     const int64_t SL = std::min<int64_t>(8, MT);
     // staged blobs per grouped launch (each half of the ring); STRATA_GLM5_PF_BLOBS, 1..32, default 16 (24 could not page-lock its 723 MiB beside a 105 GiB RAM tier)
     const int B = [] { const char* v = std::getenv("STRATA_GLM5_PF_BLOBS"); const int b = v ? std::atoi(v) : 16; return b < 1 ? 1 : b > 32 ? 32 : b; }();
-    const uint64_t max_blob = lay.max_blob;
+    // the staging slot: MMQ (below) steps from expert to expert in whole blocks of the layer's type, so a slot holds a
+    // whole number of every MMQ layer type's blocks (UD-IQ4_XS: IQ3_S 110 B, IQ4_XS 136 B: lcm 7,480, x 16 B).  A plain
+    // max_blob stride read the second expert of a launch from the middle of a block (the answer was "!!!!", 2026-10-09).
+    const uint64_t max_blob = [&] {
+        uint64_t a = 16;
+        for (const auto& fm : lay.fmt)
+            if (strata::prefill::mmq::supported(fm.gu_type) && strata::prefill::mmq::supported(fm.d_type)) {
+                a = std::lcm(a, (uint64_t) strata::prefill::mmq::matrix_bytes(fm.gu_type, 1, 256));
+                a = std::lcm(a, (uint64_t) strata::prefill::mmq::matrix_bytes(fm.d_type, 1, 256));
+            }
+        return (lay.max_blob + a - 1) / a * a;
+    }();
     // STRATA_GLM5_PF_DIRECT=1 (opt-in, 2026-10-09): pinned blobs DMA'd straight from the RAM tier.  It removed the host
     // copies (80 -> 3 s summed over the threads, 4,400 tokens) but the prompt was not faster (46-57 vs 57-60 s): the GPU's
     // grouped experts then set the pace (the wait for the previous half grew by as much).  PCIe gives 41-49 GB/s here.
@@ -1097,6 +1110,65 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         return true;
     };
     // the routed experts of the whole chunk (T tokens) on the GPU, the shared expert, the combine into boc
+    // 2026-10-09: the routed experts through llama.cpp's MMQ (int8 tensor cores; Project Maya's GLM prompt path does
+    // the same) instead of native_expert_grouped, in every layer whose gate/up and down types MMQ has (UD-IQ4_XS: 39 of
+    // the 42, IQ3_S / IQ4_XS; the 3 with Q6_K downs stay native).  Each expert of a launch sits in its own staging slot
+    // (a VRAM-cache resident is copied there), so one launch per product covers them all: gate|up, the clamped swiglu
+    // in place, down into the routed outputs.  The gate|up rows and both q8_1 images live in gscratch.  Not bitwise the
+    // native kernels (another summation order).  STRATA_GLM5_PF_MMQ=0: native_expert_grouped everywhere.
+    namespace mmq = strata::prefill::mmq;
+    static const bool pf_mmq_on = [] { const char* v = std::getenv("STRATA_GLM5_PF_MMQ"); return !(v && v[0] == '0'); }();
+    const int64_t NFF = g.n_ff;
+    std::unique_ptr<mmq::Context> mq;
+    std::vector<int8_t> mmq_layer((size_t) g.n_layers, -1);
+    float* mm_gu = nullptr;
+    uint8_t *mm_xq = nullptr, *mm_hq = nullptr;
+    int32_t* mm_iota = nullptr;
+    if (pf_mmq_on && mmq::built()) {
+        const size_t a_gu = ((size_t) CK * 2 * NFF * 4 + 255) & ~(size_t) 255;
+        const size_t a_xq = (mmq::q8_bytes(CK, N) + 255) & ~(size_t) 255;
+        const size_t a_hq = (mmq::q8_bytes(CK, NFF) + 255) & ~(size_t) 255;
+        if (a_gu + a_xq + a_hq + (size_t) CK * 4 <= native_expert_scratch_bytes(CK, NFF)) {
+            uint8_t* gs = (uint8_t*) gscratch;
+            mm_gu = (float*) gs;
+            mm_xq = gs + a_gu;
+            mm_hq = gs + a_gu + a_xq;
+            mm_iota = (int32_t*) (gs + a_gu + a_xq + a_hq);
+            mq = std::make_unique<mmq::Context>();
+        }
+    }
+    // the layer's experts through MMQ (its types covered and a tile that fits the card for both products)
+    auto use_mmq = [&](int64_t l) -> bool {
+        if (!mq) return false;
+        int8_t& v = mmq_layer[(size_t) l];
+        if (v < 0) {
+            const auto& fm = lay.fmt[(size_t) l];
+            v = (int8_t) (mmq::supported(fm.gu_type) && mmq::supported(fm.d_type) && mmq::fits(fm.gu_type, 2 * NFF) &&
+                          mmq::fits(fm.d_type, N));
+        }
+        return v != 0;
+    };
+    // one launch's experts (nb, their weights max_blob apart from wbase): rows [bounds[e], bounds[e+1]) of the entries
+    // read x[tok[row]] (ld floats) and write out[dst[row]] (N floats a row)
+    auto run_mmq = [&](int64_t l, const uint8_t* wbase, int nb, int entries, int max_rows, const int32_t* d_bounds,
+                       const int32_t* d_tok, const float* x, int64_t ld, const int32_t* d_dst, float* out) {
+        mmq::iota(mm_iota, entries, cs);   // (gscratch is the native kernels' too: written each time)
+        const auto& fm = lay.fmt[(size_t) l];
+        const NativeExpertLayout L = native_expert_layout(fm.gu_type, fm.d_type, fm.n_embd, fm.n_ff);
+        mmq::quantize(x, d_tok, mm_xq, fm.gu_type, N, ld, entries, cs);
+        mmq::Product gu;
+        gu.w = wbase; gu.type = fm.gu_type; gu.w_rows = 2 * NFF; gu.w_cols = N; gu.expert_bytes = max_blob; gu.n = nb;
+        gu.xq = mm_xq; gu.bounds = d_bounds; gu.ids = mm_iota; gu.total_rows = entries; gu.max_rows = max_rows;
+        gu.dst = mm_gu; gu.ld_dst = 2 * NFF;
+        mq->run(gu, cs);
+        glm5_swiglu_rows(mm_gu, entries, (int) NFF, m.clamp_exp, cs);
+        mmq::quantize(mm_gu, nullptr, mm_hq, fm.d_type, NFF, 2 * NFF, entries, cs);
+        mmq::Product dn;
+        dn.w = wbase + L.down_off; dn.type = fm.d_type; dn.w_rows = N; dn.w_cols = NFF; dn.expert_bytes = max_blob;
+        dn.n = nb; dn.xq = mm_hq; dn.bounds = d_bounds; dn.ids = d_dst; dn.total_rows = entries; dn.max_rows = max_rows;
+        dn.dst = out; dn.ld_dst = N;
+        mq->run(dn, cs);
+    };
     auto moe = [&](int64_t l, int64_t T) -> bool {
         const WeightRef *wr = wfind(wt, l, "ffn_gate_inp.weight", err), *wb = wfind(wt, l, "exp_probs_b.bias", err),
                         *wsg = wfind(wt, l, "ffn_gate_shexp.weight", err), *wsu = wfind(wt, l, "ffn_up_shexp.weight", err),
@@ -1128,6 +1200,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         NativeExpertLayout L = native_expert_layout(fm.gu_type, fm.d_type, fm.n_embd, fm.n_ff);
         L.swiglu_limit = m.clamp_exp;
         const uint64_t bb = lay.blob_bytes(l);
+        const bool mm = use_mmq(l);
         for (size_t bi = 0, b0 = 0; b0 < used.size(); ++bi, b0 += B) {
             const int hf = (int) (bi & 1);
             const int nb = (int) std::min<size_t>(B, used.size() - b0);
@@ -1146,20 +1219,35 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             pf_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count();
             int ns = 0;
             int32_t stream_e[32];
-            int entries = 0;
-            for (int j = 0; j < nb; ++j) {
-                const int32_t e = used[b0 + (size_t) j];
+            int entries = 0, max_rows = 0;
+            // the streamed experts first (staging slots 0..ns-1, as the DMA below fills them), then the residents: with
+            // MMQ each resident is copied into the next slot, so every expert of the launch is max_blob apart
+            int ord[32], no = 0;
+            for (int pass = 0; pass < 2; ++pass)
+                for (int j = 0; j < nb; ++j) {
+                    const int32_t e = used[b0 + (size_t) j];
+                    const bool res = f.host_res && f.host_res[(size_t) l * NE + e] >= 0;
+                    if (res == (pass == 1)) ord[no++] = j;
+                }
+            for (int q = 0; q < nb; ++q) {
+                const int32_t e = used[b0 + (size_t) ord[q]];
                 const int32_t slot = f.host_res ? f.host_res[(size_t) l * NE + e] : -1;
                 if (slot >= 0) {
-                    hptr[j] = (unsigned long long) (f.cache_base + (f.slot_off ? (size_t) f.slot_off[slot]
-                                                                                : (size_t) slot * f.cache_blob));
+                    const uint8_t* src = f.cache_base + (f.slot_off ? (size_t) f.slot_off[slot] : (size_t) slot * f.cache_blob);
+                    if (mm) {
+                        cudaMemcpyAsync(dstage + (size_t) q * max_blob, src, (size_t) bb, cudaMemcpyDeviceToDevice, cs);
+                        hptr[q] = (unsigned long long) (dstage + (size_t) q * max_blob);
+                    } else {
+                        hptr[q] = (unsigned long long) src;
+                    }
                     ++prefill_resident;
                 } else {
-                    hptr[j] = (unsigned long long) (dstage + (size_t) ns * max_blob);
+                    hptr[q] = (unsigned long long) (dstage + (size_t) ns * max_blob);
                     stream_e[ns++] = e;
                     ++prefill_streamed;
                 }
-                start[j] = entries;
+                start[q] = entries;
+                max_rows = std::max<int>(max_rows, (int) by[(size_t) e].size());
                 for (int32_t i : by[(size_t) e]) { dst[entries] = i; tok[entries] = (int32_t) (i / K); ++entries; }
             }
             start[nb] = entries;
@@ -1225,8 +1313,11 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             cudaMemcpyAsync(dpl + (B + 1) + 2 * CK, count, 4, cudaMemcpyHostToDevice, cs);
             cudaMemcpyAsync(dp, hptr, (size_t) nb * 8, cudaMemcpyHostToDevice, cs);
             cudaStreamWaitEvent(cs, ev_copied[hf], 0);
-            native_expert_grouped(L, dp, dpl, dpl + (B + 1) + 2 * CK, dpl + (B + 1), dpl + (B + 1) + CK, B, CK,
-                                  q8c, gscratch, parts, cs);
+            if (mm)
+                run_mmq(l, dstage, nb, entries, max_rows, dpl, dpl + (B + 1) + CK, xmc, N, dpl + (B + 1), parts);
+            else
+                native_expert_grouped(L, dp, dpl, dpl + (B + 1) + 2 * CK, dpl + (B + 1), dpl + (B + 1) + CK, B, CK,
+                                      q8c, gscratch, parts, cs);
             cudaEventRecord(ev_done[hf], cs);   // the host waits for it before this half is filled again
         }
         native_moe_combine_multi(parts, wc, shc, boc, N, K, (int) T, cs);
@@ -1510,10 +1601,12 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         auto hfree = [&] { for (void*& q : host_free.p) { if (q) cudaFreeHost(q); q = nullptr; } };
         walk = false;
         for (; PG >= 2 * C || PG == n_all; PG = std::max<int64_t>(C, (PG / 2 + C - 1) / C * C)) {
-            q8f = (int64_t) (((size_t) PG * q8row / 4 + 63) & ~(size_t) 63);   // floats of parts: the q8_1 inputs
+            // floats at the front of parts: the group's FFN inputs (F32, MMQ quantizes its own rows) and their q8_1
+            // image (the native kernels' layers)
+            q8f = (int64_t) (((size_t) PG * N + (size_t) PG * q8row / 4 + 63) & ~(size_t) 63);
             E_cap = std::min<int64_t>(CK, (CK * N - q8f - csrf) / N);           // expert output rows a launch
             hostS = (float*) halloc((size_t) PG * HF * 4, 0);
-            hq8 = (uint8_t*) halloc((size_t) PG * q8row, 1);
+            hq8 = (uint8_t*) halloc((size_t) PG * N * 4, 1);   // the FFN inputs, F32
             hids = (int32_t*) halloc((size_t) PG * K * 4, 2);
             hw = (float*) halloc((size_t) PG * K * 4, 3);
             pcsr = (int32_t*) halloc((size_t) 2 * (4 * CK + 1) * 4, 4);
@@ -1524,7 +1617,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         if (std::getenv("STRATA_GLM5_PF_PROF") != nullptr)
             std::fprintf(stderr, "strata glm5 prefill: layer walk %s (groups of %lld tokens, %lld expert rows a launch, %zu MiB "
                          "page-locked)\n", walk ? "on" : "off (no page-locked memory)", (long long) PG, (long long) E_cap,
-                         ((size_t) PG * HF * 4 + (size_t) PG * q8row + (size_t) PG * K * 8) >> 20);
+                         ((size_t) PG * HF * 4 + (size_t) PG * N * 4 + (size_t) PG * K * 8) >> 20);
     }
     // walk: the chunk's router, shared expert (into boc) and q8_1 inputs; ids / weights / inputs to the host at token off
     auto moe_route = [&](int64_t l, int64_t T, int64_t off) -> bool {
@@ -1542,10 +1635,9 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             shared_expert_multi(n, xmc + (size_t) s0 * N, nullptr, nsw, nullptr, sh_gate_, sh_up_, sh_g_,
                                 boc + (size_t) s0 * N, N, m.NFF, cs, nullptr, 0, m.clamp_sh);
         }
-        quantize_q8_1_rows(xmc, T, N, q8c, cs);
         cudaMemcpyAsync(hids + (size_t) off * K, idsc, (size_t) T * K * 4, cudaMemcpyDeviceToHost, cs);
         cudaMemcpyAsync(hw + (size_t) off * K, wc, (size_t) T * K * 4, cudaMemcpyDeviceToHost, cs);
-        cudaMemcpyAsync(hq8 + (size_t) off * q8row, q8c, (size_t) T * q8row, cudaMemcpyDeviceToHost, cs);
+        cudaMemcpyAsync(hq8 + (size_t) off * N * 4, xmc, (size_t) T * N * 4, cudaMemcpyDeviceToHost, cs);
         return true;
     };
     // walk: layer l's routed experts over the group's Pn tokens, each streamed once; the sums (shared + routed, in the
@@ -1555,10 +1647,13 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     auto moe_walk = [&](int64_t l, int64_t Pn) -> bool {
         if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "verify glm5 prefill: the router failed on the GPU"; return false; }
         float* acc = Rc;
-        uint8_t* q8a = (uint8_t*) parts;
+        float* xa = parts;                                       // the group's FFN inputs
+        uint8_t* q8a = (uint8_t*) (parts + (size_t) PG * N);     // their q8_1 image (native layers)
         int32_t* dcsr = (int32_t*) (parts + q8f);
         float* rows = parts + q8f + csrf;
-        cudaMemcpyAsync(q8a, hq8, (size_t) Pn * q8row, cudaMemcpyHostToDevice, cs);
+        const bool mm = use_mmq(l);
+        cudaMemcpyAsync(xa, hq8, (size_t) Pn * N * 4, cudaMemcpyHostToDevice, cs);
+        if (!mm) quantize_q8_1_rows(xa, Pn, N, q8a, cs);
         hand_copy(acc, hostS, nullptr, HC * N, N, Pn);
         for (auto& v : by) v.clear();
         used.clear();
@@ -1598,21 +1693,34 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             const auto tpl = std::chrono::steady_clock::now();
             int ns = 0;
             int32_t stream_e[32];
-            int entries = 0;
+            int entries = 0, max_rows = 0;
             ent.clear();
-            for (int j = 0; j < nb; ++j) {
-                const int32_t e = used[b0 + (size_t) j];
+            int ord[32], no = 0;   // the streamed experts first, then the residents (as in moe)
+            for (int pass = 0; pass < 2; ++pass)
+                for (int j = 0; j < nb; ++j) {
+                    const int32_t e = used[b0 + (size_t) j];
+                    const bool res = f.host_res && f.host_res[(size_t) l * NE + e] >= 0;
+                    if (res == (pass == 1)) ord[no++] = j;
+                }
+            for (int q = 0; q < nb; ++q) {
+                const int32_t e = used[b0 + (size_t) ord[q]];
                 const int32_t slot = f.host_res ? f.host_res[(size_t) l * NE + e] : -1;
                 if (slot >= 0) {
-                    hptr[j] = (unsigned long long) (f.cache_base + (f.slot_off ? (size_t) f.slot_off[slot]
-                                                                                : (size_t) slot * f.cache_blob));
+                    const uint8_t* src = f.cache_base + (f.slot_off ? (size_t) f.slot_off[slot] : (size_t) slot * f.cache_blob);
+                    if (mm) {
+                        cudaMemcpyAsync(dstage + (size_t) q * max_blob, src, (size_t) bb, cudaMemcpyDeviceToDevice, cs);
+                        hptr[q] = (unsigned long long) (dstage + (size_t) q * max_blob);
+                    } else {
+                        hptr[q] = (unsigned long long) src;
+                    }
                     ++prefill_resident;
                 } else {
-                    hptr[j] = (unsigned long long) (dstage + (size_t) ns * max_blob);
+                    hptr[q] = (unsigned long long) (dstage + (size_t) ns * max_blob);
                     stream_e[ns++] = e;
                     ++prefill_streamed;
                 }
-                start[j] = entries;
+                start[q] = entries;
+                max_rows = std::max<int>(max_rows, (int) by[(size_t) e].size());
                 for (int32_t i : by[(size_t) e]) {
                     dst[entries] = entries; tok[entries] = (int32_t) (i / K);
                     e_w[entries] = hw[(size_t) i];
@@ -1690,8 +1798,11 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             cudaMemcpyAsync(dp, hptr, (size_t) nb * 8, cudaMemcpyHostToDevice, cs);
             cudaMemcpyAsync(dc, hc, half_i * 4, cudaMemcpyHostToDevice, cs);
             cudaStreamWaitEvent(cs, ev_copied[hf], 0);
-            native_expert_grouped(L, dp, dpl, dpl + (B + 1) + 2 * CK, dpl + (B + 1), dpl + (B + 1) + CK, B, CK,
-                                  q8a, gscratch, rows, cs);
+            if (mm)
+                run_mmq(l, dstage, nb, entries, max_rows, dpl, dpl + (B + 1) + CK, xa, N, dpl + (B + 1), rows);
+            else
+                native_expert_grouped(L, dp, dpl, dpl + (B + 1) + 2 * CK, dpl + (B + 1), dpl + (B + 1) + CK, B, CK,
+                                      q8a, gscratch, rows, cs);
             glm5_scatter_add(rows, dc, dc + CK, dc + 2 * CK + 1, (const float*) (dc + 3 * CK + 1), nu, acc, (int) N, cs);
             cudaEventRecord(ev_done[hf], cs);
             w_enq_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tq).count();

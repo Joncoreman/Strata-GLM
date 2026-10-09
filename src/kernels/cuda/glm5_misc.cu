@@ -114,6 +114,26 @@ void glm5_latent_store(const float* kv, uint16_t* pool, const int32_t* page_tabl
     check("glm5_latent_store");
 }
 
+// the MMQ experts' SwiGLU, in place: row r's first n_ff of its 2 * n_ff gate|up values become silu(gate) * up, with
+// GLM's clamp when limit > 0 (gate <= limit, |up| <= limit; Project Maya's swiglu_rows, MIT)
+static __global__ void swiglu_rows_kernel(float* gu, int64_t rows, int n_ff, float limit) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * n_ff) return;
+    const int64_t r = i / n_ff;
+    const int c = (int) (i - r * n_ff);
+    float* row = gu + r * 2 * n_ff;
+    float g = row[c], u = row[n_ff + c];
+    if (limit > 0.f) { g = fminf(g, limit); u = fminf(fmaxf(u, -limit), limit); }
+    row[c] = (g / (1.0f + expf(-g))) * u;
+}
+
+void glm5_swiglu_rows(float* gu, int64_t rows, int n_ff, float limit, void* stream) {
+    if (rows <= 0) return;
+    const int64_t n = rows * n_ff;
+    swiglu_rows_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(gu, rows, n_ff, limit);
+    check("glm5_swiglu_rows");
+}
+
 // the layer walk's combine: token u_tok[u] += sum over its entries j (in order) of e_w[j] * rows[e_row[j]]
 static __global__ void scatter_add_kernel(const float* __restrict__ rows, const int32_t* __restrict__ u_tok,
                                           const int32_t* __restrict__ u_off, const int32_t* __restrict__ e_row,

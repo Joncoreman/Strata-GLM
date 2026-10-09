@@ -20,6 +20,9 @@ void glm5_latent_store(const float* kv, uint16_t* pool, const int32_t* page_tabl
 /// The same into a q4_0 pool (dim / 32 ggml blocks of 18 bytes per row; read by mla_decode_attn_batch_q4).
 void glm5_latent_store_q4(const float* kv, uint8_t* pool, const int32_t* page_table, const int32_t* steps, int step_count,
                           int page_size, int dim, int n_tok, void* stream);
+/// The prompt path's MMQ experts (2026-10-09): in place, row r of `rows` rows of 2 * n_ff gate|up values gets
+/// silu(gate) * up in its first n_ff (GLM's clamp when limit > 0: gate <= limit, |up| <= limit).
+void glm5_swiglu_rows(float* gu, int64_t rows, int n_ff, float limit, void* stream);
 /// The prompt path's layer walk (2026-10-09): for u < n_u, acc[u_tok[u]] += sum_{j in [u_off[u], u_off[u+1])}
 /// e_w[j] * rows[e_row[j]] (n_embd floats each), the entries in order; distinct u_tok per call.
 void glm5_scatter_add(const float* rows, const int32_t* u_tok, const int32_t* u_off, const int32_t* e_row, const float* e_w,
