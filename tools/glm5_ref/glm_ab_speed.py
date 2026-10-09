@@ -31,6 +31,19 @@ if mode == "mn":
     args += ["--remote-stage", os.environ.get("STAGE_ADDR", "KITT3060:9300"), "--layer-split", f"{K1},{K2}"]
 elif mode == "mn2":   # both 3060s: GPU 0 runs [30, 37), GPU 1 [37, 44)
     args += ["--remote-stage", "KITT3060:9300,KITT3060:9302", "--layer-split", os.environ.get("SPLIT3", "30,37,44")]
+# 2026-10-09: what slowed runs down today, checked before each run (a warning, the run goes on)
+#  - the 5090's NIC power saving (Green Ethernet / Gigabit Lite / Power Saving Mode) came back ON after a Killer
+#    driver reinstall: the stage round trip went 19 -> 30-42 ms (ping.py p90 12 ms, max 334 ms)
+#  - Chrome's GPU process or Rainmeter holding a core: the pinned pool waits for it (8.6 instead of 15.5 tok/s)
+pre = subprocess.run(["powershell", "-NoProfile", "-Command",
+                      "Get-NetAdapterAdvancedProperty -Name * -EA SilentlyContinue | "
+                      "? { $_.DisplayName -match 'Green|グリーン|Gigabit Lite|Power Saving' -and $_.DisplayValue -match '有効|Enabled' } | "
+                      "% { 'NIC ' + $_.Name + ': ' + $_.DisplayName + ' is on' }; "
+                      "Get-Process chrome,Rainmeter -EA SilentlyContinue | select -Unique Name | % { 'running: ' + $_.Name }"],
+                     capture_output=True, text=True, encoding="utf-8", errors="replace").stdout.split("\n")
+for w in (l.strip() for l in pre):
+    if w and (mode.startswith("mn") or w.startswith("running")):
+        print("WARNING before the run:", w, flush=True)
 env = dict(os.environ, STRATA_GLM5_GO="1", STRATA_TRACE="1")
 TAG = os.environ.get("TAG", "")   # a suffix for the log and token files (A/B runs side by side)
 err = open(OUT / f"head_{mode}{TAG}.err", "w", encoding="utf-8")
