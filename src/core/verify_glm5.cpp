@@ -1673,7 +1673,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     // window's kernels in the window's order, each given the whole sub-batch; Q8_0 projections through cuBLAS (others
     // a slice at a time).  The scores / selection / attention / wv_b go mla_ab tokens at a time inside (vbT reuses lat).
     static const bool mla_prof = std::getenv("STRATA_GLM5_PF_PROF") != nullptr;
-    double ms_m[4] = {};   // projections, indexer, attention, output (STRATA_GLM5_PF_PROF)
+    double ms_m[5] = {};   // projections, indexer, attention, output, key append (STRATA_GLM5_PF_PROF)
     auto mla_layer = [&](int64_t l, int64_t T) -> bool {
         auto mt = std::chrono::steady_clock::now();
         auto mlap = [&](int i) {
@@ -1737,10 +1737,21 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                                       ma_qaT, (int) KVR, (long long) n * KVR, (int) NH);
             glm5_transpose_abd(ma_qaT, ma_qa, (int) NH, n, (int) KVR, cs);
             mlap(0);
-            for (int t = 0; t < n; ++t)
-                glm5_kpool_append(ma_rk + (size_t) t * ID, ma_rg + (size_t) t * ID, st + (size_t) t * kStepCount + kStepPos,
-                                  (const float*) wikn->data, (const float*) wikb->data, (const float*) wape->data, m.ln_eps,
-                                  kb, m.max_cells, cs);
+            {   // 2026-10-10: the sub-batch's cells in two launches when they are consecutive (n launches before)
+                static const bool pf_kb = [] { const char* v = std::getenv("STRATA_GLM5_PF_KAPPEND"); return !(v && v[0] == '0'); }();
+                const int64_t c_first = h_steps[(size_t) b0 * kStepCount + kStepPos];
+                const int64_t c_last = h_steps[(size_t) (b0 + n - 1) * kStepCount + kStepPos];
+                if (pf_kb && c_last - c_first == n - 1 && c_first >= 0 && c_last < m.max_cells) {
+                    glm5_kpool_append_batch(ma_rk, ma_rg, c_first, n, (const float*) wikn->data, (const float*) wikb->data,
+                                            (const float*) wape->data, m.ln_eps, kb, m.max_cells, cs);
+                } else {
+                    for (int t = 0; t < n; ++t)
+                        glm5_kpool_append(ma_rk + (size_t) t * ID, ma_rg + (size_t) t * ID, st + (size_t) t * kStepCount + kStepPos,
+                                          (const float*) wikn->data, (const float*) wikb->data, (const float*) wape->data, m.ln_eps,
+                                          kb, m.max_cells, cs);
+                }
+            }
+            mlap(4);
             if (!proj(wiqb, QLR, IH * ID, ma_qr, n, ma_iq)) return false;
             glm5_f32_gemv((const float*) wip->data, X, ma_iw, (int) N, (int) IH, n, 1.0f / std::sqrt((float) (ID * IH)), cs);
             mlap(1);
@@ -2158,8 +2169,9 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     if (prof && walk)
         std::fprintf(stderr, "strata glm5 prefill prof: walk host side - entry lists %.0f ms, launches %.0f ms\n", w_plan_ms, w_enq_ms);
     if (prof && mla_sb > 0)
-        std::fprintf(stderr, "strata glm5 prefill prof: MLA layers %.0f ms of the attention (projections %.0f, indexer %.0f, "
-                             "attention %.0f, output %.0f)\n", ms_m[0] + ms_m[1] + ms_m[2] + ms_m[3], ms_m[0], ms_m[1], ms_m[2], ms_m[3]);
+        std::fprintf(stderr, "strata glm5 prefill prof: MLA layers %.0f ms of the attention (projections %.0f, key append %.0f, "
+                             "indexer %.0f, attention %.0f, output %.0f)\n", ms_m[0] + ms_m[1] + ms_m[2] + ms_m[3] + ms_m[4],
+                     ms_m[0], ms_m[4], ms_m[1], ms_m[2], ms_m[3]);
     if (prof)
         std::fprintf(stderr, "strata glm5 prefill prof: of the host blob copies - waiting for the GPU's previous half %.0f ms, "
                              "fetching the streamed blobs %.0f ms (threads: in blob() %.0f ms, copying %.0f ms, summed)\n",

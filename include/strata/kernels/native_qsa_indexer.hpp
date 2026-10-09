@@ -64,6 +64,12 @@ inline constexpr float kGlm5TailScore = 1.0e30f;
 void glm5_kpool_append(const float* raw_k, const float* gate, const int32_t* relative_pos_device, const float* k_norm,
                        const float* k_norm_b, const float* ape, float epsilon, const Glm5KpoolBuffers& b,
                        int64_t max_cells, void* stream, float* key_out = nullptr);
+/// The prompt path (2026-10-10): cells first_cell .. first_cell + n - 1 (consecutive; raw_k / gate [n][128]) in two
+/// launches - the blocks they complete in parallel, then the trailing incomplete block's cells into the tail - each
+/// cell's arithmetic glm5_kpool_append's, the same pooled keys and tail.
+void glm5_kpool_append_batch(const float* raw_k, const float* gate, int64_t first_cell, int64_t n, const float* k_norm,
+                             const float* k_norm_b, const float* ape, float epsilon, const Glm5KpoolBuffers& b,
+                             int64_t max_cells, void* stream);
 /// scores [nq][max_blocks] for blocks 0..n_bid (steps[kStepNBid]); q [nq][32][128], w [nq][32].  active_blocks > 0: no
 /// query of the call has more than this many blocks (n_bid + 1), so the grid stops there (the prompt path; the same scores)
 void glm5_kpool_scores(const float* q, const float* w, const uint16_t* pooled, const int32_t* steps, int64_t nq,

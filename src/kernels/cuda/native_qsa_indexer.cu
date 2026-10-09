@@ -331,6 +331,96 @@ __global__ void __launch_bounds__(256) glm5_kpool_scores_kernel(const float* __r
 }
 }  // namespace
 
+// ---- the prompt path's batched append (2026-10-10): cells first .. first + n - 1 in two launches, each cell's
+// arithmetic glm5_kpool_append_kernel's ----
+__device__ __forceinline__ float kpool_key(const float* __restrict__ raw_k, const float* __restrict__ kw,
+                                           const float* __restrict__ kb, float eps, float* red) {
+    const int d = threadIdx.x, lane = d & 31, w = d >> 5;
+    const float x = raw_k[d];
+    float s = x;
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    if (lane == 0) red[w] = s;
+    __syncthreads();
+    const float mean = (red[0] + red[1] + red[2] + red[3]) / (float) KD;
+    __syncthreads();
+    const float xc = x - mean;
+    float v = xc * xc;
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if (lane == 0) red[w] = v;
+    __syncthreads();
+    const float var = (red[0] + red[1] + red[2] + red[3]) / (float) KD;
+    __syncthreads();
+    return xc * (1.0f / sqrtf(var + eps)) * kw[d] + kb[d];
+}
+
+// one CTA per block that completes inside the batch: its earlier cells from `tail`, the batch's from raw_k / gate
+__global__ void __launch_bounds__(KD) glm5_kpool_full_kernel(const float* __restrict__ raw_k, const float* __restrict__ gate,
+                                                             int64_t first, int64_t blk0, const float* __restrict__ kw,
+                                                             const float* __restrict__ kb, const float* __restrict__ ape,
+                                                             float eps, const float* __restrict__ tail,
+                                                             __nv_bfloat16* __restrict__ pooled) {
+    __shared__ float red[KD / 32];
+    const int d = threadIdx.x;
+    const int64_t b = blk0 + blockIdx.x;
+    float lg[KP], kj[KP];
+#pragma unroll
+    for (int j = 0; j < KP; ++j) {
+        const int64_t c = b * KP + j;
+        if (c < first) {
+            kj[j] = tail[j * 2 * KD + d];
+            lg[j] = tail[j * 2 * KD + KD + d] + ape[j * KD + d];
+        } else {
+            const int64_t t = c - first;
+            kj[j] = kpool_key(raw_k + t * KD, kw, kb, eps, red);
+            lg[j] = gate[t * KD + d] + ape[j * KD + d];
+        }
+    }
+    float mx = lg[0];
+#pragma unroll
+    for (int j = 1; j < KP; ++j) mx = fmaxf(mx, lg[j]);
+    float sum = 0.f;
+#pragma unroll
+    for (int j = 0; j < KP; ++j) { lg[j] = expf(lg[j] - mx); sum += lg[j]; }
+    const float inv = 1.0f / sum;
+    float p = 0.f;
+#pragma unroll
+    for (int j = 0; j < KP; ++j) p += (lg[j] * inv) * kj[j];
+    pooled[(size_t) b * KD + d] = __float2bfloat16_rn(p);
+}
+
+// the trailing cells whose block does not complete: their key | gate into the tail
+__global__ void __launch_bounds__(KD) glm5_kpool_tail_kernel(const float* __restrict__ raw_k, const float* __restrict__ gate,
+                                                             int64_t first, int64_t c0, const float* __restrict__ kw,
+                                                             const float* __restrict__ kb, float eps, float* __restrict__ tail) {
+    __shared__ float red[KD / 32];
+    const int d = threadIdx.x;
+    const int64_t c = c0 + blockIdx.x, t = c - first;
+    const float key = kpool_key(raw_k + t * KD, kw, kb, eps, red);
+    const int slot = (int) (c % KP);
+    tail[slot * 2 * KD + d] = key;
+    tail[slot * 2 * KD + KD + d] = gate[t * KD + d];
+}
+
+void glm5_kpool_append_batch(const float* raw_k, const float* gate, int64_t first_cell, int64_t n, const float* k_norm,
+                             const float* k_norm_b, const float* ape, float epsilon, const Glm5KpoolBuffers& b,
+                             int64_t max_cells, void* stream) {
+    if (n <= 0) return;
+    if (!raw_k || !gate || !k_norm || !k_norm_b || !ape || !b.tail || !b.pooled || !stream || first_cell < 0 ||
+        first_cell + n > max_cells)
+        throw std::invalid_argument("glm5_kpool_append_batch: missing buffer, stream or cells out of range");
+    const int64_t end = first_cell + n;               // cells [first_cell, end)
+    const int64_t blk0 = first_cell / KP;             // the first block a batch cell is in
+    const int64_t blk1 = end / KP;                    // blocks [blk0, blk1) complete inside the batch
+    const cudaStream_t s = (cudaStream_t) stream;
+    if (blk1 > blk0)
+        glm5_kpool_full_kernel<<<(unsigned) (blk1 - blk0), KD, 0, s>>>(raw_k, gate, first_cell, blk0, k_norm, k_norm_b, ape,
+                                                                       epsilon, b.tail, (__nv_bfloat16*) b.pooled);
+    const int64_t c0 = std::max<int64_t>(first_cell, blk1 * KP);   // the trailing cells of an incomplete block
+    if (end > c0)
+        glm5_kpool_tail_kernel<<<(unsigned) (end - c0), KD, 0, s>>>(raw_k, gate, first_cell, c0, k_norm, k_norm_b, epsilon,
+                                                                    b.tail);
+}
+
 void glm5_kpool_append(const float* raw_k, const float* gate, const int32_t* relative_pos_device, const float* k_norm,
                        const float* k_norm_b, const float* ape, float epsilon, const Glm5KpoolBuffers& b,
                        int64_t max_cells, void* stream, float* key_out) {
