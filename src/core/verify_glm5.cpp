@@ -2011,6 +2011,30 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         L.swiglu_limit = m.clamp_exp;
         const uint64_t bb = lay.blob_bytes(l);
         const size_t half_i = (size_t) 4 * CK + 1;
+        // an expert routed by more of the group's tokens than a launch holds (E_cap; a 16,384-token group can give one
+        // over 8,192) goes in rounds: round r takes entries [r * E_cap, (r + 1) * E_cap) of every expert (the rest
+        // of the loop below unchanged; such an expert is streamed once a round)
+        std::vector<std::vector<int32_t>> by_full;
+        std::vector<int32_t> used_full;
+        bool split = false;
+        for (int32_t e : used) split = split || (int64_t) by[(size_t) e].size() > E_cap;
+        if (split) {
+            used_full = used;
+            by_full.resize((size_t) NE);
+            for (int32_t e : used_full) by_full[(size_t) e] = by[(size_t) e];
+        }
+        for (int64_t rnd = 0;; ++rnd) {
+        if (split) {
+            used.clear();
+            for (int32_t e : used_full) {
+                const auto& fl = by_full[(size_t) e];
+                const size_t lo = std::min(fl.size(), (size_t) (rnd * E_cap)),
+                             hi = std::max(lo, std::min(fl.size(), (size_t) ((rnd + 1) * E_cap)));
+                by[(size_t) e].assign(fl.begin() + (ptrdiff_t) lo, fl.begin() + (ptrdiff_t) hi);
+                if (!by[(size_t) e].empty()) used.push_back(e);
+            }
+            if (used.empty()) break;
+        }
         for (size_t bi = 0, b0 = 0; b0 < used.size(); ++bi) {
             const int hf = (int) (bi & 1);
             int nb = 0;
@@ -2151,6 +2175,8 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             w_enq_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tq).count();
             b0 += (size_t) nb;
         }
+        if (!split) break;
+        }   // the rounds
         hand_copy(acc, nullptr, hostS, HC * N, N, Pn);
         kbvb_layer = -1;   // parts (where kb_f / vb_f are carved) held this layer's expert outputs
         return true;
