@@ -23,6 +23,8 @@ void glm5_latent_store_q4(const float* kv, uint8_t* pool, const int32_t* page_ta
 /// The prompt path's MMQ experts (2026-10-09): in place, row r of `rows` rows of 2 * n_ff gate|up values gets
 /// silu(gate) * up in its first n_ff (GLM's clamp when limit > 0: gate <= limit, |up| <= limit).
 void glm5_swiglu_rows(float* gu, int64_t rows, int n_ff, float limit, void* stream);
+/// g[i] = silu(g[i]) * u[i] for i < n, GLM's clamp when limit > 0 (the shared / dense FFN through MMQ)
+void glm5_swiglu2(float* g, const float* u, int64_t n, float limit, void* stream);
 /// dst[idx[r]] = src[r] for r < n_rows (rows of n_embd floats): the prompt path's CPU expert outputs into `parts`
 void glm5_copy_rows(const float* src, const int32_t* idx, float* dst, int n_rows, int n_embd, void* stream);
 /// dst[0] = a, dst[1] = b on the stream (an MMQ product's bounds)

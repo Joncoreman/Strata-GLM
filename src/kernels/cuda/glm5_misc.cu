@@ -127,6 +127,20 @@ static __global__ void swiglu_rows_kernel(float* gu, int64_t rows, int n_ff, flo
     row[c] = (g / (1.0f + expf(-g))) * u;
 }
 
+static __global__ void swiglu2_kernel(float* g, const float* __restrict__ u, int64_t n, float limit) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float a = g[i], b = u[i];
+    if (limit > 0.f) { a = fminf(a, limit); b = fminf(fmaxf(b, -limit), limit); }
+    g[i] = (a / (1.0f + expf(-a))) * b;
+}
+
+void glm5_swiglu2(float* g, const float* u, int64_t n, float limit, void* stream) {
+    if (n <= 0) return;
+    swiglu2_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(g, u, n, limit);
+    check("glm5_swiglu2");
+}
+
 void glm5_swiglu_rows(float* gu, int64_t rows, int n_ff, float limit, void* stream) {
     if (rows <= 0) return;
     const int64_t n = rows * n_ff;
