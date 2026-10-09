@@ -776,14 +776,47 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     float* kb_f = nullptr;   // [NH][KVR][QK]
     float* vb_f = nullptr;   // [NH][VD][KVR]
     int64_t kbvb_layer = -1;
+    // The scratch is CARVED from `parts` (the routed experts' outputs, C*K*N floats = 512 MiB for a 4K chunk): parts is
+    // written and read only inside a layer's FFN (moe), and the attention side of the next layer runs after that on the
+    // same stream.  A cudaMalloc here would not fit: with a 4K chunk at 262K context the card has 0 MiB left, and WDDM
+    // lets the allocation succeed past the card and pages it to system memory, silently - a prompt then took 217-304 s
+    // instead of ~6 (2026-10-09).
+    static const bool pf_kda_on = [] { const char* v = std::getenv("STRATA_GLM5_PF_KDA"); return !(v && v[0] == '0'); }();
+    const int64_t KSB = std::min<int64_t>(256, C);   // stage 2: tokens a projection GEMM
+    const int64_t WSCR = (int64_t) 4 << 20;          // stage 2: dequantized weight rows, floats (16 MB)
+    const size_t kBlasWs = (size_t) 8 << 20;         // cuBLAS's workspace, bytes
+    float *kq = nullptr, *kk = nullptr, *kv_ = nullptr, *kf = nullptr, *kz = nullptr, *ky = nullptr, *kfa = nullptr,
+          *kga = nullptr, *kbl = nullptr, *wscr = nullptr;
     if (pf_blas_on) {
         if (pf_blas == nullptr && cublasCreate(&pf_blas) != CUBLAS_STATUS_SUCCESS) pf_blas = nullptr;
         if (pf_blas != nullptr) {
-            kb_f = (float*) dalloc((size_t) m.NH * m.KVR * m.QK * 4);
-            vb_f = (float*) dalloc((size_t) m.NH * m.VD * m.KVR * 4);
-            if (kb_f == nullptr || vb_f == nullptr) kb_f = vb_f = nullptr;   // no room: the per-head launches
-            else cublasSetStream(pf_blas, cs);
+            float* p = parts;
+            float* const end = parts + (size_t) CK * N;
+            auto take = [&](size_t n) -> float* { float* r = p; p += (n + 63) & ~(size_t) 63; return p <= end ? r : nullptr; };
+            float* ws = take(kBlasWs / 4);
+            kb_f = take((size_t) m.NH * m.KVR * m.QK);
+            vb_f = take((size_t) m.NH * m.VD * m.KVR);
+            if (ws == nullptr || kb_f == nullptr || vb_f == nullptr) {
+                kb_f = vb_f = nullptr;   // a small chunk: the per-head launches
+            } else {
+                cublasSetStream(pf_blas, cs);
+                cublasSetWorkspace(pf_blas, ws, kBlasWs);
+                if (pf_kda_on) {
+                    const size_t di = (size_t) KSB * m.DI;
+                    kq = take(di); kk = take(di); kv_ = take(di); kf = take(di); kz = take(di); ky = take(di);
+                    kfa = take((size_t) KSB * 128); kga = take((size_t) KSB * 128); kbl = take((size_t) KSB * m.H);
+                    wscr = take((size_t) WSCR);
+                    if (!kq || !kk || !kv_ || !kf || !kz || !ky || !kfa || !kga || !kbl) wscr = nullptr;
+                }
+            }
         }
+    }
+    const bool kda_batch = wscr != nullptr;
+    if (std::getenv("STRATA_GLM5_PF_PROF") != nullptr) {
+        size_t fr = 0, tot = 0;
+        cudaMemGetInfo(&fr, &tot);
+        std::fprintf(stderr, "strata glm5 prefill: MLA absorb %s, KDA projections %s (%zu MiB free after the scratch)\n",
+                     kb_f ? "batched (cuBLAS)" : "per head", kda_batch ? "batched (cuBLAS)" : "per slice", fr >> 20);
     }
     uint8_t* pin = nullptr;
     const size_t pin_blobs = (size_t) 2 * B * max_blob;
@@ -1091,6 +1124,69 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             cudaEventRecord(ev_done[hf], cs);   // the host waits for it before this half is filled again
         }
         native_moe_combine_multi(parts, wc, shc, boc, N, K, (int) T, cs);
+        kbvb_layer = -1;   // parts (where kb_f / vb_f are carved) now holds this layer's expert outputs
+        return true;
+    };
+
+    // stage 2: Y (rows x out, row-major) = X (rows x in) . W^T for a Q8_0 weight W [out][in], through cuBLAS in F32;
+    // W dequantized a slice of rows at a time into `wscr`
+    auto gemm_q8 = [&](const WeightRef* w, int64_t in, int64_t out, const float* X, int64_t rows, float* Y) -> bool {
+        if (w->native_type != 8 || in % 32 != 0) { err = "verify glm5 prefill: a KDA projection is not Q8_0"; return false; }
+        const size_t row_bytes = (size_t) in / 32 * 34;
+        const int64_t R = std::max<int64_t>(1, std::min<int64_t>(out, WSCR / in));
+        const float one = 1.0f, zero = 0.0f;
+        for (int64_t r0 = 0; r0 < out; r0 += R) {
+            const int64_t nr = std::min<int64_t>(R, out - r0);
+            dequant_q8_0((const uint8_t*) w->native_data + (size_t) r0 * row_bytes, wscr, nr * in, cs);
+            if (cublasSgemm(pf_blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) nr, (int) rows, (int) in, &one, wscr, (int) in, X,
+                            (int) in, &zero, Y + r0, (int) out) != CUBLAS_STATUS_SUCCESS) {
+                err = "verify glm5 prefill: cublasSgemm failed";
+                return false;
+            }
+        }
+        return true;
+    };
+    // stage 2: one KDA layer over the chunk: per sub-batch the mHC reads (a slice at a time), the projections at once,
+    // the conv / gates / recurrence a slice at a time (the window's kernels and order), the output projection at once
+    auto kda_layer = [&](int64_t l, int64_t T) -> bool {
+        const int64_t gi = m.kda_index[(size_t) l];
+        const WeightRef *wq = wfind(wt, l, "attn_q.weight", err), *wk = wfind(wt, l, "attn_k.weight", err),
+                        *wv = wfind(wt, l, "attn_v.weight", err), *wo = wfind(wt, l, "attn_output.weight", err),
+                        *wfa = wfind(wt, l, "ssm_f_a.weight", err), *wfb = wfind(wt, l, "ssm_f_b.weight", err),
+                        *wga = wfind(wt, l, "ssm_g_a.weight", err), *wgb = wfind(wt, l, "ssm_g_b.weight", err),
+                        *wbe = wfind(wt, l, "ssm_beta.weight", err), *wdt = wfind(wt, l, "ssm_dt.bias", err),
+                        *wsa = wfind(wt, l, "ssm_a", err), *wnm = wfind(wt, l, "ssm_norm.weight", err);
+        if (!wq || !wk || !wv || !wo || !wfa || !wfb || !wga || !wgb || !wbe || !wdt || !wsa || !wnm) return false;
+        float* state = ss.gdn_state + (size_t) (gi - ss.gdn_ord0) * gdn_floats;
+        float* conv = state + (uint64_t) m.S * m.H * m.S;
+        float* qkv = qkv_L_ + (size_t) gi * MT * m.C;
+        float* hb = h_L_ + (size_t) gi * MT * m.C;
+        float* gate = m.gate + (size_t) gi * MT * m.H * m.S;
+        float* beta = beta_L_ + (size_t) gi * MT * m.H;
+        const int64_t DI = m.DI, H = m.H;
+        for (int64_t b0 = 0; b0 < T; b0 += KSB) {
+            const int64_t nb = std::min<int64_t>(KSB, T - b0);
+            for (int64_t s0 = b0; s0 < b0 + nb; s0 += SL) {
+                const int n = (int) std::min<int64_t>(SL, b0 + nb - s0);
+                if (!mhc_read(l, "attn", l > 0, s0, n, "attn_norm.weight")) return false;
+            }
+            const float* X = xmc + (size_t) b0 * N;
+            if (!gemm_q8(wq, N, DI, X, nb, kq) || !gemm_q8(wk, N, DI, X, nb, kk) || !gemm_q8(wv, N, DI, X, nb, kv_) ||
+                !gemm_q8(wfa, N, 128, X, nb, kfa) || !gemm_q8(wga, N, 128, X, nb, kga) ||
+                !gemm_q8(wbe, N, H, X, nb, kbl) || !gemm_q8(wfb, 128, DI, kfa, nb, kf) || !gemm_q8(wgb, 128, DI, kga, nb, kz))
+                return false;
+            for (int64_t s0 = 0; s0 < nb; s0 += SL) {
+                const int n = (int) std::min<int64_t>(SL, nb - s0);
+                glm5_pack3(kq + (size_t) s0 * DI, kk + (size_t) s0 * DI, kv_ + (size_t) s0 * DI, qkv, (int) DI, n, cs);
+                gdn_conv_l2_multi(conv, qkv, m.convw + (size_t) gi * m.C * 4, hb, (int) m.C, (int) (2 * H), 1e-6f, n, cs, 0);
+                kda_gate_beta_multi(kf + (size_t) s0 * DI, (const float*) wdt->data, (const float*) wsa->data, m.lb,
+                                    kbl + (size_t) s0 * H, gate, beta, (int) H, n, cs);
+                gdn_step_norm_multi(state, hb, (int) m.C, gate, beta, kz + (size_t) s0 * DI, (const float*) wnm->data,
+                                    m.rms_eps, ky + (size_t) s0 * DI, (int) H, (int) H, n, nkeep + n, cs, 0, nullptr, true);
+                gdn_conv_commit(conv, qkv, (int) m.C, nkeep + n, cs);
+            }
+            if (!gemm_q8(wo, DI, N, ky, nb, boc + (size_t) b0 * N)) return false;
+        }
         return true;
     };
 
@@ -1143,9 +1239,13 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             }
             lap(ms_ffn, tp);
             for (int64_t l = lb; l < le; ++l) {
-                for (int64_t s0 = 0; s0 < T; s0 += SL) {
-                    const int n = (int) std::min<int64_t>(SL, T - s0);
-                    if (!mhc_read(l, "attn", l > 0, s0, n, "attn_norm.weight") || !attn(l, s0, n)) return false;
+                if (kda_batch && m.kda_index[(size_t) l] >= 0) {
+                    if (!kda_layer(l, T)) return false;
+                } else {
+                    for (int64_t s0 = 0; s0 < T; s0 += SL) {
+                        const int n = (int) std::min<int64_t>(SL, T - s0);
+                        if (!mhc_read(l, "attn", l > 0, s0, n, "attn_norm.weight") || !attn(l, s0, n)) return false;
+                    }
                 }
                 lap(ms_attn, tp);
                 for (int64_t s0 = 0; s0 < T; s0 += SL) {
