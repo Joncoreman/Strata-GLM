@@ -297,7 +297,8 @@ public:
     bool glm5_slot_read(const std::string& path, uint64_t fingerprint, std::vector<int32_t>& toks, std::string& err);
     static bool glm5_slot_peek(const std::string& path, uint64_t fingerprint, std::vector<int32_t>& toks);
     double prefill_ms_copy = 0, prefill_ms_total = 0;
-    int64_t prefill_streamed = 0, prefill_resident = 0;
+    int64_t prefill_streamed = 0, prefill_resident = 0, prefill_direct = 0;
+    double pf_wait_ms = 0, pf_fetch_ms = 0, pf_blob_thread_ms = 0, pf_copy_thread_ms = 0;   // STRATA_GLM5_PF_PROF
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.

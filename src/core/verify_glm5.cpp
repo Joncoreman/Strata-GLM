@@ -724,6 +724,11 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     // staged blobs per grouped launch (each half of the ring); STRATA_GLM5_PF_BLOBS, 1..32, default 16 (24 could not page-lock its 723 MiB beside a 105 GiB RAM tier)
     const int B = [] { const char* v = std::getenv("STRATA_GLM5_PF_BLOBS"); const int b = v ? std::atoi(v) : 16; return b < 1 ? 1 : b > 32 ? 32 : b; }();
     const uint64_t max_blob = lay.max_blob;
+    // STRATA_GLM5_PF_DIRECT=1 (opt-in, 2026-10-09): pinned blobs DMA'd straight from the RAM tier.  It removed the host
+    // copies (80 -> 3 s summed over the threads, 4,400 tokens) but the prompt was not faster (46-57 vs 57-60 s): the GPU's
+    // grouped experts then set the pace (the wait for the previous half grew by as much).  PCIe gives 41-49 GB/s here.
+    static const bool pf_direct = [] { const char* v = std::getenv("STRATA_GLM5_PF_DIRECT"); return v && v[0] == '1'; }();
+    const uint8_t* hsrc[32] = {};   // the pinned source of a blob that goes straight to the device
     // ---- buffers for one chunk, freed when the prompt is done
     std::vector<void*> allocs;
     auto dalloc = [&](size_t bytes) -> void* {
@@ -965,6 +970,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             // its plan (the compute recorded ev_done after the plan copies and the launch)
             cudaEventSynchronize(ev_copied[hf]);
             cudaEventSynchronize(ev_done[hf]);
+            pf_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count();
             int ns = 0;
             int32_t stream_e[32];
             int entries = 0;
@@ -989,15 +995,52 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                 bool failed = false;
                 std::vector<std::thread> th;
                 th.reserve((size_t) ns);
+                std::atomic<int64_t> us_blob{0}, us_copy{0};   // STRATA_GLM5_PF_PROF: summed over the threads
+                const auto tf = std::chrono::steady_clock::now();
+                // 2026-10-09: a blob in page-locked host memory (the RAM tier is pinned and mapped since v0.1.41) goes
+                // to the device in its own DMA; only the others (the file tier) are copied into the staging first.
+                // 4,400 tokens in chunks of 4,096: the copies into the staging took 89 s summed over 16 threads (18 s).
+                std::atomic<bool> direct[32];
+                for (int k = 0; k < ns; ++k) direct[k] = false;
                 for (int k = 0; k < ns; ++k)
                     th.emplace_back([&, k] {
+                        const auto a = std::chrono::steady_clock::now();
                         const uint8_t* hb = f.blob ? f.blob(f.ctx, l, stream_e[k]) : nullptr;
+                        const auto b = std::chrono::steady_clock::now();
                         if (hb == nullptr) { failed = true; return; }
-                        std::memcpy(hstage + (size_t) k * max_blob, hb, (size_t) bb);
+                        cudaPointerAttributes at{};
+                        if (pf_direct && cudaPointerGetAttributes(&at, hb) == cudaSuccess && at.type == cudaMemoryTypeHost) {
+                            hsrc[k] = hb;
+                            direct[k] = true;
+                        } else {
+                            cudaGetLastError();
+                            std::memcpy(hstage + (size_t) k * max_blob, hb, (size_t) bb);
+                        }
+                        us_blob += std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+                        us_copy += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - b).count();
                     });
                 for (auto& t : th) t.join();
+                pf_fetch_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count();
+                pf_blob_thread_ms += (double) us_blob.load() / 1000.0;
+                pf_copy_thread_ms += (double) us_copy.load() / 1000.0;
                 if (failed) { err = "verify glm5 prefill: an expert of layer " + std::to_string(l) + " is in no tier"; return false; }
-                cudaMemcpyAsync(dstage, hstage, (size_t) (ns - 1) * max_blob + bb, cudaMemcpyHostToDevice, copy_s);
+                if (!pf_direct) {
+                    cudaMemcpyAsync(dstage, hstage, (size_t) (ns - 1) * max_blob + bb, cudaMemcpyHostToDevice, copy_s);
+                } else {   // runs of staged blobs in one DMA each, the pinned ones straight from the RAM tier
+                    for (int k = 0; k < ns;) {
+                        if (direct[k]) {
+                            cudaMemcpyAsync(dstage + (size_t) k * max_blob, hsrc[k], (size_t) bb, cudaMemcpyHostToDevice, copy_s);
+                            ++prefill_direct;
+                            ++k;
+                            continue;
+                        }
+                        int e = k + 1;
+                        while (e < ns && !direct[e]) ++e;
+                        cudaMemcpyAsync(dstage + (size_t) k * max_blob, hstage + (size_t) k * max_blob,
+                                        (size_t) (e - k - 1) * max_blob + bb, cudaMemcpyHostToDevice, copy_s);
+                        k = e;
+                    }
+                }
             }
             cudaEventRecord(ev_copied[hf], copy_s);
             prefill_ms_copy += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count();
@@ -1040,6 +1083,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     // STRATA_GLM5_PF_PROF=1 (2026-10-09): sync between the parts and print where a prompt's time goes
     static const bool prof = std::getenv("STRATA_GLM5_PF_PROF") != nullptr;
     double ms_attn = 0, ms_norm = 0, ms_ffn = 0;
+    const double wait0 = pf_wait_ms, fetch0 = pf_fetch_ms, blobt0 = pf_blob_thread_ms, copyt0 = pf_copy_thread_ms;
     const double copy0 = prefill_ms_copy;
     auto lap = [&](double& acc, std::chrono::steady_clock::time_point& t0) {
         if (!prof) return;
@@ -1103,9 +1147,15 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     prefill_ms_total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
     if (prof)
         std::fprintf(stderr, "strata glm5 prefill prof: %lld tokens, layers %lld-%lld: attention %.0f ms, mHC/norm %.0f ms, "
-                             "FFN/experts %.0f ms (host blob copies %.0f ms of it); streamed %lld, resident %lld so far\n",
+                             "FFN/experts %.0f ms (host blob copies %.0f ms of it); streamed %lld (%lld straight from pinned "
+                             "RAM), resident %lld so far\n",
                      (long long) n_all, (long long) lb, (long long) le - 1, ms_attn, ms_norm, ms_ffn,
-                     prefill_ms_copy - copy0, (long long) prefill_streamed, (long long) prefill_resident);
+                     prefill_ms_copy - copy0, (long long) prefill_streamed, (long long) prefill_direct,
+                     (long long) prefill_resident);
+    if (prof)
+        std::fprintf(stderr, "strata glm5 prefill prof: of the host blob copies - waiting for the GPU's previous half %.0f ms, "
+                             "fetching the streamed blobs %.0f ms (threads: in blob() %.0f ms, copying %.0f ms, summed)\n",
+                     pf_wait_ms - wait0, pf_fetch_ms - fetch0, pf_blob_thread_ms - blobt0, pf_copy_thread_ms - copyt0);
     return true;
 }
 
