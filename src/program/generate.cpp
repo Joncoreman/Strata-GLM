@@ -2212,8 +2212,17 @@ int main(int argc, char** argv) {
     strata::core::NativeDense native_dense;
     heap_mark("the canonical weight table");
     if (!o.native_dense_gguf.empty()) {
+        // 2026-10-09: layers this engine never runs keep their projections out of VRAM, for the expert cache - a
+        // MULTINODE head's remote stages [split_at.front(), split_at.back()) (about 1 GiB for GLM layers 38-43) and
+        // glm5-next's NextN layer without STRATA_GLM5_MTP (174 MiB).  STRATA_MN_KEEP_ALL=1 loads them all.
+        std::vector<std::pair<int64_t, int64_t>> never_run;
+        if (std::getenv("STRATA_MN_KEEP_ALL") == nullptr) {
+            if (remote_head && split_at.size() >= 2) never_run.push_back({split_at.front(), split_at.back()});
+            const char* mv = std::getenv("STRATA_GLM5_MTP");
+            if (glm5_model && !(mv != nullptr && std::atoi(mv) != 0)) never_run.push_back({g.n_layers, INT64_MAX});
+        }
         if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key, stage_mode ? g_stage_lb : 0,
-                               stage_mode ? g_stage_le : -1)) {
+                               stage_mode ? g_stage_le : -1, never_run.empty() ? nullptr : &never_run)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
         }

@@ -77,7 +77,8 @@ NativeDense::~NativeDense() {
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi) {
+                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi,
+                       const std::vector<std::pair<int64_t, int64_t>>* skip) {
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
@@ -150,6 +151,11 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (layer_hi > 0) {   // MULTINODE: a stage engine uploads only its own layers
                     const long long l = std::atoll(tensor.name.c_str() + 4);   // "blk.<L>."
                     if (l < layer_lo || l >= layer_hi) continue;
+                }
+                if (skip != nullptr && tensor.name.rfind("blk.", 0) == 0) {   // layers this engine never runs
+                    const long long l = std::atoll(tensor.name.c_str() + 4);
+                    if (std::any_of(skip->begin(), skip->end(), [l](const auto& r) { return l >= r.first && l < r.second; }))
+                        continue;
                 }
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name; return false;

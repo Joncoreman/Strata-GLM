@@ -24,14 +24,15 @@ print("prompt tokens:", ids.count(",") + 1, flush=True)
 args = ["--serve", "--pack", PACK, "--native", NATIVE, "--prefill", "auto", "--spec", "6", "--max-context", os.environ.get("CTX", "32768"),
         "--pcie-frac", "0", "--short-read", "1000000000", "--prompt-cache", "0", "--pool-workers", os.environ.get("WORKERS", "16"),
         "--vram-reserve-mib", os.environ.get("VRES", "2200"), "--mmap-experts", "--resident-budget-gib", os.environ.get("RES", "105"),
-        "--expert-profile", PACK + "/expert-profile-learned-2026-10-08b.bin", "--expert-cache", "0",
+        "--expert-profile", PACK + "/expert-profile-learned-2026-10-08b.bin", "--expert-cache", os.environ.get("CACHE", "0"),
         "--adapt-every", "1", "--adapt-swaps", os.environ.get("ADAPT", "64")]
 if mode == "mn":
     args += ["--remote-stage", os.environ.get("STAGE_ADDR", "KITT3060:9300"), "--layer-split", f"{K1},{K2}"]
 elif mode == "mn2":   # both 3060s: GPU 0 runs [30, 37), GPU 1 [37, 44)
     args += ["--remote-stage", "KITT3060:9300,KITT3060:9302", "--layer-split", os.environ.get("SPLIT3", "30,37,44")]
 env = dict(os.environ, STRATA_GLM5_GO="1", STRATA_TRACE="1")
-err = open(OUT / f"head_{mode}.err", "w", encoding="utf-8")
+TAG = os.environ.get("TAG", "")   # a suffix for the log and token files (A/B runs side by side)
+err = open(OUT / f"head_{mode}{TAG}.err", "w", encoding="utf-8")
 p = subprocess.Popen([str(EXE)] + args, cwd=WT, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
                      text=True, bufsize=1)
 t0 = time.time()
@@ -60,4 +61,4 @@ try:
     p.stdin.write("QUIT\n"); p.stdin.flush(); p.wait(timeout=120)
 except Exception:
     p.kill()
-(OUT / f"tokens_{mode}.txt").write_text(",".join(map(str, toks)), encoding="utf-8")
+(OUT / f"tokens_{mode}{TAG}.txt").write_text(",".join(map(str, toks)), encoding="utf-8")

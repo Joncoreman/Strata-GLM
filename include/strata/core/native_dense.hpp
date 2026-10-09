@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::core {
@@ -20,9 +21,11 @@ public:
     NativeDense(const NativeDense&) = delete;
     NativeDense& operator=(const NativeDense&) = delete;
     /// MULTINODE: with `layer_hi` > 0 only the blk.L tensors with layer_lo <= L < layer_hi are uploaded (a stage
-    /// engine that runs those layers alone; the canonical arena skips the rest too).
+    /// engine that runs those layers alone; the canonical arena skips the rest too).  `skip` holds [lo, hi) layer
+    /// ranges this engine never runs (a head's remote stages, an unused MTP layer): their projections stay out of VRAM.
     bool load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-              bool include_ple_key = false, int64_t layer_lo = 0, int64_t layer_hi = -1);
+              bool include_ple_key = false, int64_t layer_lo = 0, int64_t layer_hi = -1,
+              const std::vector<std::pair<int64_t, int64_t>>* skip = nullptr);
     /// Plan v0.3 P1: the canonical tensor names `load` would serve natively from these shards (eligible name,
     /// supported type, 2-D), read from the GGUF headers only - so the canonical arena can skip them.
     static bool served_names(const std::vector<std::string>& shards, bool include_ple_key,
