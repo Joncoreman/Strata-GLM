@@ -12474,8 +12474,9 @@ int main(int argc, char** argv) {
             int64_t slot_clock = 0;
             const int slot_max = [] { const char* v = std::getenv("STRATA_GLM5_SLOTS"); return v ? std::atoi(v) : 8; }();
             const int64_t slot_min = [] { const char* v = std::getenv("STRATA_GLM5_SLOT_MIN"); return v ? std::atoll(v) : 1024; }();
-            const std::string slot_dir = [] { const char* v = std::getenv("STRATA_GLM5_SLOT_DIR"); return std::string(v ? v : "glm5-slots"); }();
-            const bool slots_on = slot_max > 0 && gl_chain.empty();
+            // on only where a folder is named: a benchmark or a test run never reads an earlier run's state by accident
+            const std::string slot_dir = [] { const char* v = std::getenv("STRATA_GLM5_SLOT_DIR"); return std::string(v ? v : ""); }();
+            const bool slots_on = slot_max > 0 && !slot_dir.empty() && gl_chain.empty();
             const uint64_t slot_fp = [&] {   // the model, the pack and the latent format: a slot of another is never read
                 uint64_t hsh = 1469598103934665603ull;
                 const std::string id = "glm5-slot-1|" + o.native_preset + "|" + o.pack + "|" +
