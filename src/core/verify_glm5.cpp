@@ -1456,7 +1456,8 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                 // them (85 tokens: the fetch took 0.92 s, its threads 0.32 s)
                 // (blob() on this thread also for the file tier: reading those on threads instead was slower - 85 tokens
                 // 1.7 -> 2.3 s, 720 tokens 6.8 -> 8.1 s; the source's own read-ahead serves them in order)
-                const bool serial = pf_direct && T <= 1024;
+                static const int64_t serial_max = [] { const char* v = std::getenv("STRATA_GLM5_PF_SERIAL_MAX"); return v ? std::atoll(v) : 1024; }();
+                const bool serial = pf_direct && T <= serial_max;
                 for (int k = 0; serial && k < ns; ++k) {
                     const auto a = std::chrono::steady_clock::now();
                     const uint8_t* hb = f.blob ? f.blob(f.ctx, l, stream_e[k]) : nullptr;
@@ -2146,6 +2147,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             }
         return true;
     };
+    const double setup_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
     try {
         if (walk) {
             int64_t last_c0 = 0, last_T = 0, last_g0 = 0;
@@ -2204,6 +2206,9 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     const cudaError_t se = cudaStreamSynchronize(cs);
     if (se != cudaSuccess) { err = std::string("verify glm5 prefill: ") + cudaGetErrorString(se); return false; }
     prefill_ms_total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+    if (prof)
+        std::fprintf(stderr, "strata glm5 prefill prof: setup (buffers, page-locked staging) %.0f ms of %.0f ms\n", setup_ms,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count());
     if (prof)
         std::fprintf(stderr, "strata glm5 prefill prof: %lld tokens, layers %lld-%lld: attention %.0f ms, mHC/norm %.0f ms, "
                              "FFN/experts %.0f ms (host blob copies %.0f ms of it); streamed %lld (%lld straight from pinned "

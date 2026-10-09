@@ -12553,6 +12553,20 @@ int main(int argc, char** argv) {
                              std::chrono::duration<double, std::milli>(Clock::now() - tw).count());
                 slots.push_back(std::move(sl));
             };
+            // 2026-10-10: a 32-token warm-up prompt before READY (one PC) - the first request otherwise paid ~2 s of first
+            // use (the chunk buffers, page-locked staging, cuBLAS / MMQ); the state is zeroed after it and the cells it
+            // wrote are rewritten by the first prompt.  STRATA_GLM5_WARMUP=0: none
+            if (gl_chain.empty() && pf_chunk > 0 && !(std::getenv("STRATA_GLM5_WARMUP") && std::getenv("STRATA_GLM5_WARMUP")[0] == '0')) {
+                const Clock::time_point tw = Clock::now();
+                std::vector<int32_t> wtoks(32);
+                for (int i = 0; i < 32; ++i) wtoks[(size_t) i] = 1000 + 37 * i;
+                std::string we;
+                if (ver.prefill_glm5(wtoks.data(), 32, 0, pf_chunk, pf, we) && ver.wait_commit(we))
+                    std::fprintf(stderr, "strata serve: warm-up prompt in %.0f ms\n",
+                                 std::chrono::duration<double, std::milli>(Clock::now() - tw).count());
+                else
+                    std::fprintf(stderr, "strata serve: warm-up skipped (%s)\n", we.c_str());
+            }
             if (!ver.glm5_state_zero(err)) { std::fprintf(stderr, "strata serve: %s\n", err.c_str()); return 1; }
             std::printf("INFO engine=glm5 model=glm5-next\n");
             std::printf("READY %lld stop\n", (long long) o.max_context);
