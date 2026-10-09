@@ -9,8 +9,9 @@ import mn_test as M   # noqa: E402
 
 which, out = sys.argv[1], sys.argv[2]
 if which == "after":
-    M.EXE = Path(r"D:\AI\LLM\strata-glm-gpu\build-engine\strata.exe")
-    M.WT = Path(r"D:\AI\LLM\strata-glm-gpu")
+    import os
+    M.WT = Path(os.environ.get("WT", r"D:\AI\LLM\strata-glm-gpu"))   # the worktree whose build-engine runs
+    M.EXE = M.WT / "build-engine" / "strata.exe"
 print("engine:", M.EXE)
 sys.argv = ["mn_test.py", "run", "ref", "--profile", str(M.BASE_PROFILE), "--max-new", "64", "--out", out]
 M.main()

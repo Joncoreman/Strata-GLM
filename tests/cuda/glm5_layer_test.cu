@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
     mmvq(P + "ssm_f_b.weight", fa, LR, f, DI);
     mmvq(P + "ssm_g_b.weight", ga, LR, z, DI);
     kda_gate_beta_multi(f, W(P + "ssm_dt.bias"), W(P + "ssm_a"), -5.0f, bl, gate, beta, H, T, st);
-    gdn_step_norm_multi(state, h, C, gate, beta, z, W(P + "ssm_norm.weight"), 1e-5f, y, H, H, T, nullptr, st, 0, true);
+    gdn_step_norm_multi(state, h, C, gate, beta, z, W(P + "ssm_norm.weight"), 1e-5f, y, H, H, T, nullptr, st, 0, nullptr, true);
     mmvq(P + "attn_output.weight", y, DI, attn_out, N);
     // ---- FFN side: mHC read with the attention write folded in, dense FFN
     mhc("ffn", true, attn_out, postA, combA, postF, combF, "ffn_norm.weight", x2);
@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
     nw.gate_type = T_(P + "ffn_gate.weight").type; nw.up_type = T_(P + "ffn_up.weight").type; nw.down_type = T_(P + "ffn_down.weight").type;
     nw.gate_data = T_(P + "ffn_gate.weight").dev; nw.up_data = T_(P + "ffn_up.weight").dev; nw.down_data = T_(P + "ffn_down.weight").dev;
     nw.q8_1 = q8;
-    shared_expert_multi(T, x2, nullptr, nw, nullptr, g_ff, u_ff, gsc, ffn_out, N, NFF, st, 10.0f);
+    shared_expert_multi(T, x2, nullptr, nw, nullptr, g_ff, u_ff, gsc, ffn_out, N, NFF, st, nullptr, 0, 10.0f);
     // ---- the layer's last write (in the engine it is folded into layer 1's first read)
     {
         MhcMulti m;

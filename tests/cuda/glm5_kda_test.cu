@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
     // the recurrence + norm + output gate, with llama.cpp's own gate/beta (verify form: state read, not written)
     float* dh = up(h); float* dgt = up(gate); float* dbt = up(beta); float* dz = up(z); float* dgam = up(gamma);
     float* state = dev(HS * S); float* dy = dev(T * HS);
-    strata::kernels::gdn_step_norm_multi(state, dh, (int)(3 * HS), dgt, dbt, dz, dgam, rms_eps, dy, H, H, T, nullptr, nullptr, 0, true);
+    strata::kernels::gdn_step_norm_multi(state, dh, (int)(3 * HS), dgt, dbt, dz, dgam, rms_eps, dy, H, H, T, nullptr, nullptr, 0, nullptr, true);
     if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("cuda error\n"); return 2; }
     check("KDA y (vs llama.cpp)", down(dy, T * HS), want_y, 1e-4);
     const auto s_after_verify = down(state, HS * S);
@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
     // the commit form: n_keep = T writes the state; the outputs must be the same
     int32_t* nk; cudaMalloc(&nk, 4); cudaMemcpy(nk, &T, 4, cudaMemcpyHostToDevice);
     float* dy2 = dev(T * HS);
-    strata::kernels::gdn_step_norm_multi(state, dh, (int)(3 * HS), dgt, dbt, dz, dgam, rms_eps, dy2, H, H, T, nk, nullptr, 0, true);
+    strata::kernels::gdn_step_norm_multi(state, dh, (int)(3 * HS), dgt, dbt, dz, dgam, rms_eps, dy2, H, H, T, nk, nullptr, 0, nullptr, true);
     cudaDeviceSynchronize();
     check("KDA y, commit form", down(dy2, T * HS), down(dy, T * HS), 0.0);
     // replay: from the committed state, the last token alone again must not equal (state advanced) - sanity only

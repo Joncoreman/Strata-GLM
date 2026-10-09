@@ -96,9 +96,10 @@ GLM5_FORM = {name: "F32" for name in (
     "ssm_conv1d_q.weight", "ssm_conv1d_k.weight", "ssm_conv1d_v.weight", "indexer_compressor_ape.weight",
     "nextn.enorm.weight", "nextn.hnorm.weight", "nextn.shared_head_norm.weight",
 )}
-# PLE key encodings left in the GGUF for the engine's native PLE key (Q2_0; Q8_0 in UD-Q4_K_XL).  Other quantized
-# keys take the BF16 path (--compat-bf16), as before.
-NATIVE_PLE_KEY = {"Q2_0", "Q8_0"}
+# PLE key encodings left in the GGUF for the engine's native PLE key: the formats NativeDense serves (Q2_0; Q8_0 in
+# UD-Q4_K_XL; IQ3_XXS and IQ4_XS, #381).  Other quantized keys take the BF16 path (--compat-bf16), as before.
+NATIVE_PLE_KEY = {"Q2_0", "Q8_0", "IQ3_XXS", "IQ4_XS"}
+
 KIND = {"BF16": "4", "F16": "5", "F32": "2"}
 
 

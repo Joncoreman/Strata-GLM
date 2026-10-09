@@ -33,7 +33,7 @@ int main(int argc, char** argv) {
         cudaMalloc(&nw.q8_1, (size_t)T * (ff > n ? ff : n) * 2);   // q8_1: 36 B per 32 values < 2 B per value
         float *dx = up(x), *dg, *du, *dgs, *dout;
         cudaMalloc(&dg, (size_t)T * ff * 4); cudaMalloc(&du, (size_t)T * ff * 4); cudaMalloc(&dgs, 64); cudaMalloc(&dout, (size_t)T * n * 4);
-        strata::kernels::shared_expert_multi(T, dx, nullptr, nw, nullptr, dg, du, dgs, dout, n, ff, st, lim);
+        strata::kernels::shared_expert_multi(T, dx, nullptr, nw, nullptr, dg, du, dgs, dout, n, ff, st, nullptr, 0, lim);
         if (cudaStreamSynchronize(st) != cudaSuccess) { std::printf("cuda error\n"); return 2; }
         std::vector<float> got((size_t)T * n);
         cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost);

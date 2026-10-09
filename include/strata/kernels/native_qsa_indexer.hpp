@@ -43,6 +43,11 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
                                const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
                                int64_t max_cells, const RopeScaling& scaling, void* stream);
 
+void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_pos_device,
+                                     int pos_stride, int n_steps, int32_t pos_base,
+                                     const float* gamma, float epsilon,
+                                     const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
+                                     int64_t max_cells, const RopeScaling& scaling, void* stream);
 // ---- glm5-next (GLM-5.3-Flash) k-pool indexer (llama.cpp b11461 glm5-next.cpp:756-859) -------------------------
 // Per cell: key = LayerNorm(indexer.attn_k x) * k_norm + k_norm_b (mean-centred, eps layer_norm_epsilon) and gate =
 // indexer_compressor_gate x, 128 each.  The first three cells of a block wait in `tail` (key | gate, 3 x 256 floats);

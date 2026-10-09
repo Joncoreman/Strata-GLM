@@ -4,7 +4,9 @@
 param([switch]$NoBuild)
 $R = $PSScriptRoot
 $py = 'D:\AI\LLM\strata\.venv\Scripts\python.exe'
-$full = (Get-ChildItem 'D:\AI\LLM\llamacpp-glm5\runs' -Directory -Filter 'full_*' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName
+# the multi-token dumps only: the -ub 1 runs (full_*_ub1_*, the layer test's ground truth) hold one token per tensor
+$full = (Get-ChildItem 'D:\AI\LLM\llamacpp-glm5\runs' -Directory -Filter 'full_*' | Where-Object Name -notlike '*_ub1_*' |
+         Sort-Object LastWriteTime | Select-Object -Last 1).FullName
 $c = Join-Path $R 'build-glm-gpu\cases'; $b = Join-Path $R 'build-glm-gpu'
 New-Item -ItemType Directory -Force $c | Out-Null
 if (-not $NoBuild) { cmd /c "`"$R\build-glm5-tests.bat`" 2>&1" | Select-String -Pattern ' error|LNK' }

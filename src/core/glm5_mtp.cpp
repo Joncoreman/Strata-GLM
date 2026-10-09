@@ -297,7 +297,7 @@ bool Glm5Mtp::layer(const int32_t* tok_dev, const float* h_in, int n, int64_t c0
         NativeSharedWeights nsw;
         nsw.gate_type = m.wsg->native_type; nsw.gate_data = m.wsg->native_data; nsw.up_type = m.wsu->native_type;
         nsw.up_data = m.wsu->native_data; nsw.down_type = m.wsd->native_type; nsw.down_data = m.wsd->native_data; nsw.q8_1 = m.q8;
-        shared_expert_multi(n, m.x, nullptr, nsw, nullptr, m.sg, m.su, m.sgs, m.sh, N, m.NFF, cs, m.clamp_sh);
+        shared_expert_multi(n, m.x, nullptr, nsw, nullptr, m.sg, m.su, m.sgs, m.sh, N, m.NFF, cs, nullptr, 0, m.clamp_sh);
         if (m.experts != nullptr) {   // phase B: the routed experts, all on the GPU
             const int64_t K = m.K, cap = (int64_t) n * K;
             glm5_f32_gemv((const float*) m.wr->data, m.x, m.rlog, (int) N, (int) m.NE, n, 1.0f, cs);

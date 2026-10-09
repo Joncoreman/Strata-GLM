@@ -304,7 +304,7 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
             kda_gate_beta_multi(m.f, (const float*) wdt->data, (const float*) wsa->data, m.lb, m.bl, gate, beta,
                                 (int) m.H, n, cs);
             gdn_step_norm_multi(state, hb, (int) m.C, gate, beta, z_, (const float*) wnm->data, m.rms_eps, y_, (int) m.H,
-                                (int) m.H, te, nullptr, cs, tb, true);
+                                (int) m.H, te, nullptr, cs, tb, nullptr, true);
             mmvq(wo, y_, (int) m.DI, bo_, (int) N, n, m.q8, cs);
         } else {
             // ======================= DSA (MLA + k-pool indexer) =======================
@@ -379,7 +379,7 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
             NativeSharedWeights nw;
             nw.gate_type = wg->native_type; nw.gate_data = wg->native_data; nw.up_type = wu->native_type; nw.up_data = wu->native_data;
             nw.down_type = wd->native_type; nw.down_data = wd->native_data; nw.q8_1 = m.q8;
-            shared_expert_multi(n, xm, nullptr, nw, nullptr, m.dg, m.du, sh_g_, bo_, N, m.NFFD, cs, m.clamp_sh);
+            shared_expert_multi(n, xm, nullptr, nw, nullptr, m.dg, m.du, sh_g_, bo_, N, m.NFFD, cs, nullptr, 0, m.clamp_sh);
             doorbell_ring(m_seq_, cs);   // no experts: the host skips this layer's pool and raises its flags
             return true;
         }
@@ -393,7 +393,7 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
         NativeSharedWeights nsw;
         nsw.gate_type = wsg->native_type; nsw.gate_data = wsg->native_data; nsw.up_type = wsu->native_type;
         nsw.up_data = wsu->native_data; nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data; nsw.q8_1 = m.q8;
-        shared_expert_multi(n, xm, nullptr, nsw, nullptr, sh_gate_, sh_up_, sh_g_, shared_, N, m.NFF, cs, m.clamp_sh);
+        shared_expert_multi(n, xm, nullptr, nsw, nullptr, sh_gate_, sh_up_, sh_g_, shared_, N, m.NFF, cs, nullptr, 0, m.clamp_sh);
         quantize_q8_1_rows(xm, n, N, nat_xq_, cs);
         return true;
     };
@@ -491,7 +491,7 @@ bool Verifier::capture_commit_glm5(std::string& err) {
                 gdn_conv_commit(conv, qkv_L_ + (size_t) gi * MT * m.C, (int) m.C, commit_, cs_);
                 gdn_step_norm_multi(state, h_L_ + (size_t) gi * MT * m.C, (int) m.C, m.gate + (size_t) gi * MT * m.H * m.S,
                                     beta_L_ + (size_t) gi * MT * m.H, z_, (const float*) wnm->data, m.rms_eps, y_dummy_,
-                                    (int) m.H, (int) m.H, (int) MT, commit_, cs_, 0, true);
+                                    (int) m.H, (int) m.H, (int) MT, commit_, cs_, 0, nullptr, true);
             } else {
                 const WeightRef *wikn = wfind(*wt_, l, "indexer.k_norm.weight", err),
                                 *wikb = wfind(*wt_, l, "indexer.k_norm.bias", err),
@@ -746,7 +746,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             mmvq(wgb, m.ga, 128, z_, (int) m.DI, n, m.q8, cs);
             kda_gate_beta_multi(m.f, (const float*) wdt->data, (const float*) wsa->data, m.lb, m.bl, gate, beta, (int) m.H, n, cs);
             gdn_step_norm_multi(state, hb, (int) m.C, gate, beta, z_, (const float*) wnm->data, m.rms_eps, y_, (int) m.H,
-                                (int) m.H, n, nkeep + n, cs, 0, true);   // the commit: the state written
+                                (int) m.H, n, nkeep + n, cs, 0, nullptr, true);   // the commit: the state written
             gdn_conv_commit(conv, qkv, (int) m.C, nkeep + n, cs);
             mmvq(wo, y_, (int) m.DI, bo, (int) N, n, m.q8, cs);
             return true;
@@ -825,7 +825,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         for (int64_t s0 = 0; s0 < T; s0 += SL) {
             const int n = (int) std::min<int64_t>(SL, T - s0);
             shared_expert_multi(n, xmc + (size_t) s0 * N, nullptr, nsw, nullptr, sh_gate_, sh_up_, sh_g_,
-                                shc + (size_t) s0 * N, N, m.NFF, cs, m.clamp_sh);
+                                shc + (size_t) s0 * N, N, m.NFF, cs, nullptr, 0, m.clamp_sh);
         }
         quantize_q8_1_rows(xmc, T, N, q8c, cs);
         cudaMemcpyAsync(h_ids.data(), idsc, (size_t) TK * 4, cudaMemcpyDeviceToHost, cs);
@@ -977,7 +977,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                     for (int64_t s0 = 0; s0 < T; s0 += SL) {
                         const int n = (int) std::min<int64_t>(SL, T - s0);
                         shared_expert_multi(n, xmc + (size_t) s0 * N, nullptr, nw, nullptr, m.dg, m.du, sh_g_,
-                                            boc + (size_t) s0 * N, N, m.NFFD, cs, m.clamp_sh);
+                                            boc + (size_t) s0 * N, N, m.NFFD, cs, nullptr, 0, m.clamp_sh);
                     }
                 } else if (!moe(l, T)) {
                     return false;
