@@ -2,6 +2,9 @@
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
+> **This fork adds GLM-5.3-Flash (320B-A18B, 157 GB) on one PC: RTX 5090 + 128 GB RAM, 25 tokens/s.**
+> See **[README-GLM5.md](README-GLM5.md)** ([日本語](README-GLM5.ja.md)). The Qwen3.8-Flash-Next support below is Strata's own and unchanged.
+
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
 

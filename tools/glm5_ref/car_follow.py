@@ -4,10 +4,14 @@
 import os, subprocess, sys, time
 from pathlib import Path
 
-WT = Path(r"D:\AI\LLM\strata-glm-v041")
-EXE = WT / "build-engine" / "strata.exe"
-PACK = os.environ.get("PACK", "D:/AI/LLM/Strata-data/packs/glm53_iq4xs")   # PACK= / NATIVE=: another quantization
-NATIVE = os.environ.get("NATIVE", "D:/AI/LLM/GLM-5.3-Flash-GGUF/unsloth/GLM-5.3-Flash-GGUF/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _glm5_paths as P  # noqa: E402  (PACK= / NATIVE= / STRATA_EXE=, else strata-glm5.json, else Strata-data)
+
+WT = P.REPO
+EXE = P.engine_exe()
+PACK = str(P.pack_dir()).replace("\\", "/")
+NATIVE = str(P.native_gguf()).replace("\\", "/")
+PROFILE = str(P.expert_profile()).replace("\\", "/")
 prompt, cont, out = sys.argv[1], sys.argv[2], sys.argv[3]
 env = dict(os.environ, STRATA_GLM5_GO="1", STRATA_FOLLOW_LOGITS=out, STRATA_GLM5_PREFILL="4096", STRATA_GLM5_PF_DIRECT="1")
 for kv in sys.argv[4:]:
@@ -17,7 +21,7 @@ n_cont = open(cont).read().count(",") + 1
 args = ["--pack", PACK, "--native", NATIVE, "--prefill", "auto", "--spec", "6", "--max-context", "32768",
         "--pcie-frac", "0", "--short-read", "1000000000", "--prompt-cache", "0", "--pool-workers", "22",
         "--vram-reserve-mib", "3400", "--mmap-experts", "--resident-budget-gib", "98",
-        "--expert-profile", PACK + "/expert-profile-learned-2026-10-08b.bin", "--expert-cache", "0",
+        "--expert-profile", PROFILE, "--expert-cache", "0",
         "--adapt-every", "1", "--adapt-swaps", "64",
         "--tokens-file", prompt, "--max-new", str(n_cont), "--spec-follow", cont]
 # ORACLE=1: the continuation as the drafts too - the windows go wide (8 tokens, all accepted: a perfect drafter's

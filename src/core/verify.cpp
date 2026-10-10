@@ -58,7 +58,7 @@
 #include <immintrin.h>
 
 namespace strata::core {
-extern float* g_car_weights;   // expert_source.cpp: STRATA_CAR_TEST's router weights (rewritten by STRATA_CAR_RENORM)
+extern float* g_car_weights;   // expert_source.cpp: the expert skipping's router weights (STRATA_GLM5_SKIP_*)
 namespace {
 
 constexpr float EPS = 1e-6f;
@@ -2022,7 +2022,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
-        g_car_weights = h_w_ + (size_t) tb * ss.k;   // STRATA_CAR_TEST (expert_source.cpp)
+        g_car_weights = h_w_ + (size_t) tb * ss.k;   // the expert skipping (expert_source.cpp)
         if (pool != nullptr && !(glm_ != nullptr && l < g.n_dense_layers))   // glm5: a dense layer has no experts
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
@@ -3080,7 +3080,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window (pipelined): the CPU experts of layer", l);
-        g_car_weights = h_w_ + (size_t) tb * ss.k;   // STRATA_CAR_TEST (expert_source.cpp)
+        g_car_weights = h_w_ + (size_t) tb * ss.k;   // the expert skipping (expert_source.cpp)
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);

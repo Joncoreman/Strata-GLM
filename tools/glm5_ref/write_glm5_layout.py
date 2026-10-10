@@ -7,7 +7,6 @@ import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-os.environ.setdefault("STRATA_GGUF_PY", r"D:\AI\LLM\llamacpp-glm5\gguf-py")
 import iq_pack  # noqa: E402
 
 src = pathlib.Path(sys.argv[1])

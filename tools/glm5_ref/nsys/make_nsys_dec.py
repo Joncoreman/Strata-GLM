@@ -19,7 +19,7 @@ out.mkdir(exist_ok=True)
     "@echo off\r\n"
     'cd /d "%~dp0"\r\n'
     "set STRATA_GLM5_GO=1\r\nset STRATA_GLM5_PREFILL=4096\r\nset STRATA_GLM5_PF_DIRECT=1\r\n"
-    "set STRATA_CAR_TEST=2\r\nset STRATA_CAR_RAM=1\r\nset STRATA_CAR_MINW=0.08\r\n"
+    "set STRATA_GLM5_SKIP_KEEP=2\r\nset STRATA_GLM5_SKIP_MINW=0.10\r\n"
     '"C:\\Program Files\\NVIDIA Corporation\\Nsight Systems 2024.6.2\\target-windows-x64\\nsys.exe" profile '
     "-t cuda --cuda-graph-trace=node --cuda-flush-interval=500 --sample=none --cpuctxsw=none -f true -o glm_dec "
     f'"{WT}\\build-engine\\strata.exe" {args} > run_nsys_dec.log 2>&1\r\n'

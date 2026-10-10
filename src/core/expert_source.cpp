@@ -3220,7 +3220,7 @@ std::atomic<uint64_t> g_cpu_bytes{0};
 std::atomic<int64_t> g_ns_prefetch{0}, g_ns_zero{0}, g_zero_rows{0};
 }  // namespace
 
-// STRATA_CAR_TEST's router weights: the verify window sets it to the call's rows (h_w_, [n_tok][k]) before the pool
+// the expert skipping's router weights (STRATA_GLM5_SKIP_*): the verify window sets it to the call's rows (h_w_, [n_tok][k]) before the pool
 float* g_car_weights = nullptr;
 
 void expert_pool_jobs_stats(double& ms_prefetch, double& ms_zero, int64_t& zero_rows) {
@@ -3422,17 +3422,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     }
     const auto c2 = std::chrono::steady_clock::now();
-    // 2026-10-10 SPEED TEST ONLY (STRATA_CAR_TEST=R, default 0 = off): a CPU entry of rank >= R in its token whose
-    // expert is in neither VRAM nor the RAM copy (a file-tier read) is not computed - its row stays zero, the other
-    // weights are NOT renormalised.  STRATA_CAR_RAM=1: RAM-copy ones of rank >= R too.  Estimates what the 2x3090
-    // recipe's CAR ("faithful" / "fast") would gain; the answers change, so it is not for use.
-    static const int car_test = [] { const char* v = std::getenv("STRATA_CAR_TEST"); return v ? std::atoi(v) : 0; }();
-    static const bool car_ram = [] { const char* v = std::getenv("STRATA_CAR_RAM"); return v && v[0] == '1'; }();
-    // STRATA_CAR_CONF=tau (> 0): only a token whose first R picks carry >= tau of its routing weight skips (a token
-    // that spreads its weight - an unsure one - keeps all of its experts)
-    static const float car_conf = [] { const char* v = std::getenv("STRATA_CAR_CONF"); return v ? (float) std::atof(v) : 0.0f; }();
-    static const float car_minw = [] { const char* v = std::getenv("STRATA_CAR_MINW"); return v ? (float) std::atof(v) : 0.0f; }();
-    static const float car_renorm = [] { const char* v = std::getenv("STRATA_CAR_RENORM"); return v ? (float) std::atof(v) : 0.0f; }();
+    // 2026-10-10 expert skipping (OFF by default; the answers change a little when on - about one token in 100 on a
+    // long reasoning text at MINW 0.08, measured as the next-token KL against the exact path).  STRATA_GLM5_SKIP_KEEP=R
+    // (0 = off): a CPU entry of rank >= R in its token may be skipped - its row stays zero.  Which ones:
+    // STRATA_GLM5_SKIP_MINW=theta: only an expert whose routing weight is under theta of the token's (0.08-0.10 is the
+    // measured sweet spot: chat decode +30%); STRATA_GLM5_SKIP_RAM=0 limits it to experts read from the files (not in
+    // VRAM nor the RAM copy; default 1 = the RAM copy's too); STRATA_GLM5_SKIP_CONF=tau: only a token whose first R
+    // picks carry >= tau of its weight.  After the 2x3090 recipe's CAR ("faithful" / "fast").
+    static const int car_test = [] { const char* v = std::getenv("STRATA_GLM5_SKIP_KEEP"); return v ? std::atoi(v) : 0; }();
+    static const bool car_ram = [] { const char* v = std::getenv("STRATA_GLM5_SKIP_RAM"); return !(v && v[0] == '0'); }();
+    static const float car_conf = [] { const char* v = std::getenv("STRATA_GLM5_SKIP_CONF"); return v ? (float) std::atof(v) : 0.0f; }();
+    static const float car_minw = [] { const char* v = std::getenv("STRATA_GLM5_SKIP_MINW"); return v ? (float) std::atof(v) : 0.0f; }();
+    // STRATA_GLM5_SKIP_RENORM=maxscale (> 0): the skipped weight goes to the kept experts (capped) - measured worse, off
+    static const float car_renorm = [] { const char* v = std::getenv("STRATA_GLM5_SKIP_RENORM"); return v ? (float) std::atof(v) : 0.0f; }();
     static const bool split_file = [] { const char* v = std::getenv("STRATA_POOL_SPLIT_FILE"); return !(v && v[0] == '0'); }();
     const FileExpertSource* car_fs = car_test > 0 ? dynamic_cast<const FileExpertSource*>(d.src) : nullptr;
     bool car_skip[kMaxWindowEntries] = {};
@@ -3445,7 +3447,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 for (int64_t j = 0; j < k; ++j) { all += w[j]; if (j < car_test) top += w[j]; }
                 if (!(all > 0.0f) || top < car_conf * all) continue;
             }
-            // STRATA_CAR_MINW=theta (> 0): only an expert whose own weight is under theta of the token's skips
+            // STRATA_GLM5_SKIP_MINW=theta (> 0): only an expert whose own weight is under theta of the token's skips
             float wsum = 0.0f;
             if (car_minw > 0.0f && g_car_weights != nullptr)
                 for (int64_t j = 0; j < k; ++j) wsum += g_car_weights[t * k + j];
@@ -3455,7 +3457,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 car_skip[i] = kind[i] < 0 && ids[i] >= 0 && ids[i] < d.n_expert &&
                               (car_ram || !car_fs->has_resident(d.layers, ids[i]));
             }
-            // STRATA_CAR_RENORM=maxscale (> 0, the 2x3090 recipe's 1.5): the skipped weight goes to the kept experts -
+            // STRATA_GLM5_SKIP_RENORM=maxscale (> 0, the 2x3090 recipe's 1.5): the skipped weight goes to the kept experts -
             // skipped 0, kept x min(total / kept, maxscale).  The GPU takes these weights back before its combine
             // (verify_glm5 post: m_w_ -> w_)
             if (car_renorm > 0.0f && g_car_weights != nullptr) {
@@ -3546,7 +3548,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
                 continue;
             }
-            if (car_skip[i]) {   // STRATA_CAR_TEST: not computed, a zero row
+            if (car_skip[i]) {   // skipped (STRATA_GLM5_SKIP_*): not computed, a zero row
                 std::memset(row, 0, (size_t) HW * sizeof(float));
                 continue;
             }

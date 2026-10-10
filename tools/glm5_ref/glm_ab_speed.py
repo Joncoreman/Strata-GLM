@@ -3,10 +3,14 @@
 import os, subprocess, sys, time
 from pathlib import Path
 
-WT = Path(os.environ.get("WT", r"D:\AI\LLM\strata-glm-gpu"))   # the worktree whose build-engine runs
-EXE = WT / "build-engine" / "strata.exe"
-PACK = os.environ.get("PACK", "D:/AI/LLM/Strata-data/packs/glm53_iq4xs")   # PACK= / NATIVE=: another quantization (2026-10-10)
-NATIVE = os.environ.get("NATIVE", "D:/AI/LLM/GLM-5.3-Flash-GGUF/unsloth/GLM-5.3-Flash-GGUF/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _glm5_paths as P  # noqa: E402  (PACK= / NATIVE= / STRATA_EXE=, else strata-glm5.json, else Strata-data)
+
+WT = Path(os.environ.get("WT", str(P.REPO)))   # the repository whose build-engine runs
+EXE = Path(os.environ.get("STRATA_EXE", str(WT / "build-engine" / "strata.exe")))
+PACK = str(P.pack_dir()).replace("\\", "/")
+NATIVE = str(P.native_gguf()).replace("\\", "/")
+PROFILE = str(P.expert_profile()).replace("\\", "/")
 OUT = WT / "build-engine" / "glm_ab"   # logs and tokens (beside the engine build, not in the source tree)
 OUT.mkdir(exist_ok=True)
 mode = sys.argv[1]
@@ -30,7 +34,7 @@ print("prompt tokens:", ids.count(",") + 1, flush=True)
 args = ["--serve", "--pack", PACK, "--native", NATIVE, "--prefill", "auto", "--spec", os.environ.get("SPEC", "6"), "--max-context", os.environ.get("CTX", "32768"),
         "--pcie-frac", "0", "--short-read", "1000000000", "--prompt-cache", "0", "--pool-workers", os.environ.get("WORKERS", "16"),
         "--vram-reserve-mib", os.environ.get("VRES", "2200"), "--mmap-experts", "--resident-budget-gib", os.environ.get("RES", "105"),
-        "--expert-profile", PACK + "/expert-profile-learned-2026-10-08b.bin", "--expert-cache", os.environ.get("CACHE", "0"),
+        "--expert-profile", PROFILE, "--expert-cache", os.environ.get("CACHE", "0"),
         "--adapt-every", os.environ.get("ADAPT_EVERY", "1"), "--adapt-swaps", os.environ.get("ADAPT", "64")]
 args += os.environ.get("EXTRA", "").split()   # more engine flags for an A/B (space separated)
 if mode == "mn":
