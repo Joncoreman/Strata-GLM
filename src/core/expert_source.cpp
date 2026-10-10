@@ -3434,7 +3434,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
             }
         }
-    static int64_t car_tok = 0, car_conf_tok = 0, car_skips = 0, car_cpu = 0;   // printed every 1,000 calls
+    static int64_t car_tok = 0, car_conf_tok = 0, car_skips = 0, car_cpu = 0;   // printed every 20,000 calls
     if (car_fs != nullptr) {
         for (int64_t i = 0; i < n; ++i) { car_skips += car_skip[i]; car_cpu += kind[i] < 0; }
         for (int64_t t = 0; t < n_tok; ++t) {
@@ -3442,7 +3442,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             for (int64_t j = 0; j < k; ++j) if (car_skip[t * k + j]) { ++car_conf_tok; break; }
         }
         static int64_t calls = 0;
-        if (++calls % 1000 == 0)
+        if (++calls % 20000 == 0)
             std::fprintf(stderr, "strata car test: %.1f%% of tokens skipped some expert, %.1f%% of the CPU entries skipped\n",
                          100.0 * car_conf_tok / std::max<int64_t>(1, car_tok), 100.0 * car_skips / std::max<int64_t>(1, car_cpu));
     }
