@@ -13063,7 +13063,9 @@ int main(int argc, char** argv) {
                 while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
             }
             if (first_window) T = 1;
-            if (prompt_windows && !use_mtp && !gmtp_on) T = 1;   // glm5-next without a drafter: wider windows would only verify zeros
+            // glm5-next without a drafter: wider windows would only verify zeros (--spec-oracle drafts the known
+            // continuation: the windows stay wide - what a perfect drafter would give, 2026-10-10)
+            if (prompt_windows && !use_mtp && !gmtp_on && oracle.empty()) T = 1;
             bool from_sfx = false;
             int sfx_match = 0;
             if (o.suffix_draft > 0 && !first_window) {

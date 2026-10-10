@@ -58,7 +58,7 @@
 #include <immintrin.h>
 
 namespace strata::core {
-extern const float* g_car_weights;   // expert_source.cpp: STRATA_CAR_TEST's router weights
+extern float* g_car_weights;   // expert_source.cpp: STRATA_CAR_TEST's router weights (rewritten by STRATA_CAR_RENORM)
 namespace {
 
 constexpr float EPS = 1e-6f;

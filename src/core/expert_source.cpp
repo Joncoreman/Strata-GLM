@@ -3187,7 +3187,7 @@ std::atomic<int64_t> g_ns_prefetch{0}, g_ns_zero{0}, g_zero_rows{0};
 }  // namespace
 
 // STRATA_CAR_TEST's router weights: the verify window sets it to the call's rows (h_w_, [n_tok][k]) before the pool
-const float* g_car_weights = nullptr;
+float* g_car_weights = nullptr;
 
 void expert_pool_jobs_stats(double& ms_prefetch, double& ms_zero, int64_t& zero_rows) {
     ms_prefetch = (double) g_ns_prefetch.exchange(0) / 1e6;
@@ -3398,6 +3398,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // that spreads its weight - an unsure one - keeps all of its experts)
     static const float car_conf = [] { const char* v = std::getenv("STRATA_CAR_CONF"); return v ? (float) std::atof(v) : 0.0f; }();
     static const float car_minw = [] { const char* v = std::getenv("STRATA_CAR_MINW"); return v ? (float) std::atof(v) : 0.0f; }();
+    static const float car_renorm = [] { const char* v = std::getenv("STRATA_CAR_RENORM"); return v ? (float) std::atof(v) : 0.0f; }();
     const FileExpertSource* car_fs = car_test > 0 ? dynamic_cast<const FileExpertSource*>(d.src) : nullptr;
     bool car_skip[kMaxWindowEntries] = {};
     if (car_fs != nullptr)
@@ -3418,6 +3419,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 if (car_minw > 0.0f && (g_car_weights == nullptr || !(wsum > 0.0f) || g_car_weights[i] >= car_minw * wsum)) continue;
                 car_skip[i] = kind[i] < 0 && ids[i] >= 0 && ids[i] < d.n_expert &&
                               (car_ram || !car_fs->has_resident(d.layers, ids[i]));
+            }
+            // STRATA_CAR_RENORM=maxscale (> 0, the 2x3090 recipe's 1.5): the skipped weight goes to the kept experts -
+            // skipped 0, kept x min(total / kept, maxscale).  The GPU takes these weights back before its combine
+            // (verify_glm5 post: m_w_ -> w_)
+            if (car_renorm > 0.0f && g_car_weights != nullptr) {
+                float* w = g_car_weights + t * k;
+                float total = 0.0f, kept = 0.0f;
+                bool any = false;
+                for (int64_t j = 0; j < k; ++j) { total += w[j]; if (car_skip[t * k + j]) any = true; else kept += w[j]; }
+                if (any && kept > 0.0f) {
+                    const float sc = std::min(total / kept, car_renorm);
+                    for (int64_t j = 0; j < k; ++j) w[j] = car_skip[t * k + j] ? 0.0f : w[j] * sc;
+                }
             }
         }
     static int64_t car_tok = 0, car_conf_tok = 0, car_skips = 0, car_cpu = 0;   // printed every 1,000 calls

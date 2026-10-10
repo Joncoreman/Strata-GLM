@@ -435,6 +435,10 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
         native_expert_grouped(L, p_ptr2, p_start2, p_counts + 2, p_dst, p_tok, cap, cap, nat_xq_, hit_scratch_, hit_out_, cs,
                               kPcieGroupRows);
         wait_flag_ge(m_flag_, ring, cs);
+        // STRATA_CAR_RENORM (expert_source.cpp): the host rewrote the window's weights in m_w_ (skipped 0, the rest
+        // scaled) - the combine takes them back (a bit copy; unchanged rows copy as they were)
+        static const bool car_renorm = [] { const char* v = std::getenv("STRATA_CAR_RENORM"); return v && std::atof(v) > 0.0; }();
+        if (car_renorm) copy_i32_from_mapped((int32_t*) w_, (const int32_t*) m_w_, (int64_t) n * K, cs);
         copy_rows_from_mapped(parts_, m_ymiss_, (int64_t) n * K, N, p_dst, p_counts + 1, cs);
         moe_hit_add(parts_, hit_out_, p_dst, p_counts + 1, cap, N, cs);
         native_moe_combine_multi(parts_, w_, shared_, bo_, N, K, n, cs);

@@ -1,5 +1,5 @@
-# The quality yardstick (2026-10-10): run strata (not --serve) over a prompt and a fixed continuation, every window
-# accepted (--spec-follow + --spec-oracle on the same file), each position's logits to OUT (STRATA_FOLLOW_LOGITS).
+# The quality yardstick (2026-10-10): run strata (not --serve) over a prompt and a fixed continuation
+# (--spec-follow), each position's logits to OUT (STRATA_FOLLOW_LOGITS).
 # Usage: python car_follow.py PROMPT_IDS CONT_IDS OUT [extra env as K=V ...]
 import os, subprocess, sys, time
 from pathlib import Path
@@ -19,7 +19,11 @@ args = ["--pack", PACK, "--native", NATIVE, "--prefill", "auto", "--spec", "6", 
         "--vram-reserve-mib", "3400", "--mmap-experts", "--resident-budget-gib", "98",
         "--expert-profile", PACK + "/expert-profile-learned-2026-10-08b.bin", "--expert-cache", "0",
         "--adapt-every", "1", "--adapt-swaps", "64",
-        "--tokens-file", prompt, "--max-new", str(n_cont), "--spec-follow", cont, "--spec-oracle", cont]
+        "--tokens-file", prompt, "--max-new", str(n_cont), "--spec-follow", cont]
+# ORACLE=1: the continuation as the drafts too - the windows go wide (8 tokens, all accepted: a perfect drafter's
+# speed); without it every window is one token (the yardstick's runs, 2026-10-10)
+if os.environ.get("ORACLE") == "1":
+    args += ["--spec-oracle", cont]
 t0 = time.time()
 r = subprocess.run([str(EXE)] + args, cwd=WT, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
 log = Path(out).with_suffix(".log")
