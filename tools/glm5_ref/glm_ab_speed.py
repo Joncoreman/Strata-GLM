@@ -14,7 +14,10 @@ K1, K2 = (int(sys.argv[2]), int(sys.argv[3])) if len(sys.argv) > 3 else (30, 44)
 NEW = 256
 LONG = int(os.environ.get("LONG", "0"))   # N > 0: summarize the first N characters of docs (a long prompt)
 msg_args = []
-if LONG > 0:
+if os.environ.get("MSG"):   # MSG=file: this message instead of the chat question / the docs (UTF-8)
+    msg_args = ["@" + os.environ["MSG"]]
+    NEW = int(os.environ.get("NEW", "256"))
+elif LONG > 0:
     DOCS = Path(os.environ.get("DOCS", str(WT / "docs")))   # DOCS=...: another tree's docs (the same prompt for two builds)
     docs = "".join(p.read_text(encoding="utf-8", errors="replace") for p in sorted(DOCS.glob("*.md")))
     msg_file = OUT / "prompt_msg.txt"   # through a file: a long prompt overflows Windows' 32K command line
