@@ -6,8 +6,8 @@ from pathlib import Path
 
 WT = Path(r"D:\AI\LLM\strata-glm-v041")
 EXE = WT / "build-engine" / "strata.exe"
-PACK = "D:/AI/LLM/Strata-data/packs/glm53_iq4xs"
-NATIVE = "D:/AI/LLM/GLM-5.3-Flash-GGUF/unsloth/GLM-5.3-Flash-GGUF/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"
+PACK = os.environ.get("PACK", "D:/AI/LLM/Strata-data/packs/glm53_iq4xs")   # PACK= / NATIVE=: another quantization
+NATIVE = os.environ.get("NATIVE", "D:/AI/LLM/GLM-5.3-Flash-GGUF/unsloth/GLM-5.3-Flash-GGUF/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf")
 prompt, cont, out = sys.argv[1], sys.argv[2], sys.argv[3]
 env = dict(os.environ, STRATA_GLM5_GO="1", STRATA_FOLLOW_LOGITS=out, STRATA_GLM5_PREFILL="4096", STRATA_GLM5_PF_DIRECT="1")
 for kv in sys.argv[4:]:

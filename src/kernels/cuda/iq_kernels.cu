@@ -645,8 +645,9 @@ template<> struct Fmt<11> { static constexpr int qk = 256, ipb = QI3_K, step = 1
 #else
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8) X(11)
 #endif
-// glm5-next (2026-10-08): Q6_K (14) and Q4_K (12) downs are always built - the UD-Q4_K_XL pack has them
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(14) X(12)
+// glm5-next (2026-10-08): Q6_K (14) and Q4_K (12) downs are always built - the UD-Q4_K_XL pack has them;
+// IQ3_S (21) downs too (2026-10-10: GLM-5.3-Flash UD-IQ3_XXS has IQ2_S gate/up with IQ3_S downs)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(14) X(12) X(21)
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8)
 
 __device__ __forceinline__ float warp_sum(float v) {

@@ -5,8 +5,8 @@ from pathlib import Path
 
 WT = Path(os.environ.get("WT", r"D:\AI\LLM\strata-glm-gpu"))   # the worktree whose build-engine runs
 EXE = WT / "build-engine" / "strata.exe"
-PACK = "D:/AI/LLM/Strata-data/packs/glm53_iq4xs"
-NATIVE = "D:/AI/LLM/GLM-5.3-Flash-GGUF/unsloth/GLM-5.3-Flash-GGUF/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"
+PACK = os.environ.get("PACK", "D:/AI/LLM/Strata-data/packs/glm53_iq4xs")   # PACK= / NATIVE=: another quantization (2026-10-10)
+NATIVE = os.environ.get("NATIVE", "D:/AI/LLM/GLM-5.3-Flash-GGUF/unsloth/GLM-5.3-Flash-GGUF/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf")
 OUT = WT / "build-engine" / "glm_ab"   # logs and tokens (beside the engine build, not in the source tree)
 OUT.mkdir(exist_ok=True)
 mode = sys.argv[1]
