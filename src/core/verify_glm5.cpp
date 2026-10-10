@@ -57,6 +57,10 @@
 
 namespace strata::core {
 
+// the MLA decode's per-head absorb products (wk_b[h] . q[h], wv_b[h] . lat[h]) in one launch each (2026-10-10:
+// 2 x 64 launches of ~4.9 us a DSA layer -> 2; bitwise the per-head calls).  STRATA_GLM5_ABSORB_BATCH=0: head by head
+static const bool absorb_batch = [] { const char* v = std::getenv("STRATA_GLM5_ABSORB_BATCH"); return !(v && v[0] == '0'); }();
+
 struct Verifier::Glm5 {
     // geometry (from the GGUF)
     int64_t N = 0, H = 0, S = 0, C = 0, DI = 0;            // n_embd, KDA heads, head dim, conv channels, H*S
@@ -347,9 +351,13 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
             native_quantize_q8_1(m.qT, m.q8, (int) (QK * NH * n), 1, cs);   // NH*n contiguous columns as one vector
             {
                 const size_t row = (size_t) (QK / 32) * 34, qcol = (size_t) (QK / 32) * 36;
-                for (int64_t h = 0; h < NH; ++h)
-                    native_mmvq(wkb->native_type, (const uint8_t*) wkb->native_data + (size_t) h * KVR * row,
-                                m.q8 + (size_t) h * n * qcol, m.qaT + (size_t) h * n * KVR, (int) QK, (int) KVR, n, cs);
+                // one token: the heads in one launch (2026-10-10; STRATA_GLM5_ABSORB_BATCH=0: head by head)
+                if (!(n == 1 && absorb_batch && wkb->native_type == 8 &&
+                      native_mmvq_batched_q8_0(wkb->native_data, (size_t) KVR * row, m.q8, qcol, m.qaT, (size_t) KVR,
+                                               (int) QK, (int) KVR, (int) NH, cs)))
+                    for (int64_t h = 0; h < NH; ++h)
+                        native_mmvq(wkb->native_type, (const uint8_t*) wkb->native_data + (size_t) h * KVR * row,
+                                    m.q8 + (size_t) h * n * qcol, m.qaT + (size_t) h * n * KVR, (int) QK, (int) KVR, n, cs);
             }
             glm5_transpose_abd(m.qaT, m.qa, (int) NH, n, (int) KVR, cs);                    // [t][h][KVR]
             // the indexer: keys and gates of these tokens into the pool (tail snapshot first, for the commit)
@@ -371,9 +379,12 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
             native_quantize_q8_1(m.latT, m.q8, (int) (KVR * NH * n), 1, cs);
             {
                 const size_t row = (size_t) (KVR / 32) * 34, qcol = (size_t) (KVR / 32) * 36;
-                for (int64_t h = 0; h < NH; ++h)
-                    native_mmvq(wvb->native_type, (const uint8_t*) wvb->native_data + (size_t) h * VD * row,
-                                m.q8 + (size_t) h * n * qcol, m.vbT + (size_t) h * n * VD, (int) KVR, (int) VD, n, cs);
+                if (!(n == 1 && absorb_batch && wvb->native_type == 8 &&
+                      native_mmvq_batched_q8_0(wvb->native_data, (size_t) VD * row, m.q8, qcol, m.vbT, (size_t) VD,
+                                               (int) KVR, (int) VD, (int) NH, cs)))
+                    for (int64_t h = 0; h < NH; ++h)
+                        native_mmvq(wvb->native_type, (const uint8_t*) wvb->native_data + (size_t) h * VD * row,
+                                    m.q8 + (size_t) h * n * qcol, m.vbT + (size_t) h * n * VD, (int) KVR, (int) VD, n, cs);
             }
             glm5_transpose_abd(m.vbT, m.vb, (int) NH, n, (int) VD, cs);                     // [t][h][VD]
             mmvq(wo, m.vb, (int) (NH * VD), bo_, (int) N, n, m.q8, cs);

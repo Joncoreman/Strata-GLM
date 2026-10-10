@@ -129,6 +129,13 @@ bool native_mmvq_supported(int ggml_type) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
+/// 2026-10-10: n_batch single-column Q8_0 products in ONE launch - member b reads weights + b * w_stride_bytes,
+/// x_q8_1 + b * x_stride_bytes and writes y + b * y_stride; each member bitwise native_mmvq(8, ..., ncols = 1) on
+/// its slice.  Returns false (nothing launched) for a stride that is not whole blocks, n_in not a multiple of 32, or
+/// n_batch outside 1..65535.
+bool native_mmvq_batched_q8_0(const void* weights, std::size_t w_stride_bytes, const void* x_q8_1,
+                              std::size_t x_stride_bytes, float* y, std::size_t y_stride, int n_in, int n_out,
+                              int n_batch, void* stream);
 /// S26 STRATA_LFUSE: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2), same type / shape / input, in ONE launch,
 /// bitwise the two calls. Returns false (nothing launched) where that is not the case (Q8_0, 2-8 columns only).
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,

@@ -778,11 +778,11 @@ __device__ __forceinline__ float small_q8_dot(const IQ4NLBlock* __restrict__ w,
 
 // QI=4 for Q4_0/Q5_0/IQ4_NL and QI=8 for Q8_0. With VDR=2 this preserves
 // the pinned 64/32-block iteration and 2048/1024-element small-K thresholds.
+// The body of the ncols = 1 kernel, shared by the plain and the batched launch below (2026-10-10): the same
+// instructions in the same order, so a batch's slice is bitwise the plain call on it.
 template<typename Weight, int Qi, bool SmallK>
-__launch_bounds__(WARPS * WARP, 1)
-__global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
-                                         const Q81Block* __restrict__ x,
-                                         float* __restrict__ y, int n_in, int n_out) {
+__device__ __forceinline__ void native_small_mmvq_body(const Weight* __restrict__ w, const Q81Block* __restrict__ x,
+                                                       float* __restrict__ y, int n_in, int n_out) {
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = 2 * WARPS * WARP / Qi;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
@@ -813,6 +813,25 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
         tmp[i] = warp_sum(tmp[i]);
         if (threadIdx.x == i && row0 + i < n_out) y[row0 + i] = tmp[i];
     }
+}
+
+template<typename Weight, int Qi, bool SmallK>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
+                                         const Q81Block* __restrict__ x,
+                                         float* __restrict__ y, int n_in, int n_out) {
+    native_small_mmvq_body<Weight, Qi, SmallK>(w, x, y, n_in, n_out);
+}
+
+// blockIdx.y = the batch member: its own weights, input and output (strides in blocks / floats).  GLM-5.3's MLA
+// decode absorbs per head (wk_b[h] . q[h], wv_b[h] . lat[h]): 64 launches of 4.9 us each a layer became one.
+template<typename Weight, int Qi, bool SmallK>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_small_mmvq_batched_kernel(const Weight* __restrict__ w, const Q81Block* __restrict__ x,
+                                                 float* __restrict__ y, int n_in, int n_out, long long w_stride,
+                                                 long long x_stride, long long y_stride) {
+    const long long b = blockIdx.y;
+    native_small_mmvq_body<Weight, Qi, SmallK>(w + b * w_stride, x + b * x_stride, y + b * y_stride, n_in, n_out);
 }
 
 // ============================ plan v0.3 P3: ncols = 2..8 (speculative verify, small batches) ============================
@@ -2400,6 +2419,34 @@ void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
     if (q8_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q8_PACKED=1 tensors
     small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+}
+
+bool native_mmvq_batched_q8_0(const void* weights, std::size_t w_stride_bytes, const void* x_q8_1,
+                              std::size_t x_stride_bytes, float* y, std::size_t y_stride, int n_in, int n_out,
+                              int n_batch, void* stream) {
+    constexpr int Qi = 8;
+    if (n_batch < 1 || n_batch > 65535 || n_in <= 0 || n_in % 32 != 0 || n_out <= 0 ||
+        w_stride_bytes % sizeof(Q80Block) != 0 || x_stride_bytes % sizeof(Q81Block) != 0)
+        return false;
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    const auto* w = static_cast<const Q80Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const dim3 threads(WARP, WARPS);
+    const long long ws = (long long) (w_stride_bytes / sizeof(Q80Block)), xs = (long long) (x_stride_bytes / sizeof(Q81Block));
+    if (n_in / 32 < 2 * WARPS * WARP / Qi) {
+        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+        native_small_mmvq_batched_kernel<Q80Block, Qi, true><<<dim3(blocks, unsigned(n_batch)), threads, 0, s>>>(
+            w, x, y, n_in, n_out, ws, xs, (long long) y_stride);
+    } else {
+        native_small_mmvq_batched_kernel<Q80Block, Qi, false><<<dim3(unsigned(n_out), unsigned(n_batch)), threads, 0, s>>>(
+            w, x, y, n_in, n_out, ws, xs, (long long) y_stride);
+    }
+    launch_check();
+    return true;
 }
 
 void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,
