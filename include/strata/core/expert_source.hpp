@@ -197,6 +197,9 @@ public:
     /// The `n` experts of `layer` the CPU is about to ask `blob` for, all at once: a source that reads a file may
     /// fetch them in parallel.  The bytes `blob` then returns are the same.  Default: nothing.
     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
+    /// 2026-10-10: `prefetch` that returns at once - the reads go on in the background and a `blob` of one still in
+    /// flight waits for it.  Default: the synchronous prefetch.
+    virtual void prefetch_async(int64_t layer, const int64_t* experts, int64_t n) { prefetch(layer, experts, n); }
     /// CS-T: the experts of `layer` a predictor expects next - a source that reads a file may start reading their
     /// pages now, in the background.  Only warms: what `blob` returns is unchanged.  Default: nothing.
     virtual void warm(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
@@ -636,6 +639,7 @@ public:
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override;
+    void prefetch_async(int64_t layer, const int64_t* experts, int64_t n) override;
     /// CS-T: the GGUF in place asks the OS for the predicted experts' pages (PrefetchVirtualMemory on Windows,
     /// madvise(WILLNEED) elsewhere), skipping the RAM copy's.
     void warm(int64_t layer, const int64_t* experts, int64_t n) override;
@@ -691,6 +695,14 @@ private:
     struct Fill { size_t v; int64_t layer, e; uint8_t* dst; };
     /// The claimed buffers' blobs: one overlapped batch when unbuffered, else the fetch threads' mapped copies.
     void fill_many(const std::vector<Fill>& todo);
+    /// prefetch's claims (the stage buffers of the experts not in the RAM copy nor cached), to fill
+    void claim_fills(int64_t layer, const int64_t* experts, int64_t n, std::vector<Fill>& todo);
+    // prefetch_async: one background thread fills what the decode windows hand it (started on first use)
+    std::thread pf_thread_;
+    std::mutex pf_mu_;
+    std::condition_variable pf_cv_;
+    std::vector<Fill> pf_todo_;
+    bool pf_stop_ = false;
     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
     /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
     bool read_direct(const Fill* fills, size_t n) const;

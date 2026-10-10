@@ -12278,13 +12278,33 @@ int main(int argc, char** argv) {
         // the prompt's routing counts (Verifier::pf_usage), for these RAM-tier decisions only, scaled to a window's and
         // decayed every window (STRATA_GLM5_RAM_SEED=0: none) - the topic's file-tier experts move in from the first window
         std::vector<float> ram_bias;
+        // 2026-10-10: the promotion in two steps so its file reads leave the token's path (6-9 ms a window after a
+        // summary prompt): this window asks the source to read the picks in the background (prefetch_async), the next
+        // window copies them (blob() is then a copy of a staged buffer) and exchanges.  STRATA_GLM5_RAM_DEFER=0: read now
+        static const bool ram_defer = [] { const char* v = std::getenv("STRATA_GLM5_RAM_DEFER"); return !(v && v[0] == '0'); }();
+        struct RSwap { float gain; int32_t layer, in, out; };
+        std::vector<RSwap> ram_pending;
         auto ram_promote = [&]() -> bool {
             if (ram_swaps <= 0 || !pending.empty() || drive.d.usage.empty() || !src.complement_ready() ||
                 src.exchange_capacity() < 1)
                 return true;
             const Clock::time_point t0 = Clock::now();
             const bool biased = ram_bias.size() == drive.d.usage.size();
-            struct RSwap { float gain; int32_t layer, in, out; };
+            if (!ram_pending.empty()) {   // last window's picks, read in the background meanwhile
+                int64_t q = 0;
+                for (const RSwap& s : ram_pending) {
+                    if (q >= src.exchange_capacity()) break;
+                    if (!src.has_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) continue;   // moved meanwhile
+                    const uint8_t* b = srcp->blob(s.layer, s.out);
+                    uint8_t* xb = src.exchange_buffer(q);
+                    if (b == nullptr || xb == nullptr) break;
+                    std::memcpy(xb, b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
+                    if (!src.stage_exchange(s.layer, s.in, s.out, q)) break;
+                    ++q;
+                }
+                ram_pending.clear();
+                ram_swaps_total += src.commit_exchanges();
+            }
             std::vector<RSwap> sw;
             std::vector<std::pair<float, int32_t>> cand, vict;
             for (int64_t l = 0; l < g.n_layers; ++l) {
@@ -12312,15 +12332,23 @@ int main(int argc, char** argv) {
             if (sw.empty()) return true;
             std::sort(sw.begin(), sw.end(), [](const RSwap& a, const RSwap& b) { return a.gain > b.gain; });
             const size_t n = std::min<size_t>(sw.size(), (size_t) std::min<int64_t>(ram_swaps, src.exchange_capacity()));
-            for (size_t q = 0; q < n; ++q) {
-                const RSwap& s = sw[q];
-                const uint8_t* b = srcp->blob(s.layer, s.out);   // the file tier: read now (a staging buffer)
-                uint8_t* xb = src.exchange_buffer((int64_t) q);
-                if (b == nullptr || xb == nullptr) return true;
-                std::memcpy(xb, b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
-                if (!src.stage_exchange(s.layer, s.in, s.out, (int64_t) q)) break;
+            if (ram_defer) {
+                for (size_t q = 0; q < n; ++q) {   // read in the background; exchanged next window
+                    const int64_t e = sw[q].out;
+                    srcp->prefetch_async(sw[q].layer, &e, 1);
+                    ram_pending.push_back(sw[q]);
+                }
+            } else {
+                for (size_t q = 0; q < n; ++q) {
+                    const RSwap& s = sw[q];
+                    const uint8_t* b = srcp->blob(s.layer, s.out);   // the file tier: read now (a staging buffer)
+                    uint8_t* xb = src.exchange_buffer((int64_t) q);
+                    if (b == nullptr || xb == nullptr) return true;
+                    std::memcpy(xb, b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
+                    if (!src.stage_exchange(s.layer, s.in, s.out, (int64_t) q)) break;
+                }
+                ram_swaps_total += src.commit_exchanges();
             }
-            ram_swaps_total += src.commit_exchanges();
             if (biased) for (float& v : ram_bias) v *= 0.9f;
             ms_ram_swaps += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             return true;

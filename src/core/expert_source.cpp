@@ -906,6 +906,13 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 }
 
 void FileExpertSource::close() {
+    {
+        std::lock_guard<std::mutex> lk(pf_mu_);
+        pf_stop_ = true;
+    }
+    pf_cv_.notify_all();
+    if (pf_thread_.joinable()) pf_thread_.join();
+    pf_stop_ = false;
     io_stop();
     inputs_.clear();
     if (complement_arena_ != nullptr) {
@@ -1318,6 +1325,42 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
         return;
     }
     std::vector<Fill> todo;
+    const auto t0 = std::chrono::steady_clock::now();
+    claim_fills(layer, experts, n, todo);
+    fill_many(todo);
+    if (io_pf_ && !todo.empty()) {
+        io_crit_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
+                              std::memory_order_relaxed);
+        io_crit_n_.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void FileExpertSource::prefetch_async(int64_t layer, const int64_t* experts, int64_t n) {
+    if (!staged() || n <= 0 || layer < 0 || layer >= n_layers_) return;
+    if (io_fill_ && io_pf_ && direct_.empty()) { prefetch(layer, experts, n); return; }   // already in the background
+    std::vector<Fill> todo;
+    claim_fills(layer, experts, n, todo);
+    if (todo.empty()) return;
+    std::lock_guard<std::mutex> lk(pf_mu_);
+    if (!pf_thread_.joinable())
+        pf_thread_ = std::thread([this] {
+            std::vector<Fill> batch;
+            for (;;) {
+                {
+                    std::unique_lock<std::mutex> lk2(pf_mu_);
+                    pf_cv_.wait(lk2, [&] { return pf_stop_ || !pf_todo_.empty(); });
+                    if (pf_stop_ && pf_todo_.empty()) return;
+                    batch.swap(pf_todo_);
+                }
+                fill_many(batch);   // publishes each stage as it lands; a blob() of one still busy waits on stage_cv_
+                batch.clear();
+            }
+        });
+    pf_todo_.insert(pf_todo_.end(), todo.begin(), todo.end());
+    pf_cv_.notify_one();
+}
+
+void FileExpertSource::claim_fills(int64_t layer, const int64_t* experts, int64_t n, std::vector<Fill>& todo) {
     // experts.bin with io prefetch: a blob whose pages are cached is handed out as the mapping (io_blob); only the
     // uncached ones are read here, together, on the fetch threads
     const bool only_uncached = io_pf_ && role_ptr_.empty() && direct_.empty();
@@ -1331,33 +1374,24 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
             cold[(size_t) i] = cached_bytes(layer, e, total, false) < total ? 1 : 0;
         }
     }
-    const auto t0 = std::chrono::steady_clock::now();
-    {
-        std::lock_guard<std::mutex> lk(stage_mu_);
-        for (int64_t i = 0; i < n; ++i) {
-            const int64_t e = experts[i];
-            if (e < 0 || e >= n_expert_) continue;
-            const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
-            if (complement_ready_ && resident_blob(index) != nullptr)
-                continue;                                     // in the RAM copy
-            if (!override_.empty() && override_[index] != nullptr) continue;
-            if (only_uncached && !cold[(size_t) i] && stage_of_.find(layer * n_expert_ + e) == stage_of_.end()) continue;
-            size_t v = 0;
-            bool fill = false;
-            if (!claim_stage(layer * n_expert_ + e, v, fill) && fill) {
-                todo.push_back({v, layer, e, stage_buf_[v].get()});
-                if (warm_stamp_) {
-                    const uint32_t s = warm_stamp_[index].load(std::memory_order_relaxed);
-                    if (s != 0 && (uint64_t) s + 3 >= epoch_ + 1) warm_hits_.fetch_add(1, std::memory_order_relaxed);
-                }
+    std::lock_guard<std::mutex> lk(stage_mu_);
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t e = experts[i];
+        if (e < 0 || e >= n_expert_) continue;
+        const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
+        if (complement_ready_ && resident_blob(index) != nullptr)
+            continue;                                     // in the RAM copy
+        if (!override_.empty() && override_[index] != nullptr) continue;
+        if (only_uncached && !cold[(size_t) i] && stage_of_.find(layer * n_expert_ + e) == stage_of_.end()) continue;
+        size_t v = 0;
+        bool fill = false;
+        if (!claim_stage(layer * n_expert_ + e, v, fill) && fill) {
+            todo.push_back({v, layer, e, stage_buf_[v].get()});
+            if (warm_stamp_) {
+                const uint32_t s = warm_stamp_[index].load(std::memory_order_relaxed);
+                if (s != 0 && (uint64_t) s + 3 >= epoch_ + 1) warm_hits_.fetch_add(1, std::memory_order_relaxed);
             }
         }
-    }
-    fill_many(todo);
-    if (io_pf_ && !todo.empty()) {
-        io_crit_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
-                              std::memory_order_relaxed);
-        io_crit_n_.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -3399,6 +3433,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     static const float car_conf = [] { const char* v = std::getenv("STRATA_CAR_CONF"); return v ? (float) std::atof(v) : 0.0f; }();
     static const float car_minw = [] { const char* v = std::getenv("STRATA_CAR_MINW"); return v ? (float) std::atof(v) : 0.0f; }();
     static const float car_renorm = [] { const char* v = std::getenv("STRATA_CAR_RENORM"); return v ? (float) std::atof(v) : 0.0f; }();
+    static const bool split_file = [] { const char* v = std::getenv("STRATA_POOL_SPLIT_FILE"); return !(v && v[0] == '0'); }();
     const FileExpertSource* car_fs = car_test > 0 ? dynamic_cast<const FileExpertSource*>(d.src) : nullptr;
     bool car_skip[kMaxWindowEntries] = {};
     if (car_fs != nullptr)
@@ -3459,16 +3494,36 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         g_cpu_bytes += (uint64_t) miss.size() * lay.blob_bytes(d.layers);
         g_cpu_rows += rows;
         const auto p0 = std::chrono::steady_clock::now();
-        d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
+        if (split_file) d.src->prefetch_async(d.layers, miss.data(), (int64_t) miss.size());
+        else d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
         g_ns_prefetch += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - p0).count();
     }
     std::chrono::nanoseconds zero_ns{0};
     int njobs = 0;
+    // 2026-10-10 (STRATA_POOL_SPLIT_FILE, default 1): the file-tier reads go on in the background while the RAM-copy
+    // experts (pass 0) compute; the file-tier ones (pass 1) follow, their blob() waiting for a read still in flight.
+    // Each expert's rows are computed as before (one job each, the same kernels): bitwise the single pass.
+    const FileExpertSource* split_fs = split_file ? dynamic_cast<const FileExpertSource*>(d.src) : nullptr;
+    int njobs_pass0 = 0;
+    for (int pass = 0; pass < (split_fs != nullptr ? 2 : 1); ++pass) {
+    if (pass == 1) {
+        njobs_pass0 = njobs;
+        pt("run pass 0", njobs);
+        if (njobs > 0) {
+            if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
+            else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+        }
+    }
     for (int64_t t = 0; t < n_tok; ++t)
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
             const int64_t e = ids[i];
             float* row = out + (size_t) i * HW;
+            if (pass == 1 && kind[i] >= 0) continue;   // the GPU rows were zeroed / counted in pass 0
+            if (split_fs != nullptr && e >= 0 && e < d.n_expert && kind[i] < 0 && !car_skip[i] &&
+                (pass == 0) != split_fs->has_resident(d.layers, e))
+                continue;   // pass 0: the RAM copy's experts; pass 1: the rest (file tier, exchange buffers)
+            if (pass == 1 && car_skip[i]) continue;
             if (e < 0 || e >= d.n_expert) {
                 d.failed = true;
                 d.fail = "a routed expert id is out of range";
@@ -3498,7 +3553,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++d.cache_refused;
             int16_t& jo = d.job_of[(size_t) e];
             if (jo < 0) {
+                const auto b0 = std::chrono::steady_clock::now();
                 const uint8_t* b = d.src->blob(d.layers, e);
+                if (pass == 1)   // the wait for a read still in flight counts as the SSD wait ("prefetch" in the stats)
+                    g_ns_prefetch += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - b0).count();
                 if (b == nullptr) {
                     d.failed = true;
                     d.fail = "the expert source could not produce a blob";
@@ -3519,12 +3577,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++jb.nt;
             ++d.multi_entries;
         }
+    }   // the passes
     const auto c3 = std::chrono::steady_clock::now();
     g_ns_zero += zero_ns.count();
-    pt("run", njobs);
-    if (njobs > 0) {
-        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
-        else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+    pt("run", njobs - njobs_pass0);
+    if (njobs - njobs_pass0 > 0) {
+        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data() + njobs_pass0, njobs - njobs_pass0);
+        else d.pool->run_split_multi(d.jobs_multi.data() + njobs_pass0, njobs - njobs_pass0);
     }
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
