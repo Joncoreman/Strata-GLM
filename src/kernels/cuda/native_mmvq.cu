@@ -834,6 +834,20 @@ __global__ void native_small_mmvq_batched_kernel(const Weight* __restrict__ w, c
     native_small_mmvq_body<Weight, Qi, SmallK>(w + b * w_stride, x + b * x_stride, y + b * y_stride, n_in, n_out);
 }
 
+// blockIdx.y = one of up to 8 products that share the input x: its own weights, output and row count (GLM-5.3's KDA
+// layer projects x six ways - q, k, v, f_a, g_a, beta - and its DSA layer four; 2026-10-10)
+struct MmvqTable {
+    const void* w[8];
+    float* y[8];
+    int n_out[8];
+};
+template<typename Weight, int Qi, bool SmallK>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_small_mmvq_table_kernel(MmvqTable t, const Q81Block* __restrict__ x, int n_in) {
+    const int b = blockIdx.y;
+    native_small_mmvq_body<Weight, Qi, SmallK>(static_cast<const Weight*>(t.w[b]), x, t.y[b], n_in, t.n_out[b]);
+}
+
 // ============================ plan v0.3 P3: ncols = 2..8 (speculative verify, small batches) ============================
 //
 // One generic kernel for every format, parameterized by the format's iteration traits below, which are
@@ -2444,6 +2458,34 @@ bool native_mmvq_batched_q8_0(const void* weights, std::size_t w_stride_bytes, c
     } else {
         native_small_mmvq_batched_kernel<Q80Block, Qi, false><<<dim3(unsigned(n_out), unsigned(n_batch)), threads, 0, s>>>(
             w, x, y, n_in, n_out, ws, xs, (long long) y_stride);
+    }
+    launch_check();
+    return true;
+}
+
+bool native_mmvq_table_q8_0(const void* const* weights, const int* n_out, int n_batch, const void* x_q8_1,
+                            float* const* y, int n_in, void* stream) {
+    constexpr int Qi = 8;
+    if (n_batch < 1 || n_batch > 8 || n_in <= 0 || n_in % 32 != 0) return false;
+    MmvqTable t{};
+    int n_max = 0;
+    for (int b = 0; b < n_batch; ++b) {
+        if (weights[b] == nullptr || y[b] == nullptr || n_out[b] <= 0) return false;
+        t.w[b] = weights[b];
+        t.y[b] = y[b];
+        t.n_out[b] = n_out[b];
+        n_max = std::max(n_max, n_out[b]);
+    }
+    validate_pointer(x_q8_1);
+    validate_stream(stream);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const dim3 threads(WARP, WARPS);
+    if (n_in / 32 < 2 * WARPS * WARP / Qi) {
+        const unsigned blocks = unsigned((std::size_t(n_max) + WARPS - 1) / WARPS);
+        native_small_mmvq_table_kernel<Q80Block, Qi, true><<<dim3(blocks, unsigned(n_batch)), threads, 0, s>>>(t, x, n_in);
+    } else {
+        native_small_mmvq_table_kernel<Q80Block, Qi, false><<<dim3(unsigned(n_max), unsigned(n_batch)), threads, 0, s>>>(t, x, n_in);
     }
     launch_check();
     return true;

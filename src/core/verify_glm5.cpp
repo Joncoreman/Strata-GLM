@@ -60,6 +60,9 @@ namespace strata::core {
 // the MLA decode's per-head absorb products (wk_b[h] . q[h], wv_b[h] . lat[h]) in one launch each (2026-10-10:
 // 2 x 64 launches of ~4.9 us a DSA layer -> 2; bitwise the per-head calls).  STRATA_GLM5_ABSORB_BATCH=0: head by head
 static const bool absorb_batch = [] { const char* v = std::getenv("STRATA_GLM5_ABSORB_BATCH"); return !(v && v[0] == '0'); }();
+// the projections that share an input (KDA: q, k, v, f_a, g_a, beta; DSA: q_a, kv_a, indexer k, gate) in one launch
+// each for a one-token window (2026-10-10; bitwise the separate launches).  STRATA_GLM5_PROJ_BATCH=0: separate
+static const bool proj_batch = [] { const char* v = std::getenv("STRATA_GLM5_PROJ_BATCH"); return !(v && v[0] == '0'); }();
 
 struct Verifier::Glm5 {
     // geometry (from the GGUF)
@@ -303,12 +306,18 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
             float* gate = m.gate + (size_t) gi * MT * m.H * m.S;
             float* beta = beta_L_ + (size_t) gi * MT * m.H;
             native_quantize_q8_1(xm, xq_, (int) N, n, cs);   // x once for the six projections from it
-            native_mmvq(wq->native_type, wq->native_data, xq_, m.q, (int) N, (int) m.DI, n, cs);
-            native_mmvq(wk->native_type, wk->native_data, xq_, m.k, (int) N, (int) m.DI, n, cs);
-            native_mmvq(wv->native_type, wv->native_data, xq_, m.v, (int) N, (int) m.DI, n, cs);
-            native_mmvq(wfa->native_type, wfa->native_data, xq_, m.fa, (int) N, 128, n, cs);
-            native_mmvq(wga->native_type, wga->native_data, xq_, m.ga, (int) N, 128, n, cs);
-            native_mmvq(wbe->native_type, wbe->native_data, xq_, m.bl, (int) N, (int) m.H, n, cs);
+            {
+                // one token: the six in one launch (2026-10-10; STRATA_GLM5_PROJ_BATCH=0: six launches)
+                const WeightRef* ws[6] = {wq, wk, wv, wfa, wga, wbe};
+                const void* wp[6];
+                float* yp[6] = {m.q, m.k, m.v, m.fa, m.ga, m.bl};
+                const int no[6] = {(int) m.DI, (int) m.DI, (int) m.DI, 128, 128, (int) m.H};
+                bool q8 = n == 1 && proj_batch;
+                for (int i = 0; i < 6; ++i) { q8 = q8 && ws[i]->native_type == 8; wp[i] = ws[i]->native_data; }
+                if (!(q8 && native_mmvq_table_q8_0(wp, no, 6, xq_, yp, (int) N, cs)))
+                    for (int i = 0; i < 6; ++i)
+                        native_mmvq(ws[i]->native_type, ws[i]->native_data, xq_, yp[i], (int) N, no[i], n, cs);
+            }
             glm5_pack3(m.q, m.k, m.v, qkv, (int) m.DI, n, cs);
             gdn_conv_l2_multi(conv, qkv, m.convw + (size_t) gi * m.C * 4, hb, (int) m.C, (int) (2 * m.H), 1e-6f, n, cs, tb);
             mmvq(wfb, m.fa, 128, m.f, (int) m.DI, n, m.q8, cs);
@@ -337,10 +346,18 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
             float* rk = m.raw_k + (size_t) qi * MT * ID;
             float* rg = m.raw_g + (size_t) qi * MT * ID;
             native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-            native_mmvq(wqa->native_type, wqa->native_data, xq_, m.qr, (int) N, (int) QLR, n, cs);
-            native_mmvq(wkv->native_type, wkv->native_data, xq_, m.kv, (int) N, (int) KVR, n, cs);
-            native_mmvq(wik->native_type, wik->native_data, xq_, rk, (int) N, (int) ID, n, cs);
-            native_mmvq(wig->native_type, wig->native_data, xq_, rg, (int) N, (int) ID, n, cs);
+            {
+                // one token: the four projections of x in one launch (2026-10-10; STRATA_GLM5_PROJ_BATCH=0: four)
+                const WeightRef* ws[4] = {wqa, wkv, wik, wig};
+                const void* wp[4];
+                float* yp[4] = {m.qr, m.kv, rk, rg};
+                const int no[4] = {(int) QLR, (int) KVR, (int) ID, (int) ID};
+                bool q8 = n == 1 && proj_batch;
+                for (int i = 0; i < 4; ++i) { q8 = q8 && ws[i]->native_type == 8; wp[i] = ws[i]->native_data; }
+                if (!(q8 && native_mmvq_table_q8_0(wp, no, 4, xq_, yp, (int) N, cs)))
+                    for (int i = 0; i < 4; ++i)
+                        native_mmvq(ws[i]->native_type, ws[i]->native_data, xq_, yp[i], (int) N, no[i], n, cs);
+            }
             native_qsa_rms_norm_weighted(m.qr, (const float*) wqan->data, m.qr, (int) QLR, n, m.rms_eps, cs);
             native_qsa_rms_norm_weighted(m.kv, (const float*) wkvn->data, m.kv, (int) KVR, n, m.rms_eps, cs);
             if (m.lat_q4) glm5_latent_store_q4(m.kv, lat_pool, m.page_table, step_, kStepCount, 4, (int) KVR, n, cs);
