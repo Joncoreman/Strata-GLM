@@ -1,0 +1,27 @@
+{
+ "_comment": "GLM-5.3-Flash on one PC. Copy to strata-glm5.json or let tools/glm5_ref/make_glm5_config.py write it. Paths: the pack from tools/iq_pack.py, shard 1 of the GGUF. --resident-budget-gib: the RAM the experts may take (total RAM minus ~30 GB; 98 on 128 GB). --pool-workers: physical cores minus 4 (20 on a 24-core Core Ultra 9 285K). Expert skipping (STRATA_GLM5_SKIP_*) is OFF unless you add it to env: it is about +30% decode for about one changed token in 100 on long reasoning.",
+ "exe": "<REPO>\\build-engine\\strata.exe",
+ "args": [
+  "--pack", "<DATA>\\packs\\glm53_iq4xs",
+  "--native", "<GGUF_DIR>\\GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf",
+  "--prefill", "auto",
+  "--spec", "6",
+  "--max-context", "262144",
+  "--pcie-frac", "0",
+  "--mmap-experts",
+  "--resident-budget-gib", "98",
+  "--expert-profile", "<DATA>\\packs\\glm53_iq4xs\\expert-profile-learned-2026-10-08b.bin",
+  "--expert-cache", "0",
+  "--adapt-every", "1",
+  "--adapt-swaps", "64",
+  "--pool-workers", "20",
+  "--vram-reserve-mib", "3400"
+ ],
+ "env": {"STRATA_GLM5_GO": "1", "STRATA_GLM5_PREFILL": "4096", "STRATA_GLM5_PF_DIRECT": "1",
+         "STRATA_GLM5_SLOTS": "8", "STRATA_GLM5_SLOT_DIR": "<REPO>\\build-engine\\glm5-slots"},
+ "cwd": "<REPO>",
+ "tokenizer": "<DATA>\\packs\\glm53_iq4xs\\tokenizer",
+ "model_name": "glm-5.3-flash-strata",
+ "log": "<REPO>\\build-engine\\strata-glm5-serve.log",
+ "port": 8097
+}
