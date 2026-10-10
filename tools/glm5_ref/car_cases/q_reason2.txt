@@ -1,0 +1,4 @@
+A bag has 5 red, 4 blue and 3 green balls. Three balls are drawn at random without replacement.
+(1) What is the probability that all three balls are different colours?
+(2) What is the probability that at least two of them are the same colour?
+Show the full reasoning with every fraction simplified. Then check both answers again by a completely different method (for example, drawing the balls one at a time and multiplying the probabilities), and say whether the two methods agree.
