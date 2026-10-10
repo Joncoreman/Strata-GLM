@@ -64,7 +64,7 @@ Strata 本体の `START-HERE.bat --setup` は Qwen のモデルも入れよう�
 
 クライアントの接続先を `http://127.0.0.1:8097/v1`（OpenAI：`/v1/chat/completions`、Anthropic：`/v1/messages`）、
 モデル名 `glm-5.3-flash-strata` にします。Claude Code／opencode／Cursor の設定は Strata の
-[docs/CLIENTS.md](docs/CLIENTS.md) と同じです。
+[README の「Using it」](README.md#using-it)と同じです（ポートが 8080 でなく 8097 になるだけ）。
 
 ## なぜ速いか（効かなかったことも）
 

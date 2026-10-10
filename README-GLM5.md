@@ -69,8 +69,8 @@ Strata's `START-HERE.bat --setup` wants to install a Qwen model as well; you can
 ### Using it
 
 Point your client at `http://127.0.0.1:8097/v1` (OpenAI: `/v1/chat/completions`, Anthropic: `/v1/messages`),
-model `glm-5.3-flash-strata`. For Claude Code / opencode / Cursor see Strata's [docs/CLIENTS.md](docs/CLIENTS.md);
-the GLM server behaves the same.
+model `glm-5.3-flash-strata`. For Claude Code / opencode / Cursor see the "Using it" section of Strata's
+[README](README.md#using-it) (the GLM server behaves the same, on port 8097 instead of 8080).
 
 ## How it is fast (and what did not work)
 
