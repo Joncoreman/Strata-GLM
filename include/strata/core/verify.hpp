@@ -285,6 +285,9 @@ public:
     /// from `hand_in`, one before the last ends in `hand_out` - host rows of handoff_floats, the windows' layout)
     bool prefill_glm5(const int32_t* tokens, int64_t n, int64_t pos0, int chunk, const Glm5Fetch& f, std::string& err,
                       int64_t l_begin = 0, int64_t l_end = -1, const float* hand_in = nullptr, float* hand_out = nullptr);
+    /// glm5 images (2026-10-11): by absolute cell, the host row (n_embd floats, strata-vision's) that replaces the token
+    /// embedding there; null or past the end = the token's own.  Set by the serve loop for one GENI request, then cleared.
+    std::vector<const float*> glm5_img_rows;
     /// glm5 serve (2026-10-08): the sequence state that a later request continuing the same prompt needs - the KDA
     /// states with their conv histories and the indexer tails (the latents and completed indexer blocks of earlier
     /// cells are never rewritten) - copied to `host`, back from it, or zeroed (a new sequence).

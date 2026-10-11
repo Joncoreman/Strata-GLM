@@ -63,6 +63,21 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# The `glm4` / `glm5` pre-tokenizer (GLM-5.3-Flash), transcribed from llama.cpp's
+# `src/llama-vocab.cpp` `case LLAMA_VOCAB_PRE_TYPE_CHATGLM4` (2026-10-11).  Digits go in runs of up to THREE
+# (`\p{N}{1,3}`), not one by one as in qwen35, and llama.cpp sets ignore_merges for this type: a piece that is a
+# vocabulary token is that token, without BPE.  The qwen35 pattern written here before (2026-10-08) cut "2117" into
+# 2,1,1,7 where the model was trained on 211,7 - it then copied numbers and paths wrong (2117_00001 -> 2211_7_0_0001).
+GLM4_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
@@ -220,7 +235,8 @@ class Tokenizer:
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
                 got = []
-                for tok in self._bpe(mapped):
+                whole = self.ids.get(mapped) if getattr(self, "ignore_merges", False) else None
+                for tok in ([mapped] if whole is not None else self._bpe(mapped)):   # glm4: a vocabulary piece is itself
                     i = self.ids.get(tok)
                     if i is None:
                         raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
@@ -301,6 +317,10 @@ def extract(gguf_path, out_dir) -> dict:
         "pre_pattern": QWEN35_PATTERN,
         "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
     }
+    if tk.pre in ("glm4", "glm5"):   # 2026-10-11: GLM-5.3's own split (see GLM4_PATTERN)
+        cfg["pre_pattern"] = GLM4_PATTERN
+        cfg["pre_pattern_source"] = "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"
+        cfg["ignore_merges"] = True
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
                                               sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8")

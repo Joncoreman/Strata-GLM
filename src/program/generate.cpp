@@ -4791,9 +4791,15 @@ int main(int argc, char** argv) {
                 --fake_fails;
                 err = "ExpertCache: cudaMalloc failed: out of memory (STRATA_TEST_CACHE_FAIL)";
             } else {
+                // STRATA_SPARE_SLOTS (2026-10-11): the slots left empty for the asynchronous tier take any layer's expert
+                std::vector<int64_t> open_slots = sized_slots;
+                if (const char* sv = std::getenv("STRATA_SPARE_SLOTS"))
+                    for (size_t i = open_slots.size() - std::min<size_t>(open_slots.size(), (size_t) std::max(0, std::atoi(sv)));
+                         i < open_slots.size(); ++i)
+                        open_slots[i] = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
                 ok = sized_slots.empty()
                     ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
-                    : xcache.open_sized(sized_slots, g.n_layers, g.n_expert, err);
+                    : xcache.open_sized(open_slots, g.n_layers, g.n_expert, err);
             }
             if (!ok) {
                 // Issue #60: on Windows a device allocation is also charged to the system commit (RAM + page file),
@@ -4879,8 +4885,12 @@ int main(int argc, char** argv) {
         // #369 (dag08): per layer, a full layer skips only its own pairs - each layer takes its hottest experts until
         // its range is full (one full layer used to end the whole fill, leaving most layers empty)
         const bool per_layer = xcache.per_layer_admission();
+        // 2026-10-11: STRATA_SPARE_SLOTS=<n> leaves the cache's last n slots empty - glm5-next's asynchronous tier
+        // (--adapt-async 1) copies each round's new experts into free slots while a window runs (see g_tick_fast)
+        static const int64_t spare_slots = [] { const char* v = std::getenv("STRATA_SPARE_SLOTS"); return v ? std::max(0, std::atoi(v)) : 0; }();
         const int64_t want = per_layer ? (int64_t) profile.size()
-                                       : std::min<int64_t>((int64_t) profile.size(), xcache.slots());
+                                       : std::min<int64_t>((int64_t) profile.size(),
+                                                           std::max<int64_t>(0, xcache.slots() - spare_slots));
         // #286: an unbuffered file tier reads the pairs in batches of 64, the next batch while this one is copied
         std::future<void> ahead;
         auto read_batch = [&](int64_t at) { src.prefetch_pairs(profile.data() + at, std::min<int64_t>(64, want - at)); };
@@ -12118,6 +12128,7 @@ int main(int argc, char** argv) {
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         int64_t swaps_total = 0;
         double ms_adapt = 0;
+        double ms_ad_decide = 0, ms_ad_stage = 0;   // 2026-10-11: the blocking round's choice and its copies back + sync
         cudaStream_t adapt_stream = nullptr;
         if (!drive.d.usage.empty() && cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: cannot create the refill stream\n");
@@ -12205,12 +12216,15 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            const Clock::time_point t_decided = Clock::now();   // 2026-10-11: the round's parts (adapt prof line)
+            ms_ad_decide += std::chrono::duration<double, std::milli>(t_decided - ta).count();
             // this (non-serve) path refills CUDA0's cache only, so its copies back read CUDA0's cache too
             if (!resident_stage_swaps(src, host_res, g.n_expert, swaps,
                                       [&](int64_t) -> SwapHome { return {&xcache, adapt_stream, -1}; })) {
                 std::fprintf(stderr, "strata generate: an adaptive refill failed (copying evicted experts back)\n");
                 return false;
             }
+            ms_ad_stage += std::chrono::duration<double, std::milli>(Clock::now() - t_decided).count();
             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;
                 for (const Swap& s : swaps)
@@ -12284,6 +12298,11 @@ int main(int argc, char** argv) {
         static const bool ram_defer = [] { const char* v = std::getenv("STRATA_GLM5_RAM_DEFER"); return !(v && v[0] == '0'); }();
         struct RSwap { float gain; int32_t layer, in, out; };
         std::vector<RSwap> ram_pending;
+        int64_t ram_q0 = 0;   // the first exchange buffer the promotion uses (glm5 serve's pipelined tier moves it)
+        std::vector<uint8_t> ram_busy;   // experts a round in flight moves: the promotion leaves them alone (pipelined tier)
+        auto ram_is_busy = [&](int64_t l, int64_t e) {
+            return !ram_busy.empty() && ram_busy[(size_t) (l * g.n_expert + e)] != 0;
+        };
         auto ram_promote = [&]() -> bool {
             if (ram_swaps <= 0 || !pending.empty() || drive.d.usage.empty() || !src.complement_ready() ||
                 src.exchange_capacity() < 1)
@@ -12291,10 +12310,12 @@ int main(int argc, char** argv) {
             const Clock::time_point t0 = Clock::now();
             const bool biased = ram_bias.size() == drive.d.usage.size();
             if (!ram_pending.empty()) {   // last window's picks, read in the background meanwhile
-                int64_t q = 0;
+                int64_t q = ram_q0;
                 for (const RSwap& s : ram_pending) {
                     if (q >= src.exchange_capacity()) break;
                     if (!src.has_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) continue;   // moved meanwhile
+                    if (host_res[(size_t) (s.layer * g.n_expert + s.in)] >= 0 || ram_is_busy(s.layer, s.in) ||
+                        ram_is_busy(s.layer, s.out)) continue;   // on the GPU now, or a round in flight moves it
                     const uint8_t* b = srcp->blob(s.layer, s.out);
                     uint8_t* xb = src.exchange_buffer(q);
                     if (b == nullptr || xb == nullptr) break;
@@ -12314,7 +12335,7 @@ int main(int argc, char** argv) {
                 const float* bz = biased ? ram_bias.data() + l * g.n_expert : nullptr;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] >= 0) continue;   // on the GPU
+                    if (r[e] >= 0 || ram_is_busy(l, e)) continue;   // on the GPU, or a round in flight moves it
                     const float ue = u[e] + (bz ? bz[e] : 0.0f);
                     if (src.has_resident(l, e)) vict.emplace_back(ue, e);
                     else if (ue >= ram_min) cand.emplace_back(ue, e);
@@ -12331,7 +12352,7 @@ int main(int argc, char** argv) {
             }
             if (sw.empty()) return true;
             std::sort(sw.begin(), sw.end(), [](const RSwap& a, const RSwap& b) { return a.gain > b.gain; });
-            const size_t n = std::min<size_t>(sw.size(), (size_t) std::min<int64_t>(ram_swaps, src.exchange_capacity()));
+            const size_t n = std::min<size_t>(sw.size(), (size_t) std::min<int64_t>(ram_swaps, src.exchange_capacity() - ram_q0));
             if (ram_defer) {
                 for (size_t q = 0; q < n; ++q) {   // read in the background; exchanged next window
                     const int64_t e = sw[q].out;
@@ -12342,10 +12363,10 @@ int main(int argc, char** argv) {
                 for (size_t q = 0; q < n; ++q) {
                     const RSwap& s = sw[q];
                     const uint8_t* b = srcp->blob(s.layer, s.out);   // the file tier: read now (a staging buffer)
-                    uint8_t* xb = src.exchange_buffer((int64_t) q);
+                    uint8_t* xb = src.exchange_buffer(ram_q0 + (int64_t) q);
                     if (b == nullptr || xb == nullptr) return true;
                     std::memcpy(xb, b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
-                    if (!src.stage_exchange(s.layer, s.in, s.out, (int64_t) q)) break;
+                    if (!src.stage_exchange(s.layer, s.in, s.out, ram_q0 + (int64_t) q)) break;
                 }
                 ram_swaps_total += src.commit_exchanges();
             }
@@ -12683,6 +12704,439 @@ int main(int argc, char** argv) {
                                      "(layers below %lld; STRATA_MN_ADAPT_OVERLAP=0 to run it after the window)\n",
                              (long long) split_at.front());
             }
+            // 2026-10-11: --adapt-async 1 on one card.  The blocking round (choose, copy the evicted slots back and
+            // wait, queue the refills) and the next window's wait for them cost ~4.6 ms of a ~44 ms window, and the
+            // RAM tier's promotion 2-4 ms more, all between windows.  Here a round moves through three steps on a job
+            // thread while the windows run, one step per window boundary:
+            //   b0: snapshot the routing counts and the residency; job: choose (adapt()'s rule) and copy the evicted
+            //       slots back into exchange buffers (the GPU still reads those slots: read-read);
+            //   b1: stage the exchanges, mark the evicted experts non-resident and upload the table; job: copy the new
+            //       experts into the freed slots (no window plans them for the GPU any more);
+            //   b2: mark the new experts resident; job: move the evicted blobs into the RAM places the new ones left;
+            //   b3: flip the RAM copy's offsets; the RAM tier's promotion runs, and the next round starts.
+            // Each step waits for the previous one's job and copies (done long before: a window is ~44 ms), so which
+            // window first computes a swapped-in expert on the GPU depends on the window count only - reproducible.
+            // A window's CPU side never calls CUDA (one captured graph, host flags), so the job's copies cannot hold
+            // up a window in the driver.  Not with a stage link (the overlap above).
+            struct GSwap { int32_t layer, in, out, slot; int64_t j; bool exchange; };
+            enum class GState { Idle, CopyBack, SwapIn, Commit };
+            GState gstate = GState::Idle;
+            std::vector<GSwap> gswaps;
+            std::vector<float> g_usage;
+            std::vector<int32_t> g_res;
+            std::atomic<bool> g_err{false};
+            bool g_used = false;
+            const int64_t g_cap = std::min<int64_t>(o.adapt_swaps, 96);
+            std::unique_ptr<JobThread> gjob;
+            if (o.adapt_async && !adapt_overlap && !drive.d.usage.empty() && src.complement_ready() &&
+                src.exchange_capacity() >= 2 * g_cap) {
+                gjob = std::make_unique<JobThread>();
+                std::fprintf(stderr, "strata serve: adaptive tier asynchronous (--adapt-async 1): up to %lld swaps per "
+                                     "round, one step per window\n", (long long) g_cap);
+            }
+            // the choice's thresholds (adapt()'s 2.0 and 1.5 unless set): a round every three windows swaps fewer
+            static const float g_min = [] { const char* v = std::getenv("STRATA_GLM5_ASYNC_MIN"); return v ? (float) std::atof(v) : 2.0f; }();
+            static const float g_gap = [] { const char* v = std::getenv("STRATA_GLM5_ASYNC_GAP"); return v ? (float) std::atof(v) : 1.5f; }();
+            auto g_choose = [&]() {   // b0's job
+                struct C { float gain; int32_t layer, in, out; };
+                std::vector<C> all;
+                std::vector<std::pair<float, int32_t>> cand, vict;
+                for (int64_t l = 0; l < g.n_layers; ++l) {
+                    cand.clear();
+                    vict.clear();
+                    const float* u = g_usage.data() + l * g.n_expert;
+                    const int32_t* r = g_res.data() + l * g.n_expert;
+                    for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                        if (r[e] < 0) { if (u[e] >= g_min && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
+                        else vict.emplace_back(u[e], e);
+                    }
+                    if (cand.empty() || vict.empty()) continue;
+                    std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
+                    const size_t nc = std::min(cand.size(), vict.size());
+                    std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
+                                      [](auto& a, auto& b) { return a.first < b.first; });
+                    for (size_t i = 0; i < nc; ++i) {
+                        if (cand[i].first < vict[i].first + g_gap) break;
+                        all.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
+                    }
+                }
+                std::sort(all.begin(), all.end(), [](const C& a, const C& b) { return a.gain > b.gain; });
+                gswaps.clear();
+                for (const C& c : all) {
+                    if ((int64_t) gswaps.size() >= g_cap) break;
+                    const int32_t slot = g_res[(size_t) c.layer * g.n_expert + c.out];
+                    if (slot < 0) continue;
+                    const bool x = src.has_resident(c.layer, c.in) && !src.has_resident(c.layer, c.out);
+                    gswaps.push_back({c.layer, c.in, c.out, slot, (int64_t) gswaps.size(), x});
+                }
+                for (const GSwap& w : gswaps) {
+                    if (!w.exchange) continue;
+                    if (cudaMemcpyAsync(src.exchange_buffer(w.j), xcache.device_slot(w.slot),
+                                        (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer),
+                                        cudaMemcpyDeviceToHost, adapt_stream) != cudaSuccess) g_err = true;
+                    g_used = true;
+                }
+                if (g_used) { cudaEventRecord(adapt_ev, adapt_stream); (void) cudaStreamQuery(adapt_stream); }
+            };
+            auto g_copy_in = [&]() {   // b1's job: each new expert from the page-locked RAM copy, else a bounce buffer
+                for (const GSwap& w : gswaps) {
+                    const uint8_t* b = src.pinned(w.layer, w.in) ? src.resident_blob(w.layer, w.in) : nullptr;
+                    if (b == nullptr) {
+                        uint8_t* bb = src.exchange_buffer(g_cap + w.j);
+                        if (bb == nullptr || !src.copy_blob(w.layer, w.in, bb)) { g_err = true; return; }
+                        b = bb;
+                    }
+                    if (cudaMemcpyAsync(xcache.device_slot(w.slot), b,
+                                        (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer),
+                                        cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) g_err = true;
+                    g_used = true;
+                }
+                if (g_used) { cudaEventRecord(adapt_ev, adapt_stream); (void) cudaStreamQuery(adapt_stream); }
+            };
+            // 2026-10-11: the fast form, with free slots (STRATA_SPARE_SLOTS left them empty at the profile fill).  A
+            // new expert is copied into a FREE slot while the window runs, so it is planned for the GPU one window
+            // after the choice instead of two, and a round takes two windows instead of three:
+            //   b0: snapshot; job: choose, copy the evicted slots back (read-read) and the new experts into free slots;
+            //   b1: stage the exchanges, swap the table entries (the evicted slots become free), upload the table;
+            //       job: move the evicted blobs into the RAM places the new ones left (nothing computes those from RAM);
+            //   b2: flip the RAM copy's offsets; the RAM tier's promotion; the next round.
+            std::vector<int32_t> g_free;   // slots no expert holds (main thread; the job reads a copy, g_free_job)
+            std::vector<int32_t> g_free_job;
+            std::vector<int32_t> g_dst;    // gswaps[i]'s free slot
+            if (gjob) {
+                std::vector<uint8_t> used((size_t) xcache.slots(), 0);
+                for (const int32_t s : host_res)
+                    if (s >= 0 && s < xcache.slots()) used[(size_t) s] = 1;
+                for (int32_t s = 0; s < (int32_t) xcache.slots(); ++s)
+                    if (!used[(size_t) s]) g_free.push_back(s);
+                std::fprintf(stderr, "strata serve: adaptive tier: %zu free slots%s\n", g_free.size(),
+                             g_free.empty() ? " (STRATA_SPARE_SLOTS=<n> leaves some: a round then takes two windows)"
+                                            : " - new experts land in them while a window runs");
+            }
+            const bool g_fast = gjob && !g_free.empty();
+            auto g_choose_fast = [&]() {   // b0's job
+                g_choose();   // the choice and the copies back (adapt()'s rule)
+                // slots differ in size by layer: a new expert takes a free slot with room for its blob (a smaller one
+                // overran into the next slot's expert: "!!!!" answers, 2026-10-11); none with room - the swap waits
+                g_dst.assign(gswaps.size(), -1);
+                std::vector<uint8_t> taken(g_free_job.size(), 0);
+                for (size_t i = 0; i < gswaps.size(); ++i) {
+                    const uint64_t need = strata::kernels::cpu::expert_layout().blob_bytes(gswaps[i].layer);
+                    size_t best = g_free_job.size();   // the smallest free slot with room: the big ones stay for any layer
+                    uint64_t best_room = UINT64_MAX;
+                    for (size_t f = 0; f < g_free_job.size(); ++f) {
+                        const int32_t s = g_free_job[f];
+                        const uint64_t room = xcache.slot_offset(s + 1) - xcache.slot_offset(s);
+                        if (taken[f] || room < need || room >= best_room) continue;
+                        best = f;
+                        best_room = room;
+                    }
+                    if (best < g_free_job.size()) { taken[best] = 1; g_dst[i] = g_free_job[best]; }
+                }
+                for (size_t i = 0; i < gswaps.size(); ++i) {
+                    const GSwap& w = gswaps[i];
+                    if (g_dst[i] < 0) continue;
+                    const uint8_t* b = src.pinned(w.layer, w.in) ? src.resident_blob(w.layer, w.in) : nullptr;
+                    if (b == nullptr) {
+                        uint8_t* bb = src.exchange_buffer(g_cap + w.j);
+                        if (bb == nullptr || !src.copy_blob(w.layer, w.in, bb)) { g_err = true; return; }
+                        b = bb;
+                    }
+                    if (cudaMemcpyAsync(xcache.device_slot(g_dst[i]), b,
+                                        (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer),
+                                        cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) g_err = true;
+                    g_used = true;
+                }
+                if (g_used) { cudaEventRecord(adapt_ev, adapt_stream); (void) cudaStreamQuery(adapt_stream); }
+            };
+            // 2026-10-11: STRATA_GLM5_ASYNC_PIPE=1 (with free slots) - a round EVERY window, the rounds overlapped.  The
+            // fast form above swaps once per two windows, ~2 swaps a window against the blocking tier's 8, so fewer of
+            // the experts the conversation uses reach the GPU.  At each boundary b:
+            //   wait for the job; flip the round applied at b-1 (its RAM moves are done); the RAM tier's promotion
+            //   (it leaves the experts of the round built meanwhile alone); apply that round (built in window b-1:
+            //   stage, swap the table entries, upload); post the job: the applied round's RAM moves, then the next
+            //   round's choice and copies.  Consecutive rounds use the two halves of the exchange buffers (a round's
+            //   evicted blobs are read from its half until its flip); the promotion takes the buffers after them.
+            //   A round leaves alone the experts the round before it moved (their RAM places are in flux).
+            struct GRound { std::vector<GSwap> sw; std::vector<int32_t> dst; };
+            GRound g_rd[2];
+            int g_rb = 0;                     // the round the job builds next
+            bool g_built = false, g_staged = false;
+            std::vector<uint8_t> g_excl, g_excl_job;   // experts the previous round moved
+            const bool g_pipe = g_fast && [] { const char* v = std::getenv("STRATA_GLM5_ASYNC_PIPE"); return v && v[0] == '1'; }();
+            const int64_t g_ram_n = std::min<int64_t>(std::max(0, ram_swaps), 8);
+            const int64_t g_half = g_pipe ? std::max<int64_t>(0, (src.exchange_capacity() - g_ram_n) / 2) : 0;
+            const int64_t g_pcap = std::min<int64_t>(g_cap, g_half);
+            if (g_pipe)
+                std::fprintf(stderr, "strata serve: adaptive tier pipelined (STRATA_GLM5_ASYNC_PIPE=1): a round every window, "
+                                     "up to %lld swaps each\n", (long long) g_pcap);
+            auto g_build = [&](bool commit, int r, int64_t j0) {   // the job: the applied round's RAM moves, the next round
+                if (commit) src.commit_copies();
+                GRound& R = g_rd[r];
+                R.sw.clear();
+                R.dst.clear();
+                struct C { float gain; int32_t layer, in, out; };
+                std::vector<C> all;
+                std::vector<std::pair<float, int32_t>> cand, vict;
+                for (int64_t l = 0; l < g.n_layers; ++l) {
+                    cand.clear();
+                    vict.clear();
+                    const float* u = g_usage.data() + l * g.n_expert;
+                    const int32_t* rs = g_res.data() + l * g.n_expert;
+                    const uint8_t* ex = g_excl_job.empty() ? nullptr : g_excl_job.data() + l * g.n_expert;
+                    for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                        if (ex && ex[e]) continue;
+                        if (rs[e] < 0) { if (u[e] >= g_min && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
+                        else vict.emplace_back(u[e], e);
+                    }
+                    if (cand.empty() || vict.empty()) continue;
+                    std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
+                    const size_t nc = std::min(cand.size(), vict.size());
+                    std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
+                                      [](auto& a, auto& b) { return a.first < b.first; });
+                    for (size_t i = 0; i < nc; ++i) {
+                        if (cand[i].first < vict[i].first + g_gap) break;
+                        all.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
+                    }
+                }
+                std::sort(all.begin(), all.end(), [](const C& a, const C& b) { return a.gain > b.gain; });
+                std::vector<uint8_t> taken(g_free_job.size(), 0);
+                for (const C& c : all) {
+                    if ((int64_t) R.sw.size() >= g_pcap) break;
+                    const int32_t slot = g_res[(size_t) c.layer * g.n_expert + c.out];
+                    // the new expert straight from the page-locked RAM copy (one from the file waits for the RAM tier)
+                    const uint8_t* b = src.pinned(c.layer, c.in) ? src.resident_blob(c.layer, c.in) : nullptr;
+                    if (slot < 0 || b == nullptr) continue;
+                    const uint64_t need = strata::kernels::cpu::expert_layout().blob_bytes(c.layer);
+                    size_t best = g_free_job.size();
+                    uint64_t best_room = UINT64_MAX;
+                    for (size_t f = 0; f < g_free_job.size(); ++f) {
+                        const int32_t s = g_free_job[f];
+                        const uint64_t room = xcache.slot_offset(s + 1) - xcache.slot_offset(s);
+                        if (taken[f] || room < need || room >= best_room) continue;
+                        best = f;
+                        best_room = room;
+                    }
+                    if (best == g_free_job.size()) continue;
+                    taken[best] = 1;
+                    const int64_t j = j0 + (int64_t) R.sw.size();
+                    const bool x = !src.has_resident(c.layer, c.out);   // `in` is in the copy (pinned): exchange
+                    if (x && cudaMemcpyAsync(src.exchange_buffer(j), xcache.device_slot(slot), (size_t) need,
+                                             cudaMemcpyDeviceToHost, adapt_stream) != cudaSuccess) g_err = true;
+                    if (cudaMemcpyAsync(xcache.device_slot(g_free_job[best]), b, (size_t) need, cudaMemcpyHostToDevice,
+                                        adapt_stream) != cudaSuccess) g_err = true;
+                    R.sw.push_back({c.layer, c.in, c.out, slot, j, x});
+                    R.dst.push_back(g_free_job[best]);
+                    g_used = true;
+                }
+                if (g_used) { cudaEventRecord(adapt_ev, adapt_stream); (void) cudaStreamQuery(adapt_stream); }
+            };
+            auto g_wait = [&]() {   // the previous step's job and copies
+                const Clock::time_point tw = Clock::now();
+                gjob->wait();
+                if (g_used && cudaEventSynchronize(adapt_ev) != cudaSuccess) g_err = true;
+                g_used = false;
+                ms_pending_wait += std::chrono::duration<double, std::milli>(Clock::now() - tw).count();
+            };
+            // one step at a window boundary; `drain`: finish the round in flight and start none.  False: a copy failed
+            auto g_tick = [&](bool drain) -> bool {
+                if (!gjob) return true;
+                const Clock::time_point ta = Clock::now();
+                // the counts decay once per window, as the blocking tier's round every window does (decayed once a
+                // round here, they built up over a round's three windows: 18 swaps a window against 8, 2026-10-11)
+                bool decayed = false;
+                if (!drain && gstate != GState::Idle) {
+                    for (float& v : drive.d.usage) v *= o.adapt_decay;
+                    decayed = true;
+                }
+                if (g_pipe) {   // a round every window (see g_build)
+                    g_wait();
+                    if (g_err.load()) return false;
+                    if (g_staged) { src.commit_flip(); g_staged = false; }   // the round applied at the last boundary
+                    GRound& R = g_rd[g_rb ^ 1];                             // built in the window that just ended
+                    if (!drain) {   // the promotion first, leaving the built round's experts alone
+                        if (g_built) {
+                            ram_busy.assign(host_res.size(), 0);
+                            for (const GSwap& w : R.sw) {
+                                ram_busy[(size_t) w.layer * g.n_expert + w.in] = 1;
+                                ram_busy[(size_t) w.layer * g.n_expert + w.out] = 1;
+                            }
+                        }
+                        ram_q0 = 2 * g_half;
+                        const bool ok = ram_promote();
+                        ram_busy.clear();
+                        ram_q0 = 0;
+                        if (!ok) return false;
+                        if (!decayed) for (float& v : drive.d.usage) v *= o.adapt_decay;   // once a window
+                    }
+                    g_excl.assign(host_res.size(), 0);
+                    if (g_built) {   // apply it
+                        size_t k = 0;
+                        for (size_t i = 0; i < R.sw.size(); ++i) {
+                            const GSwap w = R.sw[i];
+                            const size_t out = (size_t) w.layer * g.n_expert + w.out, in = (size_t) w.layer * g.n_expert + w.in;
+                            if (host_res[out] != w.slot || host_res[in] >= 0 || !src.has_resident(w.layer, w.in)) continue;
+                            if (w.exchange && !src.stage_exchange(w.layer, w.in, w.out, w.j)) {
+                                std::fprintf(stderr, "strata serve: adaptive tier: stage_exchange refused layer %d in %d "
+                                                     "out %d\n", (int) w.layer, (int) w.in, (int) w.out);
+                                return false;
+                            }
+                            host_res[out] = strata::core::kNotResident;
+                            srcp->prefetch(w.layer, w.out);
+                            host_res[in] = R.dst[i];
+                            srcp->release(w.layer, w.in);
+                            g_free.erase(std::find(g_free.begin(), g_free.end(), R.dst[i]));
+                            g_free.push_back(w.slot);
+                            g_excl[in] = g_excl[out] = 1;
+                            ++k;
+                        }
+                        if (k > 0 && d_res != nullptr) res_put(d_res);
+                        swaps_total += (int64_t) k;
+                        g_staged = true;
+                        g_built = false;
+                    }
+                    if (drain) {   // nothing in flight past this boundary
+                        if (g_staged) { src.commit_copies(); src.commit_flip(); g_staged = false; }
+                        return true;
+                    }
+                    ++adapt_rounds;
+                    g_usage = drive.d.usage;
+                    g_res = host_res;
+                    g_free_job = g_free;
+                    g_excl_job = g_excl;
+                    for (size_t i = 0; i < heat1.size(); ++i) heat1[i] += (double) drive.d.usage[i];
+                    const bool commit = g_staged;
+                    const int r = g_rb;
+                    const int64_t j0 = (int64_t) r * g_half;   // the two rounds in flight use the two halves
+                    gjob->post([&g_build, commit, r, j0] { g_build(commit, r, j0); });
+                    g_built = true;
+                    g_rb ^= 1;
+                    ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
+                    return true;
+                }
+                for (; g_fast;) {   // the fast form (see g_free): Idle -> SwapIn (b1) -> Commit (b2) -> Idle
+                    if (g_err.load()) return false;
+                    switch (gstate) {
+                    case GState::Idle:
+                        if (drain) return true;
+                        if (!ram_promote()) return false;
+                        ++adapt_rounds;
+                        g_usage = drive.d.usage;
+                        g_res = host_res;
+                        g_free_job = g_free;
+                        for (size_t i = 0; i < heat1.size(); ++i) heat1[i] += (double) drive.d.usage[i];
+                        if (!decayed) for (float& v : drive.d.usage) v *= o.adapt_decay;
+                        decayed = true;
+                        gjob->post(g_choose_fast);
+                        gstate = GState::SwapIn;
+                        break;
+                    case GState::SwapIn: {
+                        g_wait();
+                        if (g_err.load()) return false;
+                        size_t k = 0;
+                        for (size_t i = 0; i < gswaps.size(); ++i) {
+                            const GSwap w = gswaps[i];
+                            const size_t out = (size_t) w.layer * g.n_expert + w.out, in = (size_t) w.layer * g.n_expert + w.in;
+                            if (g_dst[i] < 0 || host_res[out] != w.slot || host_res[in] >= 0) continue;   // no room / moved
+                            if (w.exchange && !src.stage_exchange(w.layer, w.in, w.out, w.j)) {
+                                std::fprintf(stderr, "strata serve: adaptive tier: stage_exchange refused layer %d in %d "
+                                                     "out %d\n", (int) w.layer, (int) w.in, (int) w.out);
+                                return false;
+                            }
+                            host_res[out] = strata::core::kNotResident;   // the CPU computes it from this window on
+                            srcp->prefetch(w.layer, w.out);
+                            host_res[in] = g_dst[i];                      // the GPU, in the slot it was copied into
+                            srcp->release(w.layer, w.in);
+                            g_free.erase(std::find(g_free.begin(), g_free.end(), g_dst[i]));
+                            g_free.push_back(w.slot);
+                            gswaps[k] = w;
+                            g_dst[k++] = g_dst[i];
+                        }
+                        gswaps.resize(k);
+                        g_dst.resize(k);
+                        if (d_res != nullptr) res_put(d_res);
+                        swaps_total += (int64_t) k;
+                        gjob->post([&] { src.commit_copies(); });
+                        gstate = GState::Commit;
+                        if (drain) continue;
+                        break;
+                    }
+                    case GState::Commit:
+                        g_wait();
+                        src.commit_flip();
+                        gswaps.clear();
+                        gstate = GState::Idle;
+                        continue;   // the RAM tier and the next round at this same boundary
+                    default:
+                        return false;
+                    }
+                    ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
+                    return true;
+                }
+                for (;;) {
+                    if (g_err.load()) return false;
+                    switch (gstate) {
+                    case GState::Idle:
+                        if (drain) return true;
+                        if (!ram_promote()) return false;   // the RAM tier between rounds (its exchanges are done here)
+                        ++adapt_rounds;
+                        g_usage = drive.d.usage;
+                        g_res = host_res;
+                        for (size_t i = 0; i < heat1.size(); ++i) heat1[i] += (double) drive.d.usage[i];
+                        if (!decayed) for (float& v : drive.d.usage) v *= o.adapt_decay;
+                        decayed = true;
+                        gjob->post(g_choose);
+                        gstate = GState::CopyBack;
+                        break;
+                    case GState::CopyBack: {
+                        g_wait();
+                        if (g_err.load()) return false;
+                        size_t k = 0;
+                        for (size_t i = 0; i < gswaps.size(); ++i) {
+                            const GSwap w = gswaps[i];
+                            const size_t out = (size_t) w.layer * g.n_expert + w.out;
+                            if (host_res[out] != w.slot) continue;
+                            if (w.exchange && !src.stage_exchange(w.layer, w.in, w.out, w.j)) {
+                                std::fprintf(stderr, "strata serve: adaptive tier: stage_exchange refused layer %d in %d "
+                                                     "out %d\n", (int) w.layer, (int) w.in, (int) w.out);
+                                return false;
+                            }
+                            host_res[out] = strata::core::kNotResident;   // the CPU computes it from the next window on
+                            srcp->prefetch(w.layer, w.out);
+                            gswaps[k++] = w;
+                        }
+                        gswaps.resize(k);
+                        if (d_res != nullptr) res_put(d_res);
+                        gjob->post(g_copy_in);
+                        gstate = GState::SwapIn;
+                        if (drain) continue;
+                        break;
+                    }
+                    case GState::SwapIn:
+                        g_wait();
+                        if (g_err.load()) return false;
+                        for (const GSwap& w : gswaps) {
+                            host_res[(size_t) w.layer * g.n_expert + w.in] = w.slot;
+                            srcp->release(w.layer, w.in);
+                        }
+                        if (d_res != nullptr) res_put(d_res);
+                        swaps_total += (int64_t) gswaps.size();
+                        gjob->post([&] { src.commit_copies(); });
+                        gstate = GState::Commit;
+                        if (drain) continue;
+                        break;
+                    case GState::Commit:
+                        g_wait();
+                        src.commit_flip();
+                        gswaps.clear();
+                        gstate = GState::Idle;
+                        continue;   // the RAM tier and the next round at this same boundary
+                    }
+                    break;
+                }
+                ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
+                return true;
+            };
             for (;;) {
                 std::string line;
                 {
@@ -12695,19 +13149,20 @@ int main(int argc, char** argv) {
                 if (line == "QUIT") break;
                 if (line.empty()) continue;
                 stop_req.store(false);
-                if (line.rfind("GEN ", 0) != 0) {
-                    std::printf("ERR this engine takes GEN requests only (glm5-next)\n");
+                const bool geni = line.rfind("GENI ", 0) == 0;   // 2026-10-11: images (GENI <max_new>[ keys] <file> <ids>)
+                if (!geni && line.rfind("GEN ", 0) != 0) {
+                    std::printf("ERR this engine takes GEN / GENI requests only (glm5-next)\n");
                     std::fflush(stdout);
                     continue;
                 }
                 // GEN <max_new>[ key=value ...] <id,id,...>
-                std::istringstream is(line.substr(4));
+                std::istringstream is(line.substr(geni ? 5 : 4));
                 std::vector<std::string> f;
                 for (std::string w; is >> w;) f.push_back(w);
                 std::vector<int64_t> ids64;
                 std::string perr;
                 const int64_t max_new = f.size() >= 2 ? std::atoll(f[0].c_str()) : 0;
-                if (f.size() < 2 || max_new < 1 || !parse_i64_list(f.back().c_str(), ids64, perr) || ids64.empty()) {
+                if (f.size() < (geni ? 3u : 2u) || max_new < 1 || !parse_i64_list(f.back().c_str(), ids64, perr) || ids64.empty()) {
                     std::printf("ERR malformed request\n");
                     std::fflush(stdout);
                     continue;
@@ -12721,6 +13176,66 @@ int main(int argc, char** argv) {
                 }
                 std::vector<int32_t> prompt((size_t) n);
                 for (int64_t i = 0; i < n; ++i) prompt[(size_t) i] = (int32_t) ids64[(size_t) i];
+                // 2026-10-11 images: the file holds strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n rows);
+                // each picture's rows go to its run of <|image|> (154854) cells, which the server widened to n.  Those
+                // cells' ids become ones derived from the picture's rows, so the prefix caches (live, snapshot, disk
+                // slots) tell two pictures apart; their embeddings are replaced anyway.
+                std::vector<float> img_rows;
+                ver.glm5_img_rows.clear();
+                bool has_img = false;
+                if (geni) {
+                    constexpr int32_t kGlmImage = 154854;   // <|image|> in GLM-5.3's vocabulary
+                    const std::string emb_path = f[f.size() - 2];
+                    struct Img { int64_t n; size_t off; };
+                    std::vector<Img> imgs;
+                    std::string ve;
+                    std::FILE* ef = std::fopen(emb_path.c_str(), "rb");
+                    if (!ef) ve = "cannot open " + emb_path;
+                    while (ef && ve.empty()) {
+                        int32_t hdr[5];
+                        const size_t got = std::fread(hdr, sizeof(int32_t), 5, ef);
+                        if (got == 0) break;
+                        if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[4] != (int32_t) g.n_embd) {
+                            ve = "bad embeddings file (expected strata-vision records of width " + std::to_string((long long) g.n_embd) + ")";
+                            break;
+                        }
+                        const size_t off = img_rows.size(), cnt = (size_t) hdr[1] * (size_t) hdr[4];
+                        img_rows.resize(off + cnt);
+                        if (std::fread(img_rows.data() + off, sizeof(float), cnt, ef) != cnt) { ve = "short embeddings file"; break; }
+                        imgs.push_back({hdr[1], off});
+                    }
+                    if (ef) std::fclose(ef);
+                    ver.glm5_img_rows.assign((size_t) n, nullptr);
+                    size_t k = 0;
+                    for (int64_t i = 0; ve.empty() && i < n;) {
+                        if (prompt[(size_t) i] != kGlmImage) { ++i; continue; }
+                        if (k >= imgs.size()) { ve = "the prompt has more images than the embeddings file"; break; }
+                        const Img& im = imgs[k++];
+                        if (i + im.n > n - 1) { ve = "an image runs to the end of the prompt"; break; }
+                        uint64_t h = fnv1a(img_rows.data() + im.off, (size_t) im.n * (size_t) g.n_embd * sizeof(float));
+                        for (int64_t j = 0; j < im.n; ++j) {
+                            if (prompt[(size_t) (i + j)] != kGlmImage) {
+                                ve = "image " + std::to_string(k) + " has " + std::to_string((long long) im.n) + " rows but fewer <|image|> cells";
+                                break;
+                            }
+                            ver.glm5_img_rows[(size_t) (i + j)] = img_rows.data() + im.off + (size_t) j * (size_t) g.n_embd;
+                            h = h * 0x100000001b3ULL + 0x9e3779b97f4a7c15ULL;
+                            prompt[(size_t) (i + j)] = (int32_t) (h % 150000u);   // any id: the row replaces its embedding
+                        }
+                        i += im.n;
+                        has_img = true;
+                    }
+                    if (ve.empty() && k != imgs.size()) ve = "the embeddings file has more images than the prompt";
+                    if (ve.empty() && !gl_chain.empty()) ve = "images are not supported with --remote-stage";
+                    if (!ve.empty()) {
+                        ver.glm5_img_rows.clear();
+                        std::printf("ERR %s\n", ve.c_str());
+                        std::fflush(stdout);
+                        continue;
+                    }
+                }
+                // --adapt-async: the round in flight finishes before the prompt lends any slot
+                if (!g_tick(true)) { std::printf("ERR an adaptive refill failed\n"); std::fflush(stdout); return 1; }
                 const Clock::time_point tp = Clock::now();
                 auto starts_with = [&](const std::vector<int32_t>& pre) {
                     return (int64_t) pre.size() <= n - 1 && std::equal(pre.begin(), pre.end(), prompt.begin());
@@ -12780,7 +13295,8 @@ int main(int argc, char** argv) {
                 static const float ram_seed = [] { const char* v = std::getenv("STRATA_GLM5_RAM_SEED"); return v ? (float) std::atof(v) : 30.0f; }();
                 const bool rseed = ram_seed > 0.f && ram_swaps > 0 && gl_chain.empty() && np - reused >= 256 && pf_chunk > 0;
                 if (seed || rseed) ver.pf_usage.assign((size_t) g.n_layers * g.n_expert, 0.0f);
-                if (np - reused >= pf_min && pf_chunk > 0) {
+                // an image's rows only reach the engine through the chunk path (the verify windows embed token ids)
+                if ((np - reused >= pf_min || has_img) && pf_chunk > 0) {
                     ver.prefill_ms_total = 0;
                     // slots: the system part first (up to the first <|user|>), then its slot, then the rest
                     int64_t cut = reused;
@@ -12825,6 +13341,7 @@ int main(int argc, char** argv) {
                         cancelled = stop_req.load();
                     }
                 }
+                ver.glm5_img_rows.clear();   // the rows live in this request's img_rows
                 if (rseed && ver.pf_usage.size() == drive.d.usage.size()) {   // the RAM tier's bias: frequency x ram_seed
                     const float k = ram_seed / (float) (np - reused);
                     ram_bias.resize(ver.pf_usage.size());
@@ -12882,9 +13399,13 @@ int main(int argc, char** argv) {
                     }
                     if (pos + T > o.max_context) { finish = "length"; break; }
                     drive.d.layers = 0; drive.d.experts = 0; drive.d.failed = false;
-                    apply_pending(!adapt_nowait());
-                    ram_promote();
-                    const bool adapt_due = !drive.d.usage.empty() && ((rounds_all + 1) % o.adapt_every) == 0;
+                    if (gjob) {
+                        if (!g_tick(false)) { std::printf("ERR an adaptive refill failed\n"); std::fflush(stdout); return 1; }
+                    } else {
+                        apply_pending(!adapt_nowait());
+                        ram_promote();
+                    }
+                    const bool adapt_due = !gjob && !drive.d.usage.empty() && ((rounds_all + 1) % o.adapt_every) == 0;
                     adapt_armed = adapt_overlap && adapt_due;
                     if (!ver.run(T, win.data(), pos, gl_pool, gl_user, outw.data(), err) || drive.d.failed) {
                         std::printf("ERR %s\n", err.empty() ? "the expert pool failed" : err.c_str());
@@ -12950,10 +13471,14 @@ int main(int argc, char** argv) {
                                      drive.d.ms_actq / w, drive.d.ms_jobs / w, drive.d.ms_run / w);
                     std::fprintf(stderr, "strata serve: adapt per window: %.2f ms (%.1f swaps), waiting for its copies %.2f ms\n",
                                  ms_adapt / w, (double) swaps_total / w, ms_pending_wait / w);
+                    std::fprintf(stderr, "strata serve: adapt parts per window: choose %.2f ms, copies back + wait %.2f ms, "
+                                         "refills queued %.2f ms\n", ms_ad_decide / w, ms_ad_stage / w,
+                                 std::max(0.0, ms_adapt - ms_ad_decide - ms_ad_stage) / w);
                     if (ram_swaps > 0)
                         std::fprintf(stderr, "strata serve: RAM tier per window: %.2f ms (%.2f file -> RAM swaps)\n",
                                      ms_ram_swaps / w, (double) ram_swaps_total / w);
                     ms_adapt = 0; swaps_total = 0; ms_pending_wait = 0; ms_ram_swaps = 0; ram_swaps_total = 0;
+                    ms_ad_decide = ms_ad_stage = 0;
                     double jp = 0, jz = 0; int64_t zr = 0;
                     strata::core::expert_pool_jobs_stats(jp, jz, zr);
                     if (cx > 0)

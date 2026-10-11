@@ -921,6 +921,10 @@ void FileExpertSource::close() {
             if (complement_registered_) (void) cudaHostUnregister(complement_arena_);
             if (complement_locked_ > 0)
                 strata::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
+#if defined(_WIN32)
+            if (complement_large_) (void) VirtualFree(complement_arena_, 0, MEM_RELEASE);
+            else
+#endif
             std::free(complement_arena_);
         }
     }
@@ -945,6 +949,7 @@ void FileExpertSource::close() {
     complement_pinned_ = false;
     complement_partial_ = false;
     complement_registered_ = false;
+    complement_large_ = false;
     complement_pin_limit_ = 0;
     complement_lock_off_ = 0;
     complement_ready_ = false;
@@ -2455,12 +2460,17 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t partial_pin = 0;   ///< CS-T: a registered prefix of a locked arena
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
     std::string note;
+    bool large_ok = false;      ///< STRATA_RAM_LARGEPAGES: the arena came from VirtualAlloc(MEM_LARGE_PAGES)
     auto release = [&]() {
         if (arena == nullptr) return;
         if (pinned_ok) (void) cudaFreeHost(arena);
         else {
             if (partial_pin > 0) (void) cudaHostUnregister(arena);
             if (locked > 0) strata::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
+#if defined(_WIN32)
+            if (large_ok) (void) VirtualFree(arena, 0, MEM_RELEASE);
+            else
+#endif
             std::free(arena);
         }
         arena = nullptr;
@@ -2518,7 +2528,55 @@ bool FileExpertSource::pin_cache_complement(
             }
         }
 #endif
+#if defined(_WIN32)
+        // STRATA_RAM_LARGEPAGES=1 (opt-in, 2026-10-11): the complement in 2 MB pages (VirtualAlloc MEM_LARGE_PAGES, the
+        // process enabling SeLockMemoryPrivilege first, as pinned.cu's arena does), then registered with CUDA.  The CPU
+        // experts read ~12 MB blobs: with 4 KB pages the hardware prefetch stops at every page and the TLB misses on
+        // each; large pages are non-pageable already.  Any failure falls through to cudaHostAlloc below.
+        static const bool ram_large = [] { const char* v = std::getenv("STRATA_RAM_LARGEPAGES"); return v && v[0] == '1'; }();
+        if (pin && !paced && ram_large) {
+            HANDLE tok = nullptr;
+            if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+                TOKEN_PRIVILEGES tp{};
+                tp.PrivilegeCount = 1;
+                if (LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid)) {
+                    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                    (void) AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr);
+                }
+                CloseHandle(tok);
+            }
+            const SIZE_T lp = GetLargePageMinimum();
+            const auto t_lp = std::chrono::steady_clock::now();
+            void* p = lp > 0 ? VirtualAlloc(nullptr, (SIZE_T) ((bytes + lp - 1) / lp * lp),
+                                            MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE) : nullptr;
+            const unsigned long lerr = p ? 0 : GetLastError();
+            if (p != nullptr && cudaHostRegister(p, (size_t) bytes, cudaHostRegisterMapped | cudaHostRegisterPortable) == cudaSuccess) {
+                void* alias = nullptr;
+                if (cudaHostGetDevicePointer(&alias, p, 0) == cudaSuccess && alias != nullptr) {
+                    arena = p;
+                    device = (const uint8_t*) alias;
+                    partial_pin = bytes;   // registered whole: complement_registered_, freed by unregister + VirtualFree
+                    large_ok = true;
+                    note = "large pages (" + std::to_string((unsigned long long) lp) + " B, " +
+                           std::to_string((long long) std::chrono::duration<double>(std::chrono::steady_clock::now() - t_lp).count()) +
+                           " s) registered and mapped";
+                } else {
+                    (void) cudaGetLastError();
+                    (void) cudaHostUnregister(p);
+                    (void) VirtualFree(p, 0, MEM_RELEASE);
+                    std::fprintf(stderr, "FileExpertSource: STRATA_RAM_LARGEPAGES: no device alias; 4 KB pages instead\n");
+                }
+            } else {
+                (void) cudaGetLastError();
+                if (p != nullptr) (void) VirtualFree(p, 0, MEM_RELEASE);
+                std::fprintf(stderr, "FileExpertSource: STRATA_RAM_LARGEPAGES: %s (VirtualAlloc error %lu); 4 KB pages instead\n",
+                             p ? "cudaHostRegister refused" : "large pages refused", lerr);
+            }
+        }
+        if (pin && !paced && arena == nullptr) {
+#else
         if (pin && !paced) {
+#endif
             const cudaError_t allocated = cudaHostAlloc(&arena, (size_t) bytes,
                                                          cudaHostAllocMapped | cudaHostAllocPortable);
             if (allocated == cudaSuccess) {
@@ -2810,8 +2868,9 @@ bool FileExpertSource::pin_cache_complement(
     complement_pinned_ = (pinned_ok || partial_pin > 0) && bytes > 0;
     complement_pin_limit_ = pinned_ok ? bytes : partial_pin;
     complement_registered_ = !pinned_ok && partial_pin > 0;
+    complement_large_ = large_ok;
     // a paced registration that covers the whole arena is as good as a cudaHostAlloc'd one
-    complement_partial_ = complement_registered_ && !(paced && partial_pin >= bytes);
+    complement_partial_ = complement_registered_ && !(paced && partial_pin >= bytes) && !large_ok;
     complement_locked_ = locked;
     complement_lock_off_ = lock_off;
     complement_lent_slots_ = lend ? n_slots - keep_from : 0;

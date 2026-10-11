@@ -13,7 +13,8 @@
   "--expert-profile", "<DATA>\\packs\\glm53_iq4xs\\expert-profile-learned-2026-10-08b.bin",
   "--expert-cache", "0",
   "--adapt-every", "1",
-  "--adapt-swaps", "64",
+  "--adapt-swaps", "32",
+  "--adapt-async", "1",
   "--pool-workers", "20",
   "--vram-reserve-mib", "3400"
  ],

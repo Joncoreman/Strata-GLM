@@ -2222,6 +2222,12 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             const NativeEmbed* ne = native_embed();
             if (ne == nullptr) { err = "verify glm5 prefill: needs the native token embedding"; return false; }
             ne->gather_dev(tokc, T, embc, cs);
+            // 2026-10-11: an image's cells take strata-vision's rows instead (GLM-5.3 has no RoPE: nothing else changes)
+            for (int64_t t = 0; t < T; ++t) {
+                const int64_t p = pos0 + c0 + t;
+                if (p < (int64_t) glm5_img_rows.size() && glm5_img_rows[(size_t) p] != nullptr)
+                    cudaMemcpyAsync(embc + (size_t) t * N, glm5_img_rows[(size_t) p], (size_t) N * 4, cudaMemcpyHostToDevice, cs);
+            }
             broadcast_streams(embc, Rc, N, (int) HC, (int) T, cs);
         }
         return true;

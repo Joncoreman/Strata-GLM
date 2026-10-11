@@ -28,6 +28,24 @@ and the same day: prompts at 3-33 tokens/s (86-token prompt 28 s, 4,400 tokens 1
 The "writes" numbers above use **expert skipping** (below), which changes about one token in a hundred on long
 reasoning. With it off the short-chat answer is **20 tokens/s**; the prompt speeds do not depend on it.
 
+### Update 2026-10-11
+
+- **Tokenizer fix (please update).** The pack's tokenizer split numbers one digit at a time (Qwen3.5's rule);
+  GLM-4/5 split them in runs of up to three (llama.cpp's CHATGLM4 rule) and ignore merges for whole words. The
+  model then wrote file names and numbers wrong (`2117_00001` came back as `2211_7_0_0001`). Fixed in
+  `tools/strata_tokenizer.py`. A pack made before this needs its tokenizer written again:
+  `python tools\strata_tokenizer.py --gguf <shard 1 of the GGUF> --out <the pack>\tokenizer`.
+  Checked: 12 test texts give the same token ids as llama.cpp's `/tokenize`.
+- **Images.** With the model's `mmproj` and `build-vision-glm5.bat` (llama.cpp with the glm5v projector, CPU),
+  the server reads pictures (about 414 tokens per image).
+- **Tool calls.** GLM's `<tool_call>NAME<arg_key>...` form is parsed as a call (it came back as text before).
+- **`--adapt-async 1`** (now in the example settings, with `--adapt-swaps 32`): the VRAM tier's expert swaps run
+  on a thread of their own while the next windows compute, instead of between windows (3.5-4.5 ms a window).
+  Short chat **28.7-30.1 tokens/s** (24.9-26.0 without it), the follow-up 22.9 (21.5), after a 4,228-token
+  summary 20.6 (15-16), prompts unchanged (measured with Huihui's GLM-5.3-Flash abliterated UD-IQ4_XS, whose
+  experts are byte-identical to unsloth's; expert skipping on). Which window first uses a swapped-in expert
+  depends on the window count only.
+
 Quality: the prompt path and every decode optimisation except the skipping are bitwise the engine's exact path
 (checked token by token on a deterministic 4,400-token run after each change). The skipping is measured as the
 next-token distribution's KL against the exact path: 0.016 on a summary, 0.022 on a 1,213-token reasoning text,

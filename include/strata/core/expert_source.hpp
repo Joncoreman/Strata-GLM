@@ -801,6 +801,7 @@ private:
     bool complement_pinned_ = false;
     bool complement_partial_ = false;         ///< CS-T: only the first complement_pin_limit_ bytes are registered
     bool complement_registered_ = false;      ///< the arena is ordinary memory registered with cudaHostRegister (not cudaHostAlloc)
+    bool complement_large_ = false;           ///< STRATA_RAM_LARGEPAGES: VirtualAlloc(MEM_LARGE_PAGES), freed with VirtualFree
     uint64_t complement_pin_limit_ = 0;
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
     bool complement_ready_ = false;

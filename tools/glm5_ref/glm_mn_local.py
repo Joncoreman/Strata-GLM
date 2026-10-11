@@ -4,10 +4,13 @@
 import os, subprocess, sys, time
 from pathlib import Path
 
-WT = Path(r"D:\AI\LLM\strata-glm-gpu")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _glm5_paths as P  # noqa: E402
+
+WT = Path(os.environ.get("WT", str(P.REPO)))
 EXE = WT / "build-engine" / "strata.exe"
-PACK = "D:/AI/LLM/Strata-data/packs/glm53_iq4xs"
-NATIVE = "D:/AI/LLM/GLM-5.3-Flash-GGUF/unsloth/GLM-5.3-Flash-GGUF/UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"
+PACK = str(P.pack_dir()).replace("\\", "/")
+NATIVE = str(P.native_gguf()).replace("\\", "/")
 OUT = WT / "build-engine" / "glm_mn"   # logs and tokens (beside the engine build, not in the source tree)
 OUT.mkdir(exist_ok=True)
 mode = sys.argv[1]

@@ -38,9 +38,10 @@ args = ["--serve", "--pack", PACK, "--native", NATIVE, "--prefill", "auto", "--s
         "--adapt-every", os.environ.get("ADAPT_EVERY", "1"), "--adapt-swaps", os.environ.get("ADAPT", "64")]
 args += os.environ.get("EXTRA", "").split()   # more engine flags for an A/B (space separated)
 if mode == "mn":
-    args += ["--remote-stage", os.environ.get("STAGE_ADDR", "KITT3060:9300"), "--layer-split", f"{K1},{K2}"]
-elif mode == "mn2":   # both 3060s: GPU 0 runs [30, 37), GPU 1 [37, 44)
-    args += ["--remote-stage", "KITT3060:9300,KITT3060:9302", "--layer-split", os.environ.get("SPLIT3", "30,37,44")]
+    args += ["--remote-stage", os.environ.get("STAGE_ADDR", "stage-pc:9300"), "--layer-split", f"{K1},{K2}"]
+elif mode == "mn2":   # two stage GPUs: GPU 0 runs [30, 37), GPU 1 [37, 44)
+    args += ["--remote-stage", os.environ.get("STAGE_ADDRS", "stage-pc:9300,stage-pc:9302"), "--layer-split",
+             os.environ.get("SPLIT3", "30,37,44")]
 # 2026-10-09: what slowed runs down today, checked before each run (a warning, the run goes on)
 #  - the 5090's NIC power saving (Green Ethernet / Gigabit Lite / Power Saving Mode) came back ON after a Killer
 #    driver reinstall: the stage round trip went 19 -> 30-42 ms (ping.py p90 12 ms, max 334 ms)

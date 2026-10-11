@@ -80,4 +80,5 @@ def load_tokenizer():
     types = json.load(open(d / "token_type.json", encoding="utf-8"))
     tk = ST.Tokenizer(tokens, merges, types, pre="glm4")
     tk._re = regex.compile(meta["pre_pattern"])
+    tk.ignore_merges = bool(meta.get("ignore_merges"))   # glm4 (2026-10-11)
     return tk

@@ -87,7 +87,7 @@ def main() -> int:
         "args": ["--pack", str(pack), "--native", str(gguf), "--prefill", "auto", "--spec", "6",
                  "--max-context", str(a.context), "--pcie-frac", "0", "--mmap-experts",
                  "--resident-budget-gib", str(ram), "--expert-profile", str(prof), "--expert-cache", "0",
-                 "--adapt-every", "1", "--adapt-swaps", "64", "--pool-workers", str(workers),
+                 "--adapt-every", "1", "--adapt-swaps", "32", "--adapt-async", "1", "--pool-workers", str(workers),
                  "--vram-reserve-mib", str(a.vram_reserve_mib)],
         "env": env,
         "cwd": str(REPO),

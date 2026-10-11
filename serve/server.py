@@ -1851,6 +1851,10 @@ class Vision:
             args += ["--max-tokens", str(cfg["max_tokens"])]
         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
             args += ["--min-tokens", str(cfg["min_tokens"])]
+        # the template's image markers: Qwen's by default; GLM-5.3 writes <|begin_of_image|><|image|><|end_of_image|>
+        # (2026-10-11, the config's vision "image_start" / "image_pad")
+        self.image_start = cfg.get("image_start") or VISION_START
+        self.image_pad = cfg.get("image_pad") or IMAGE_PAD
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.proc = None
@@ -3226,8 +3230,9 @@ class Service:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
+            image_pad = getattr(self.vision, "image_pad", IMAGE_PAD)
+            pad = self.tok.encode(image_pad, parse_special=True)[0]
+            start = self.tok.encode(getattr(self.vision, "image_start", VISION_START), parse_special=True)[0]
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
             # for as long as urlopen waited.
             images = [fetched[src] if src in fetched else Vision.download(src) if src.startswith(("http://", "https://"))
@@ -3242,7 +3247,7 @@ class Service:
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
-            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
+            literal = self.tok.encode(image_pad, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
                 if t == pad and j > 0 and ids[j - 1] == start:
@@ -5689,7 +5694,8 @@ def main() -> int:
             if meta.get("pre_pattern") and meta.get("pre") not in (None, "qwen35"):
                 import regex
                 tok._re = regex.compile(meta["pre_pattern"])
-                print(f"[strata] pre-tokenizer: {meta['pre']} (from {meta_path})", flush=True)
+                tok.ignore_merges = bool(meta.get("ignore_merges"))   # glm4 (2026-10-11): a vocabulary piece is itself
+                print(f"[strata] pre-tokenizer: {meta['pre']} (from {meta_path}, ignore_merges {tok.ignore_merges})", flush=True)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:

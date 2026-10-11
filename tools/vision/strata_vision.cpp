@@ -211,8 +211,15 @@ int main(int argc, char** argv) {
             const int n = (int) mtmd_input_chunk_get_n_tokens(ichunk);
             // the grid from the decoder positions (nx/ny getters are deprecated): x and y of the last token
             const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n - 1);
-            const int nx = (int) last.x + 1, ny = (int) last.y + 1;
-            if (nx * ny != n) err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)";
+            int nx = (int) last.x + 1, ny = (int) last.y + 1;
+            // 2026-10-11 GLM-5.3 (glm5v, a text model without RoPE): mtmd gives its image tokens 1-D positions, so the
+            // grid is one row of n.  The engine's GLM path uses no positions; an M-RoPE model still gets its 2-D grid.
+            if (nx * ny != n) {
+                std::fprintf(stderr, "strata-vision: positions end at (%d, %d) for %d tokens: written as one row\n",
+                             (int) last.x, (int) last.y, n);
+                nx = n;
+                ny = 1;
+            }
             const float* embd = mtmd_get_output_embd(ctx);
             FILE* f = err.empty() ? std::fopen(out.c_str(), "wb") : nullptr;
             if (err.empty() && !f) err = "cannot write " + out;

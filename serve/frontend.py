@@ -791,6 +791,27 @@ class OutputParser:
         self.fence, self.line, self.ticks = snap
         return ok
 
+    def _glm_follower(self, after: str) -> str | None:
+        """glm5-next (2026-10-11): what follows `<tool_call>` in GLM-5.3's form, `NAME<arg_key>...` or `NAME</tool_call>`
+        (no arguments): "call" when NAME is a declared tool (any name when none are declared), "wait" while it can
+        still become one, else None (the Qwen checks below decide)."""
+        m = re.match(r"[A-Za-z0-9_.\-]+", after)
+        if m is None:
+            return "wait" if not after else None
+        name = m.group(0)
+        if m.end() == len(after):   # the name may still be growing
+            return "wait" if not self.schemas or any(str(n).startswith(name) for n in self.schemas) else None
+        if self.schemas and name not in self.schemas:
+            return None
+        rest = after[m.end():].lstrip()
+        if not rest:
+            return "wait"
+        if rest.startswith(GLM_KEY) or rest.startswith(CALL_END):
+            return "call"
+        if GLM_KEY.startswith(rest) or CALL_END.startswith(rest):
+            return "wait"
+        return None
+
     def _follower(self, after: str) -> str:
         """recover: what a `<tool_call>` followed (after whitespace) by `after` opens: "call" (`<function=`), "param"
         (a declared tool's name written as `<parameter=NAME>`), "json" (`{`), "wait" (not decided yet) or "text"."""
@@ -1117,6 +1138,15 @@ class OutputParser:
                 # it is prose that names the format ("I'll use a <tool_call> block") - content, not a malformed call
                 # that ends the request.  Until its follower has arrived it is held, like a partial tag.
                 after = self.buf[i + len(CALL_START):].lstrip()
+                glm = self._glm_follower(after)   # 2026-10-11: GLM-5.3's NAME<arg_key>... is a call too
+                if glm == "call":
+                    if i and self.buf[:i].strip():
+                        out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
+                    self.buf = self.buf[i + len(CALL_START):]
+                    self.state = "call"
+                    continue
+                if glm == "wait":
+                    return out                   # held, like a partial tag, until the name and its follower arrive
                 kind = self._follower(after) if self.recover else None
                 if kind in ("param", "json"):
                     if i and self.buf[:i].strip():
