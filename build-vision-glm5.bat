@@ -3,7 +3,7 @@ rem strata-vision (the image encoder) for GLM-5.3-Flash, CPU only (the GLM engin
 rem Needs a llama.cpp checkout that knows the glm5v projector (b11461 or newer): the first argument, else LLAMA_DIR,
 rem else ..\llamacpp-glm5 beside this folder. Built for this PC (portable off). Then add a "vision" block to the
 rem server settings: exe build-vision-glm5\bin\strata-vision.exe, the model's mmproj, and GLM's image markers
-rem (image_start begin_of_image, image_pad image, each in the model's special-token brackets; see README-GLM5).
+rem (image_start begin_of_image, image_pad image, each in the model's special-token brackets; see README.md).
 setlocal
 cd /d "%~dp0"
 if not "%~1"=="" set LLAMA_DIR=%~1

@@ -1,211 +1,134 @@
-<h1 align="center">Strata</h1>
+# Strata GLM
 
-[English](README.md) · [简体中文](README.zh-CN.md) · **日本語** · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+**GLM-5.3-Flash（320B-A18B・157GB）をゲーミング PC 1台で動かす**
 
-<p align="center"><b>1,250 億パラメータの AI モデルを、手元のゲーミング PC で動かす</b><br>
-NVIDIA または AMD のグラフィックカード（12 GB 以上） · Windows または Linux · 無料のオープンソース</p>
+RTX 5090＋RAM 128GB＋NVMe で、短い会話の生成 **28.7〜30.1 tok/s**、4,400トークンの読み込み **580 tok/s**
+（同じ PC の llama.cpp は 7〜10 と 42〜55）。画像と道具呼び出しに対応・文脈 262K。
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="Strata のモデルが書いたボクセルの五重塔の庭。ブラウザで動いている様子"></a><br>
-<sub>ボクセルの五重塔の庭。1 回のプロンプトで作成し、RTX 5070 上の Strata（IQ3_S、128K コンテキスト）で実行 ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">動画全体（49 秒）</a></sub></p>
+[English](README.md) · **日本語**
 
-Strata は **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** を普通の PC で動かします。
-これは大きくて賢い AI モデルで、ふつうはサーバーが必要です。チャットをしたり、コードを書いたり、画像を読んだりできます。
-アプリやコーディングエージェントとも連携します。データが PC の外に出ることはありません。
+[Strata](https://github.com/Niko1221/Strata)（v0.1.41・MIT）のフォークです。**GLM-5.3-Flash**（3,200億パラメータ・
+活性 180億・unsloth の **UD-IQ4_XS** GGUF・157GB）を、GPU 1枚＋システム RAM＋NVMe の **PC 1台**で動かします。
+Strata 本体は Qwen3.8-Flash-Next 用で、GLM 対応はこのフォークで 2026年10月に追加したものです。Strata 本体の説明＝[README-Strata.ja.md](README-Strata.ja.md)。
 
-## どのくらい速い？
+データは PC の外に出ません。サーバーは OpenAI 互換と Anthropic 互換の API を話すので、Claude Code・Codex・opencode・
+Cursor・各種チャット画面からそのまま使えます。
 
-ごく普通のゲーミング PC 2 台で測りました。1 トークンは英単語のおよそ ¾ です。
+## 開発機での実測
 
-- **回答の書き出し：** 短いチャットで返答が表示される速さです。毎秒 60 トークンあれば、読むより速く表示されます。
-- **プロンプトの読み込み：** 送った内容を取り込む速さです（ここでは 32K トークンの文書、コード、またはチャット履歴）。
+RTX 5090（32GB）・Core Ultra 9 285K（24コア）・128GB DDR5-5200（2チャンネル）・NVMe・Windows 11・文脈 262K。
+`tools/glm5_ref/glm_ab_speed.py` で、温めたサーバーに 256トークンを答えさせた値です。
 
-<table>
-<tr><th>NVIDIA: RTX 5070 (12 GB), Ryzen 5 7600, 64 GB RAM</th><th>AMD: RX 9070 XT (16 GB), Ryzen 9 3900X, 47 GB RAM</th></tr>
-<tr><td>
+| | 読み込み（prefill） | 生成（decode） |
+|---|---:|---:|
+| 短い会話（入力 86トークン） | 1.7秒 | **25 tok/s** |
+| 560トークンの文書の後 | 5.5秒（100 tok/s） | 15.5 tok/s |
+| 4,400トークンの文書の後 | 7.4秒（590 tok/s） | 13.3 tok/s |
+| 32K トークンのプロンプト | 35〜45秒（700〜900 tok/s） | 約8 tok/s |
 
-| サイズ | 回答の書き出し | プロンプトの読み込み |
-| --- | ---: | ---: |
-| **Q2_0** | 94 tokens/s | 2,650 tokens/s |
-| **IQ2_XS** | 79 tokens/s | 2,090 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 1,750 tokens/s |
-| **IQ3_S** | 53 tokens/s | 1,620 tokens/s |
-| **Coder** | 55 tokens/s | 2,180 tokens/s |
+同じ PC・同じ日に llama.cpp（b11461・見つかった最良設定＝16スレッド・MoE 40層を CPU）で同じモデルを動かすと、
+読み込み 3〜33 tok/s（86トークンで28秒・4,400トークンで135秒）、生成 8.1 tok/s でした。
 
-</td><td>
+上の「生成」は**専門家の省略**（後述）を使った値で、長い推論で100語に約1語が変わります。省略なしなら短い会話で
+**20 tok/s**。読み込みの速さは省略に依存しません。
 
-| サイズ | 回答の書き出し | プロンプトの読み込み |
-| --- | ---: | ---: |
-| **Q2_0** | 60 tokens/s | 1,160 tokens/s |
-| **IQ2_XS** | 52 tokens/s | 1,110 tokens/s |
-| **Coder** | 44 tokens/s | 1,420 tokens/s |
+### 2026-10-11 の更新
 
-</td></tr>
-</table>
+- **トークナイザの修正（更新してください）**：パックのトークナイザが数字を1桁ずつ区切っていました（Qwen3.5 の規則）。
+  GLM-4/5 の正しい規則は「最大3桁ずつ」（llama.cpp の CHATGLM4）で、単語まるごとは結合を使いません。
+  そのためファイル名や数字の書き写しが崩れていました（`2117_00001` → `2211_7_0_0001`）。
+  `tools/strata_tokenizer.py` で修正済みです。修正前に作ったパックは、トークナイザだけ作り直してください：
+  `python tools\strata_tokenizer.py --gguf <GGUF の1本目> --out <パック>\tokenizer`。
+  検証＝12種の文で llama.cpp の `/tokenize` と単語番号が完全一致。
+- **画像**：モデルの `mmproj` と `build-vision-glm5.bat`（glm5v 対応の llama.cpp・CPU）で画像を読めます（1枚 約414トークン）。
+- **道具呼び出し**：GLM 形式の `<tool_call>名前<arg_key>…` を呼び出しとして解釈します（以前は本文として返っていました）。
+- **`--adapt-async 1`**（設定の見本に `--adapt-swaps 32` と一緒に入れました）：VRAM の専門家の入れ替えを、窓と窓の
+  間（1窓 3.5〜4.5ms）ではなく、次の窓の計算中に裏のスレッドで行います。短い会話 **28.7〜30.1 tok/s**（なし 24.9〜26.0）、
+  会話の続き 22.9（21.5）、4,228トークンの要約の後 20.6（15〜16）、読み込みは不変
+  （Huihui の GLM-5.3-Flash abliterated UD-IQ4_XS で測定。専門家は unsloth 版とバイト単位で同一・省略あり）。
+  入れ替えた専門家を何窓目から使うかは窓の数だけで決まります。
 
-NVIDIA：Q2_0 はエンジン 0.1.36、ほかの行は 0.1.26 で測定（回答 4K、プロンプト 32K）。表の全体は
-[DETAILS.md](docs/DETAILS.md#speed-measured) にあります。VRAM が多いカードほど速くなります。RTX 3090（24 GB）なら
-毎秒およそ 100-140 トークンで書き出せるはずです。長いチャットやほかのカードについて：[モデルごとの速度](docs/MODELS.md#how-fast-is-each-size)、
-[コミュニティの測定結果](docs/COMMUNITY_BENCHMARKS.md)。
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata は無料です。あなたの PC でうまく動いたら、コーヒー 1 杯の支援が開発を続ける力になります。</sub></p>
+正しさ：読み込み経路と、省略以外の生成の改修はすべて、元の厳密な経路とビット単位で同じ出力です（改修のたびに
+決定的な 4,400トークンの実行でトークン列を照合）。省略は「次の単語の確率分布の KL」で測り、要約で 0.016、
+1,213トークンの推論文で 0.022（省略なし同士のばらつき＝床は 0.013）。
 
 ## 必要なもの
 
-| | |
-| --- | --- |
-| **グラフィックカード** | **NVIDIA** GeForce RTX 20、30、40、50 シリーズ、または **AMD** Radeon RX 7900 XT / XTX、RX 7800 XT / 7700 XT、RX 9060 XT、RX 9070 / 9070 XT、Radeon AI PRO R9700、RX 6800 / 6900 シリーズ。**VRAM 12 GB 以上**が必要です。 |
-| **RAM** | 32 GB 以上。RAM の量で[使えるモデル](#どのモデルを選べばいい)が決まります。64 GB あればすべてのサイズが動きます。 |
-| **ディスク** | 空き容量が約 80 GB。できれば SSD を使ってください。初回の起動がずっと速くなります。 |
-| **OS** | Windows 10 / 11 または Linux。NVIDIA または AMD の最新のグラフィックドライバー。 |
+- Windows 10/11（Linux は GLM 経路では未検証・Strata 本体は対応）、Python 3.10 以上。
+- NVIDIA GPU 24GB 以上（32GB で検証。24GB だと VRAM に載る専門家が減って遅くなります）。
+  ビルドに Visual Studio 2022 Build Tools（C++）と CUDA toolkit 12.8 か 13。
+- **RAM 128GB**（RAM 層に専門家 98GB を置きます。64GB だと大半が SSD からの読みになり生成が数倍遅くなります）。
+- モデルを置く NVMe SSD（RAM に無い専門家は unbuffered で直接読みます）。GGUF 160GB＋パック 0.3GB。
+- モデル：[unsloth/GLM-5.3-Flash-GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) の `UD-IQ4_XS`
+  （5分割・157GB）。UD-IQ3_XXS（120GB）も生成は動きますが、読み込みは当面遅い経路になります（「分かっている制限」参照）。
 
-ほかに必要なものはすべてインストーラーが用意します。2 枚や 3 枚のカードでモデルを分担することもできます（[マルチ GPU](docs/MULTI_GPU.md)）。
+## 入れ方
 
-試験的なサポート。コミュニティのメンバーが自分のマシンで書き、テストしたものです：
-
-- **古いグラフィックカード**（Tesla P40 / V100、GTX 10、Radeon VII / MI50、RX 6700 XT、RX 5500 XT）：[Older GPUs](docs/OLDER_GPUS.md)。
-- **Intel Arc**（Linux でソースからビルド）：[Intel Arc](docs/INTEL_ARC.md)。
-- **AMD Ryzen AI Max（Strix Halo）**（Linux でソースからビルド）：[Strix Halo](docs/STRIX_HALO.md)。
-- **AVX2 のない古いプロセッサー**：動きますが、遅いです。[Older CPUs](docs/INSTALL.md#older-cpus-experimental)。
-
-全リスト：[docs/INSTALL.md](docs/INSTALL.md#what-you-need)。
-
-## インストール
-
-### AI にセットアップしてもらう
-
-AI コーディングアシスタント（Claude Code、Cursor、Codex、GitHub Copilot など）を使っていますか？ これを貼り付けてください：
-
-```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+```bat
+git clone <このリポジトリ> strata-glm5
+cd strata-glm5
+START-HERE.bat --setup          :: Strata 本体のセットアップ（Python・.venv・cmake/ninja/numpy/regex …）
+build-glm5.bat                  :: この PC の GPU 向けにエンジンをビルド（RTX 50 は sm_120。RTX 30 は "build-glm5.bat 86"）
+python tools\glm5_ref\make_glm5_config.py --gguf D:\models\UD-IQ4_XS\GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf
+START-GLM5.bat                  :: http://127.0.0.1:8097/v1 （RAM 層の固定に約1分）
 ```
 
-AI がグラフィックカード、RAM、ディスクを調べて、合うモデルを選びます。それからインストールして起動し、
-アプリのつなぎ方を教えてくれます。AI ツールは Strata の [MCP サーバー](docs/MCP_SERVER.md) を通じて、
-Strata のインストール、起動、停止もできます。
+`make_glm5_config.py` は、パック（`tools/iq_pack.py`＝密なテンソルと専門家の目次・0.3GB）をリポジトリの隣の
+`Strata-data/packs/glm53_iq4xs` に作り、学習済みの専門家プロファイルを横に置き、この PC 向けの `strata-glm5.json`
+（RAM 層＝総 RAM−30GB・スレッド＝物理コア−4）を書きます。他の設定はそのファイルを編集してください
+（`strata-glm5.example.json` に説明があります）。`--skip` を付けると専門家の省略（生成 +30%）が入ります。
 
-### 自分でやる
+Strata 本体の `START-HERE.bat --setup` は Qwen のモデルも入れようとします。.venv ができた時点で止めても（Ctrl-C）、
+最後まで通しても構いません。
 
-[Strata をダウンロード](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip)して展開します（または `git clone` します）。
-**Windows：** **`START-HERE.bat`** をダブルクリック。**Linux：** Strata フォルダーで **`./setup.sh`** を実行します。
+### 使い方
 
-手順は NVIDIA でも AMD でも同じです。インストーラーがカードを見つけて、それに合うエンジンを用意します。
-いくつか質問があります：
+クライアントの接続先を `http://127.0.0.1:8097/v1`（OpenAI：`/v1/chat/completions`、Anthropic：`/v1/messages`）、
+モデル名 `glm-5.3-flash-strata` にします。Claude Code／opencode／Cursor の設定は Strata の
+[Strata の README の「Using it」](README-Strata.md#using-it)と同じです（ポートが 8080 でなく 8097 になるだけ）。
 
-- どのモデルを、どのサイズで使うか
-- コンテキストをどのくらいにするか（モデルが覚えておけるテキストの量）
-- 画像を読ませるかどうか
+## なぜ速いか（効かなかったことも）
 
-毎回 Enter を押せば、おすすめの答えになります。そのあとモデル（約 70 GB）をダウンロードして起動します。
-ダウンロードが止まったら、もう一度実行してください。続きから再開します。ブラウザーで Strata アプリが
-`http://127.0.0.1:8080` に開きます。
+設計と全測定は `glm-notes/計画_読み込みの作り替え_2026-10-09.md` にあります。要点だけ：
 
-> **モデルの起動中、1-3 分ほど PC が重くなったり、反応しなくなったりすることがあります**（初回がいちばん長いです）。
-> Strata は 35-55 GB を RAM に読み込み、その一部をグラフィックカード用に固定します。これは正常です。
-> ウィンドウを閉じずに待ってください。Strata が何をしているかはウィンドウに表示されます。
+**読み込み（prefill）。** 専門家を「層ごとに歩く」：各層の専門家を 4K トークンの区切りごとでなく、最大 16K トークン
+のまとまりにつき1回だけ VRAM へ運び、int8 のテンソルコア（llama.cpp の MMQ）で計算します。共有専門家・密な層・
+注意側の射影もテンソルコアの GEMM、ルーターは cuBLAS 1回、長文の MLA 注意は WMMA で 32ヘッド/ブロック、SSD 層は
+1層先に先読み、ホスト側の状態は4本の連続配列でルーターと並行に移します。4,400トークンが 59.8秒 → 7.4秒。
 
-**次回からは** `START-HERE.bat`（または `./setup.sh`）をもう一度実行します。すぐに起動し、同じものを 2 回ダウンロードすることはありません。
-モデルを止めるときはウィンドウを閉じます。`UPDATE.bat`（`./update.sh`）を使うと、Strata を起動せずに更新できます。
-更新、Docker、複数のカード、ファイルの保存場所、すべてのオプションについて：[docs/INSTALL.md](docs/INSTALL.md)。
+**生成（decode）。** RAM 層は固定して学習済みプロファイルの順に並べ、最頻の専門家は VRAM に置き、両層とも会話に
+追従します（プロンプトの経路回数で初期化）。CPU の計算は1トークンでも AVX-VNNI。層の SSD 読みは読み専用スレッドで
+RAM 側の計算と並行、RAM 層への昇格の読みは1窓先に。MLA の 64ヘッドの吸収積と、同じ入力を取る KDA の射影は1回の
+起動に。会話の生成は 13.2 → 20.2 tok/s（答え不変）、省略ありで 25。
 
-## どのモデルを選べばいい
+**専門家の省略**（`STRATA_GLM5_SKIP_KEEP=2 STRATA_GLM5_SKIP_MINW=0.10`）：そのトークンへの経路の重みが全体の 10%
+未満で、VRAM に無い専門家は計算しない（上位2つは必ず計算）。[2×3090 レシピ](https://github.com/saitakarcesme/glm5.3-flash-2x3090)
+の cache-aware routing に倣ったもの。既定はオフ。
 
-インストーラーが RAM に合わせてひとつ勧めます。同じモデルにも、圧縮の強さが違う複数のサイズがあります。
-小さいサイズほど速く、大きいサイズほど少し賢くなります。
+**測って採らなかったもの**（すべてこの PC）：RTX 3060 の2台目 PC を層の段にする（頭が速くなった後は 14.4 対 20.2
+＝3060 の1層は浮く時間の3倍かかる）、PCIe 経由で GPU にも専門家を計算させる（`--pcie-frac`・DMA と CPU が同じ RAM
+帯域を取り合う）、MTP の下書き（窓を広げると CPU の仕事が比例して増える）、次の層の経路予測による SSD 先読み
+（外れた読みの方が高い）、省略した重みの配り直し、少数専門家での自己投機（下書きが全部当たっても遅い）、GGUF の
+マップ外しで unbuffered 読みを速くする（ここでは 15%・12MB の読み1本で NVMe の上限に届く）。
 
-| RAM | 選ぶもの | 理由 |
-| --- | --- | --- |
-| **32 GB** | **Coder** | 32 GB に収まり、コード向けに作られている（24 GB のカードなら Q2_0 と IQ2_XS も動く） |
-| **48 GB** | **IQ2_XS**（または最速の Q2_0） | 大きいサイズは収まらない |
-| **64 GB** | **IQ2_XS**（おすすめ）、または IQ3_XXS / IQ3_S | すべてのサイズが収まる。IQ3_S がいちばん賢く、いちばん遅い |
-| **96 GB 以上** | **IQ3_S**、または Unsloth の UD-IQ4_XS（約 4-bit） | ほかのものを全部開いたままでも、最大のサイズが入る余裕がある |
+**今の時間の内訳**（短い会話・1トークン 50ms）：CPU の RAM 専門家 19〜25ms（帯域律速：プールは 44GB/s、この PC の
+上限は 60GB/s。コアを速くしても効かず、効くのはメモリのチャンネル数）、GPU の約2,000 回の小さなカーネル起動 13ms、
+SSD 3ms、残りは入れ替えと合図。
 
-- **[Coder](docs/MODELS.md#coder)：** エキスパートを半分取り除いたコーディング向け版です。フルモデルの SWE-bench Verified スコアの
-  91% に届き（作者による測定）、32 GB の RAM に収まります。コード以外では弱く、中国語などの CJK のテキストも苦手です（#438）。
-  そうした用途には、すべてのエキスパートを残している Q2_0、IQ2_XS、IQ3_S を選んでください。
-- **[Swift 1.5](docs/MODELS.md#swift-15)：** 答える前に考える時間がずっと短いファインチューン版です。
-  ほぼ同じ品質のまま、答えが早く返ってきます。
-- **[Unsloth UD-IQ4_XS](docs/MODELS.md#unsloth-ud-iq4_xs)：** Unsloth の約 4-bit 版で、品質は IQ3_S と UD-Q4_K_XL の間です。
-  ダウンロードは 94 GB。RAM が約 80 GB 未満だと、答えている間に Strata がその一部を SSD から読むので遅くなります（NVMe SSD が有効です）。
-- **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)**（試験的）：フルモデルにいちばん近いものです。
-  ただし答えている間、Strata はその大部分を SSD から読むので、64 GB の PC では毎秒 7-8.5 トークンしか書き出せません。
-- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)：** 手動でセットアップします。
-  インストーラーのメニューにはありません。
+## 分かっている制限
 
-サイズ、ダウンロード、どれがどこに収まるかについて：[docs/MODELS.md](docs/MODELS.md)。あとで別のモデルを追加するには
-`SETUP.bat`（Linux：`./setup.sh --setup`）を実行します。
+- このフォークの GLM 経路は NVIDIA 1枚のみ（2台の段モードはコードにあるが現状は遅い。AMD は未検証）。
+- UD-IQ3_XXS：生成は動く（IQ2_S/IQ3_S の専門家は CPU・GPU とも対応）が、注意側の重みが Q6_K のため読み込みは
+  `STRATA_GLM5_PREFILL=0`（検証窓の経路）が要る。
+- パックは量子化ごと。`make_glm5_config.py` は `glm53_<量子化名>` と名付ける。
+- `tools/glm5_ref/` は開発用の台本（速度 A/B・精度の物差し `car_follow.py`／`car_kl.py`・Nsight 用）、`mn-test/`
+  は2台実験。パスは `strata-glm5.json` から読む。
 
-## 使い方
+## 謝辞とライセンス
 
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="Strata アプリの Monitor タブと、その横で動くコーディングエージェント"><br>
-<sub>Strata アプリの <b>Monitor</b>（左）。コーディングエージェントが動画の五重塔の庭を書いているところ（右）</sub></p>
-
-- **ブラウザーで：** `http://127.0.0.1:8080` を開きます。**Chat**、モデルと GPU/CPU/RAM の様子をリアルタイムで見る **Monitor**、
-  設定とアドレスが載った **About** があります。
-- **アプリやコーディングエージェントから：** 「OpenAI-compatible」プロバイダーを追加し、ベース URL に
-  **`http://127.0.0.1:8080/v1`** を指定します。API キーとモデル名は何でもかまいません。
-  - Anthropic の API を使うアプリ：`http://127.0.0.1:8080/v1/messages`（Claude Code：
-    `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`）。
-  - Codex CLI など OpenAI Responses API を使うアプリ：`/v1/responses`
-    （[設定方法](docs/DETAILS.md#the-responses-api-and-codex-cli)）。
-- **思考（Thinking）：** チャットのメニュー、またはアプリの「reasoning effort」で **off、low、medium、high** を選びます。
-  off がいちばん速く、high は難しい質問に向いています。
-- **画像：** セットアップで「Images?」に yes と答えます。そのあとチャットで **Picture** をクリックするか、アプリで画像を添付します。
-  AMD のカードは、Linux ではプロセッサーを使って画像を読みます。Windows ではまだ読めません。
-- **スマートフォンや別の PC から：** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`。キーは必ず設定してください。
-- **リクエストは 1 つずつ：** 初期設定では Strata は 1 つのリクエストに答え、ほかは待ちます。複数に同時に答えるには
-  `"parallel": 2` を設定します（[BATCHING.md](docs/BATCHING.md)）。12 GB のカードでは、それぞれの回答が遅くなります。
-- **長いプロンプト：** Strata はチャットの最初のメッセージをすべて読みます。30,000 トークンあたり約 1 分かかります。
-  2 通目以降のメッセージは数秒で始まります。
-
-詳しくは：[チャットの保存場所](docs/INSTALL.md#where-things-are-stored)、[API](docs/DETAILS.md#using-it)。
-
-## うまくいかないとき
-
-- **Strata の初回起動で PC が固まった。** モデルの読み込み中はよくあることです。ウィンドウを閉じずに待ってください。
-  10 分たっても固まったまま？ PC を再起動し、ほかのプログラムを閉じてもう一度試すか、小さいサイズを選んでください。
-- **ダウンロードやインストールの途中で止まった。** `START-HERE.bat`（または `./setup.sh`）をもう一度実行してください。
-  止まったところから続きます。
-- **とても遅く、ディスクのランプが点滅し続ける。または「the engine stopped unexpectedly」と表示される。** PC の空き RAM が
-  足りません。ほかのプログラムを閉じるか（ブラウザーは多く使います）、小さいサイズ（Q2_0 または IQ2_XS）を選んでください。
-- **ポート 8080 がすでに使われていると表示される。** Strata はもう動いています。そのウィンドウを探してください。
-
-ほかの問題と解決方法：[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。それでも解決しない場合は
-[issue](https://github.com/Niko1221/Strata/issues) を作成し、Strata フォルダーにある `strata-<model>.log` を添付してください。
-セキュリティの問題を見つけたら、非公開で報告してください：[SECURITY.md](SECURITY.md)。
-
-## しくみ
-
-このようなモデルは、ふつう数百ギガバイトのグラフィックメモリを持つサーバーで動きます。あなたのグラフィックカードは
-12-24 GB です。Strata は **PC 全体で作業を分担する** ことで、モデルを収めています。台所を思い浮かべてください。
-いつも使う道具は調理台に置き、残りは食料庫にしまっておきます。
-
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="モデルの 24,576 個のエキスパート：よく使うものはグラフィックカードに、すべては RAM に、ルックアップテーブルは SSD に"></p>
-
-- **モデルは 24,576 個の小さな専門家（「エキスパート」）のチームです。** 1 語ごとに必要なのはそのうち 10 個だけです。
-- **グラフィックカード** は、よく使われる数千個のエキスパートを持ちます。**RAM** はすべてのエキスパートを持ち、
-  **プロセッサー** が残りを同時に処理します。**SSD** は大きなルックアップテーブルを持ちます。
-
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="小さなヘルパーが次の単語を予想し、大きなモデルがまとめて確認して正しいものを残す"></p>
-
-- **予想してから確認：** 小さなヘルパーが次の数語を予想します。大きなモデルがそれをまとめて確認します。
-  答えは同じまま、1.6-1.8x 早く返ってきます。
-- **長いテキストは大きなまとまりで読みます**（一度に最大 8,192 トークン）。速さは毎秒 1,000 トークン以上です。
-
-もっと詳しい説明：[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)。各部分とその数値：
-[詳細](docs/DETAILS.md#how-it-works)と[論文](docs/paper/Strata-Paper.pdf)。
-
-## クレジットとライセンス
-
-モデルは Qwen チームの [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) です。
-圧縮は [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)、UkisAI（Swift 1.5）、
-Unsloth によるものです。Strata は [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) の一部を使っています。すべてのクレジット：
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits)。Strata は [MIT License](LICENSE) のオープンソースです。一部のパーツと
-すべてのモデルには、それぞれ独自のライセンスがあります（[どれか](docs/HOW_IT_WORKS.md#license)）。
-
-## Strata を支援する
-
-Strata は無料のオープンソースです。役に立ったら、開発を支援していただけます：
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+[Strata](https://github.com/Niko1221/Strata)（Niko1221 と Strata の貢献者・MIT）。このフォークはそのライセンスと
+著作権表示（`LICENSE`）をそのまま引き継ぎます。GLM-5.3-Flash は Z.ai、GGUF は unsloth。llama.cpp の MMQ カーネルと
+量子化形式（MIT）。比較・参考にしたもの：[Project Maya](https://github.com/mw00/project-maya)、
+[glm-flash-lite](https://github.com/sybil-solutions/glm-flash-lite)、上記の 2×3090 レシピ。GLM 対応と高速化は
+Claude（Anthropic）をペアプログラマとして書きました。上の数字はすべて開発機での実測で、`tools/glm5_ref/` の台本で
+再現できます。

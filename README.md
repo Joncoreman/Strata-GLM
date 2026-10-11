@@ -1,215 +1,149 @@
-<h1 align="center">Strata</h1>
+# Strata GLM
 
-**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+**GLM-5.3-Flash (320B-A18B, 157 GB) on one gaming PC**
 
-> **This fork adds GLM-5.3-Flash (320B-A18B, 157 GB) on one PC: RTX 5090 + 128 GB RAM, 25 tokens/s.**
-> See **[README-GLM5.md](README-GLM5.md)** ([日本語](README-GLM5.ja.md)). The Qwen3.8-Flash-Next support below is Strata's own and unchanged.
+RTX 5090 + 128 GB RAM + NVMe: **28.7-30.1 tokens/s** on a short chat, **580 tokens/s** reading a 4,400-token prompt
+(llama.cpp on the same PC: 7-10 and 42-55). Images and tool calls work; 262K context.
 
-<p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
-NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
+**English** · [日本語](README.ja.md)
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+This is a fork of [Strata](https://github.com/Niko1221/Strata) (v0.1.41, MIT) that runs **GLM-5.3-Flash**
+(320 billion parameters, 18 billion active, unsloth's **UD-IQ4_XS** GGUF, 157 GB) on **one** PC with a single
+consumer GPU, the system RAM and an NVMe drive. Strata itself runs Qwen3.8-Flash-Next; everything GLM-specific
+here was added in October 2026 and is kept in this fork. Strata's own README: [README-Strata.md](README-Strata.md).
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on a normal PC. This is a
-large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
-and coding agents. Nothing leaves your PC.
+Nothing leaves your PC. The server speaks the OpenAI and Anthropic APIs, so Claude Code, Codex, opencode,
+Cursor and any chat client can talk to it.
 
-## How fast is it?
+## Measured on the development PC
 
-We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
+RTX 5090 (32 GB) · Core Ultra 9 285K (24 cores) · 128 GB DDR5-5200 (2 channels) · NVMe · Windows 11 · 262K context.
+"Tokens/s" are measured with `tools/glm5_ref/glm_ab_speed.py`, warm server, 256-token answers.
 
-- **Writes answers:** how fast the reply appears in a short chat. 60 tokens per second is faster than you can read.
-- **Reads your prompt:** how fast it takes in what you send (here a 32K-token document, code or chat history).
+| | Reads the prompt | Writes the answer |
+|---|---:|---:|
+| Short chat (86 tokens in) | 1.7 s | **25 tokens/s** |
+| After a 560-token document | 5.5 s (100 tokens/s) | 15.5 tokens/s |
+| After a 4,400-token document | 7.4 s (590 tokens/s) | 13.3 tokens/s |
+| 32K-token prompt | 35-45 s (700-900 tokens/s) | about 8 tokens/s |
 
-<table>
-<tr><th>NVIDIA: RTX 5070 (12 GB), Ryzen 5 7600, 64 GB RAM</th><th>AMD: RX 9070 XT (16 GB), Ryzen 9 3900X, 47 GB RAM</th></tr>
-<tr><td>
+The same model with llama.cpp (b11461, best settings found: 16 threads, 40 MoE layers on the CPU) on the same PC
+and the same day: prompts at 3-33 tokens/s (86-token prompt 28 s, 4,400 tokens 135 s), answers at 8.1 tokens/s.
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 94 tokens/s | 2,650 tokens/s |
-| **IQ2_XS** | 79 tokens/s | 2,090 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 1,750 tokens/s |
-| **IQ3_S** | 53 tokens/s | 1,620 tokens/s |
-| **Coder** | 55 tokens/s | 2,180 tokens/s |
+The "writes" numbers above use **expert skipping** (below), which changes about one token in a hundred on long
+reasoning. With it off the short-chat answer is **20 tokens/s**; the prompt speeds do not depend on it.
 
-</td><td>
+### Update 2026-10-11
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 60 tokens/s | 1,160 tokens/s |
-| **IQ2_XS** | 52 tokens/s | 1,110 tokens/s |
-| **Coder** | 44 tokens/s | 1,420 tokens/s |
+- **Tokenizer fix (please update).** The pack's tokenizer split numbers one digit at a time (Qwen3.5's rule);
+  GLM-4/5 split them in runs of up to three (llama.cpp's CHATGLM4 rule) and ignore merges for whole words. The
+  model then wrote file names and numbers wrong (`2117_00001` came back as `2211_7_0_0001`). Fixed in
+  `tools/strata_tokenizer.py`. A pack made before this needs its tokenizer written again:
+  `python tools\strata_tokenizer.py --gguf <shard 1 of the GGUF> --out <the pack>\tokenizer`.
+  Checked: 12 test texts give the same token ids as llama.cpp's `/tokenize`.
+- **Images.** With the model's `mmproj` and `build-vision-glm5.bat` (llama.cpp with the glm5v projector, CPU),
+  the server reads pictures (about 414 tokens per image).
+- **Tool calls.** GLM's `<tool_call>NAME<arg_key>...` form is parsed as a call (it came back as text before).
+- **`--adapt-async 1`** (now in the example settings, with `--adapt-swaps 32`): the VRAM tier's expert swaps run
+  on a thread of their own while the next windows compute, instead of between windows (3.5-4.5 ms a window).
+  Short chat **28.7-30.1 tokens/s** (24.9-26.0 without it), the follow-up 22.9 (21.5), after a 4,228-token
+  summary 20.6 (15-16), prompts unchanged (measured with Huihui's GLM-5.3-Flash abliterated UD-IQ4_XS, whose
+  experts are byte-identical to unsloth's; expert skipping on). Which window first uses a swapped-in expert
+  depends on the window count only.
 
-</td></tr>
-</table>
-
-NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K prompts). The full tables are in
-[DETAILS.md](docs/DETAILS.md#speed-measured). A card with more VRAM is faster: an RTX 3090 (24 GB) should write
-about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
-[community results](docs/COMMUNITY_BENCHMARKS.md).
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
+Quality: the prompt path and every decode optimisation except the skipping are bitwise the engine's exact path
+(checked token by token on a deterministic 4,400-token run after each change). The skipping is measured as the
+next-token distribution's KL against the exact path: 0.016 on a summary, 0.022 on a 1,213-token reasoning text,
+against a run-to-run floor of 0.013 (GPU/CPU rounding).
 
 ## What you need
 
-| | |
-| --- | --- |
-| **Graphics card** | **NVIDIA** GeForce RTX 20, 30, 40 or 50 series, or **AMD** Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT, Radeon AI PRO R9700 or RX 6800 / 6900 series. It needs **12 GB of VRAM or more**. |
-| **RAM** | 32 GB or more. Your RAM decides [which model](#which-model-should-i-pick) fits. 64 GB runs every size. |
-| **Disk** | About 80 GB free. Use an SSD if you can: the first start is much faster. |
-| **System** | Windows 10 / 11 or Linux, and a current graphics driver from NVIDIA or AMD. |
-
-The installer sets up everything else. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)).
-
-Experimental, written and tested by community members on their own machines:
-
-- **Older graphics cards** (Tesla P40 / V100, GTX 10, Radeon VII / MI50, RX 6700 XT, RX 5500 XT): [Older GPUs](docs/OLDER_GPUS.md).
-- **Intel Arc**, built from source on Linux: [Intel Arc](docs/INTEL_ARC.md).
-- **AMD Ryzen AI Max (Strix Halo)**, built from source on Linux: [Strix Halo](docs/STRIX_HALO.md).
-- **Older processors without AVX2**: they work, but slowly. [Older CPUs](docs/INSTALL.md#older-cpus-experimental).
-
-The full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
+- Windows 10/11 (Linux is untested for the GLM path; the Strata base supports it), Python 3.10+.
+- An NVIDIA GPU with 24 GB or more (32 GB tested; 24 GB holds fewer experts in VRAM and will be slower).
+  Build tools: Visual Studio 2022 Build Tools (C++ workload) and the CUDA toolkit 12.8 or 13.
+- **128 GB of RAM** (the RAM tier holds 98 GB of experts; with 64 GB most experts come from the SSD and decode
+  will be several times slower).
+- An NVMe SSD with the model on it (the experts not in RAM are read from it, unbuffered) and about 160 GB for the
+  GGUF plus 0.3 GB for the pack.
+- The model: [unsloth/GLM-5.3-Flash-GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF), folder
+  `UD-IQ4_XS` (5 shards, 157 GB). UD-IQ3_XXS (120 GB) decodes too but its prompts go through the slow path for
+  now (its attention weights are Q6_K; see "Known limits").
 
 ## Install
 
-### Let your AI set it up
-
-Do you use an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Paste this into it:
-
-```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+```bat
+git clone <this repository> strata-glm5
+cd strata-glm5
+START-HERE.bat --setup          :: Strata's own setup: Python, the .venv (cmake, ninja, numpy, regex ...)
+build-glm5.bat                  :: the engine for your GPU (sm_120 for RTX 50; "build-glm5.bat 86" for RTX 30)
+python tools\glm5_ref\make_glm5_config.py --gguf D:\models\UD-IQ4_XS\GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf
+START-GLM5.bat                  :: http://127.0.0.1:8097/v1  (about a minute to pin the RAM tier)
 ```
 
-It checks your graphics card, RAM and disk and picks the model that fits. Then it installs and starts it and tells
-you how to connect your apps. AI tools can also install, start and stop Strata through its
-[MCP server](docs/MCP_SERVER.md).
+`make_glm5_config.py` builds the pack (`tools/iq_pack.py`: the dense tensors and the expert table, 0.3 GB) in
+`Strata-data/packs/glm53_iq4xs` next to the repository, copies the learned expert profile beside it, and writes
+`strata-glm5.json` with the RAM tier (total RAM minus 30 GB) and the pool workers (physical cores minus 4) for
+your PC. Edit that file for other settings; `strata-glm5.example.json` explains them. Add `--skip` for the expert
+skipping (+30% decode, see above).
 
-### Or do it yourself
+Strata's `START-HERE.bat --setup` wants to install a Qwen model as well; you can stop it after the Python step
+(Ctrl-C once the .venv exists) or let it finish.
 
-[Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
-**Windows:** double-click **`START-HERE.bat`**. **Linux:** run **`./setup.sh`** in the Strata folder.
+### Using it
 
-The steps are the same for NVIDIA and AMD. The installer finds your card and sets up the right engine for it. It
-asks you a few questions:
+Point your client at `http://127.0.0.1:8097/v1` (OpenAI: `/v1/chat/completions`, Anthropic: `/v1/messages`),
+model `glm-5.3-flash-strata`. For Claude Code / opencode / Cursor see the "Using it" section of Strata's
+[Strata's README](README-Strata.md#using-it) (the GLM server behaves the same, on port 8097 instead of 8080).
 
-- which model and which size,
-- how much context (how much text the model keeps in mind),
-- whether it should read pictures.
+## How it is fast (and what did not work)
 
-Press Enter each time for the recommended answer. Then it downloads the model (about 70 GB) and starts it. If the
-download stops, run it again: it continues where it left off. Your browser opens the Strata app at
-`http://127.0.0.1:8080`.
+The design notes are in `glm-notes/計画_読み込みの作り替え_2026-10-09.md` (Japanese, with every measurement). The
+short version:
 
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time).
-> Strata loads 35-55 GB into your RAM and locks part of it for the graphics card. This is normal. Wait, and don't
-> close the window. The window shows what Strata is doing.
+**Prompts (prefill).** The experts are *walked layer by layer*: each layer's routed experts are streamed into VRAM
+once per group of up to 16K tokens instead of once per 4K chunk, and multiplied on the int8 tensor cores (llama.cpp's
+MMQ). The shared experts, the dense layers and the attention projections are tensor-core GEMMs too; the router is one
+cuBLAS call; the MLA attention of long prompts runs on WMMA tensor cores with 32 heads a block; the SSD tier is
+prefetched a layer ahead; the host state moves in four contiguous arrays while the router runs. 4,400 tokens went from
+59.8 s to 7.4 s.
 
-**Next time**, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close
-its window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker,
-several cards, where the files go and every option: [docs/INSTALL.md](docs/INSTALL.md).
+**Answers (decode).** The RAM tier is pinned and ordered by a learned expert profile; the hottest experts live in
+VRAM and both tiers follow the conversation (the routing counts of the prompt seed them). What the CPU computes is
+read with AVX-VNNI even for one token. The SSD reads of a layer run on a fetcher thread while the RAM-resident experts
+compute, and the RAM promotion reads a window ahead. The MLA absorb products of all 64 heads and the KDA projections
+that share an input are single launches. Chat decode went from 13.2 to 20.2 tokens/s with the answers unchanged, and
+to 25 with the skipping.
 
-## Which model should I pick?
+**Expert skipping** (`STRATA_GLM5_SKIP_KEEP=2 STRATA_GLM5_SKIP_MINW=0.10`): a token's expert whose routing weight is
+under 10% of the token's total, and is not in VRAM, is not computed (the top 2 always are). After the
+[2x3090 recipe](https://github.com/saitakarcesme/glm5.3-flash-2x3090)'s cache-aware routing. Off by default.
 
-The installer recommends one for your RAM. The same model comes in several sizes, compressed more or less. Smaller
-sizes are faster. Larger sizes are a bit smarter.
+**Measured and not adopted** (all on this PC): a second PC with an RTX 3060 as a layer stage (14.4 vs 20.2 tokens/s
+once the head got fast - the 3060 is 3x slower per layer than the time it saves); computing experts over PCIe
+(`--pcie-frac`, the DMA and the CPU share the RAM bus); MTP drafting (the CPU's expert work grows with the window);
+a layer-ahead router prediction for the SSD reads (the mispredicted reads cost more than they hide); renormalising the
+skipped weight; self-speculation with a few experts (slower even with a perfect drafter); unmapping the GGUF for
+faster unbuffered reads (a 15% difference here, the 12 MB reads already saturate the NVMe).
 
-| Your RAM | Take | Why |
-| --- | --- | --- |
-| **32 GB** | **Coder** | it fits 32 GB, and it is made for code (with a 24 GB card, Q2_0 and IQ2_XS run too) |
-| **48 GB** | **IQ2_XS** (or Q2_0, the fastest) | the larger sizes do not fit |
-| **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits; IQ3_S is the best and the slowest |
-| **96 GB or more** | **IQ3_S**, or Unsloth's UD-IQ4_XS (~4-bit) | room for the largest sizes with everything else open |
+**Where the time goes now** (short chat, 50 ms a token): the CPU's RAM-resident experts 19-25 ms (bandwidth: the
+pool reads at 44 GB/s against this PC's 60 GB/s ceiling; faster cores do not help, more memory channels would), the
+GPU's ~2,000 small kernel launches 13 ms, the SSD 3 ms, swaps and handshakes the rest.
 
-- **[Coder](docs/MODELS.md#coder):** a coding version with half of the experts removed. It reaches 91% of the full
-  model's SWE-bench Verified score (measured by its authors) and fits 32 GB of RAM. It is weaker outside code,
-  including Chinese and other CJK text (#438). For those, take Q2_0, IQ2_XS or IQ3_S, which keep every expert.
-- **[Swift 1.5](docs/MODELS.md#swift-15):** a fine-tune that thinks for a much shorter time before it answers. You
-  get the answer sooner, at about the same quality.
-- **[Unsloth UD-IQ4_XS](docs/MODELS.md#unsloth-ud-iq4_xs):** Unsloth's ~4-bit version, between IQ3_S and
-  UD-Q4_K_XL in quality. A 94 GB download. With less than ~80 GB of RAM, Strata reads part of it from the SSD
-  while it answers, so it is slower there (an NVMe SSD helps).
-- **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)** (experimental): the closest to the full
-  model. But Strata reads most of it from the SSD while it answers, so it writes only 7-8.5 tokens/s on a 64 GB PC.
-- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
-  not in the installer's menu.
+## Known limits
 
-Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add another model later, run
-`SETUP.bat` (Linux: `./setup.sh --setup`).
-
-## Using it
-
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
-<sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
-
-- **In the browser:** open `http://127.0.0.1:8080`. It has **Chat**, a live **Monitor** of the model and your
-  GPU/CPU/RAM, and **About** with the settings and addresses.
-- **Your apps and coding agents:** add an "OpenAI-compatible" provider with the base URL
-  **`http://127.0.0.1:8080/v1`**. Any API key and any model name work.
-  - Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages` (Claude Code:
-    `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`).
-  - Codex CLI and other apps that use the OpenAI Responses API: `/v1/responses`
-    ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)).
-- **Thinking:** choose **off, low, medium or high** in the chat menu or in your app's "reasoning effort". Off is the
-  fastest. High is best for hard questions.
-- **Pictures:** say yes to "Images?" in setup. Then click **Picture** in the chat, or attach pictures in your app.
-  AMD cards read pictures on Linux through the processor; on Windows they can't yet.
-- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
-- **One request at a time:** by default Strata answers one request, and the others wait. To answer several at once,
-  set `"parallel": 2` ([BATCHING.md](docs/BATCHING.md)). On a 12 GB card this makes each answer slower.
-- **Long prompts:** Strata reads the first message of a chat in full, about 1 minute per 30,000 tokens. Follow-up
-  messages start in seconds.
-
-More: [where your chats are stored](docs/INSTALL.md#where-things-are-stored), [the API](docs/DETAILS.md#using-it).
-
-## Something went wrong?
-
-- **My PC froze the first time Strata started.** This is normal while it loads the model. Wait, and don't close the
-  window. Still frozen after 10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
-- **It stopped while downloading or installing.** Run `START-HERE.bat` (or `./setup.sh`) again. It continues where
-  it stopped.
-- **It's very slow and the disk light keeps blinking, or it says "the engine stopped unexpectedly".** Your PC does
-  not have enough free RAM. Close other programs (browsers use a lot), or pick a smaller size (Q2_0 or IQ2_XS).
-- **It says port 8080 is already in use.** Strata is already running. Look for its window.
-
-More problems and their fixes: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Still stuck? Open an
-[issue](https://github.com/Niko1221/Strata/issues) and attach `strata-<model>.log` from the Strata folder. Found a
-security problem? Report it privately: [SECURITY.md](SECURITY.md).
-
-## How does it work?
-
-Models like this one usually run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes the model fit by **sharing the work across your whole PC**. Think of a kitchen: the things
-you use all the time stay on the counter, and the rest waits in the pantry.
-
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
-
-- **The model is a team of 24,576 small specialists ("experts").** Each word needs only 10 of them.
-- **Your graphics card** keeps the few thousand experts that are used most often. **Your RAM** holds all of them,
-  and **your processor** works on the rest at the same time. **Your SSD** holds a big lookup table.
-
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
-
-- **Guess, then check:** a small helper guesses the next few words. The big model checks them all at once. You get
-  the same answer, 1.6-1.8x sooner.
-- **Long texts are read in big pieces** (up to 8,192 tokens at a time), at over 1,000 tokens per second.
-
-The longer explanation: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every part and its numbers:
-[the details](docs/DETAILS.md#how-it-works) and the [paper](docs/paper/Strata-Paper.pdf).
+- One NVIDIA GPU only in this fork's GLM path (the two-PC stage mode is in the code but currently slower; AMD is
+  untested).
+- UD-IQ3_XXS: decodes (its IQ2_S/IQ3_S experts have CPU and GPU kernels) but prompts need
+  `STRATA_GLM5_PREFILL=0` (the verify-window path) because its attention weights are Q6_K.
+- The pack is per quantization; `make_glm5_config.py` names it `glm53_<quant>`.
+- `tools/glm5_ref/` holds the developer scripts (speed A/B, the quality yardstick `car_follow.py` / `car_kl.py`, the
+  Nsight scripts); `mn-test/` is the two-PC experiment. They read the paths from `strata-glm5.json`.
 
 ## Credits and license
 
-The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was
-compressed by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5)
-and Unsloth. Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE). A few
-parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
-
-## Support Strata
-
-Strata is free and open source. If it is useful to you, you can support its development:
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+[Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors (MIT); this fork keeps its
+license and copyright notice (`LICENSE`). GLM-5.3-Flash by Z.ai; the GGUF by unsloth. llama.cpp's MMQ kernels and
+quantization formats (MIT). Ideas measured against or borrowed from [Project Maya](https://github.com/mw00/project-maya),
+[glm-flash-lite](https://github.com/sybil-solutions/glm-flash-lite) and the 2x3090 recipe above. The GLM port and
+its optimisations were written with Claude (Anthropic) as the pair programmer; every number above was measured on the
+development PC and is reproducible with the scripts in `tools/glm5_ref/`.
