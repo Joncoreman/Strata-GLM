@@ -5,6 +5,8 @@
 RTX 5090 + 128 GB RAM + NVMe: **31.3 tokens/s** on a short chat (median of 3; best 32.6), **580 tokens/s** reading a 4,400-token prompt
 (llama.cpp on the same PC: 7-10 and 42-55). Images and tool calls work; 262K context.
 
+![Strata GLM against llama.cpp on one RTX 5090 PC: prefill 580 vs 42.3 tokens/s, decode 32.64 vs 9.4 tokens/s](docs/media/strata-glm-huihui-speed.png)
+
 **English** · [日本語](README.ja.md)
 
 > **Unofficial fork, not affiliated with or endorsed by the Strata authors.**

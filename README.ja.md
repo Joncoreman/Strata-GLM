@@ -5,6 +5,8 @@
 RTX 5090＋RAM 128GB＋NVMe で、短い会話の生成 **31.3 tok/s**（3回の中央値・最高 32.6）、4,400トークンの読み込み **580 tok/s**
 （同じ PC の llama.cpp は 7〜10 と 42〜55）。画像と道具呼び出しに対応・文脈 262K。
 
+![RTX 5090 の PC 1台での Strata GLM と llama.cpp の比較：読み込み 580 対 42.3 tok/s、生成 32.64 対 9.4 tok/s](docs/media/strata-glm-huihui-speed.png)
+
 [English](README.md) · **日本語**
 
 > **非公式の改造版です。元の Strata の作者とは関係がなく、公認も受けていません。**
