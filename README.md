@@ -88,7 +88,7 @@ git clone <this repository> strata-glm5
 cd strata-glm5
 START-HERE.bat --setup          :: Strata's own setup: Python, the .venv (cmake, ninja, numpy, regex ...)
 build-glm5.bat                  :: the engine for your GPU (sm_120 for RTX 50; "build-glm5.bat 86" for RTX 30)
-python tools\glm5_ref\make_glm5_config.py --gguf D:\models\UD-IQ4_XS\GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf
+.venv\Scripts\python tools\glm5_ref\make_glm5_config.py --gguf D:\models\UD-IQ4_XS\GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf
 START-GLM5.bat                  :: http://127.0.0.1:8097/v1  (about a minute to pin the RAM tier)
 ```
 
