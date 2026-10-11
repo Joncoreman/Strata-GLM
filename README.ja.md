@@ -18,7 +18,7 @@ Cursor・各種チャット画面からそのまま使えます。
 
 ## 開発機での実測
 
-RTX 5090（32GB）・Core Ultra 9 285K（24コア）・128GB DDR5-5200（2チャンネル）・NVMe・Windows 11・文脈 262K。
+RTX 5090（32GB）・Core Ultra 9 285K（24コア）・128GB DDR5-4400（32GB×4・2チャンネル）・NVMe・Windows 11・文脈 262K。
 `tools/glm5_ref/glm_ab_speed.py` で、温めたサーバーに 256トークンを答えさせた値です。
 
 | | 読み込み（prefill） | 生成（decode） |

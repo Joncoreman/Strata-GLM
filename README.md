@@ -19,7 +19,7 @@ Cursor and any chat client can talk to it.
 
 ## Measured on the development PC
 
-RTX 5090 (32 GB) · Core Ultra 9 285K (24 cores) · 128 GB DDR5-5200 (2 channels) · NVMe · Windows 11 · 262K context.
+RTX 5090 (32 GB) · Core Ultra 9 285K (24 cores) · 128 GB DDR5-4400 (4 x 32 GB, 2 channels) · NVMe · Windows 11 · 262K context.
 "Tokens/s" are measured with `tools/glm5_ref/glm_ab_speed.py`, warm server, 256-token answers.
 
 | | Reads the prompt | Writes the answer |
