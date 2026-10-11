@@ -6,6 +6,7 @@ with tools/iq_pack.py and copy the learned expert profile beside it (2026-10-10)
            (default: physical cores - 4), --context 262144, --port 8097, --skip (turn the expert skipping on, 10%)
 """
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -39,6 +40,17 @@ def physical_cores() -> int:
         return os.cpu_count() or 8
 
 
+def ensure_pack_deps() -> None:
+    """Fail clearly, before touching the disk, when the pack cannot be built because the build
+    dependencies are missing - the usual cause is running outside the project venv (see SETUP.bat)."""
+    missing = [m for m in ("numpy", "regex") if importlib.util.find_spec(m) is None]
+    if missing:
+        sys.exit("cannot build the pack: missing Python package(s): %s\n"
+                 "Run this inside the project venv (SETUP.bat creates .venv), for example:\n"
+                 "  .venv\\Scripts\\python.exe tools\\glm5_ref\\make_glm5_config.py --gguf <shard 1 .gguf>"
+                 % ", ".join(missing))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True, help="shard 1 of the GLM-5.3-Flash GGUF (unsloth UD-IQ4_XS)")
@@ -63,7 +75,13 @@ def main() -> int:
     if not exe.exists():
         print(f"note: {exe} does not exist yet - run build-glm5.bat before START-GLM5.bat")
 
-    if not (pack / "glm5-layout.json").exists():
+    # A complete pack carries iq_pack.py's own completion markers: native_experts.txt (written last) and the
+    # exported tokenizer/ (which holds vocab.json). glm5-layout.json alone is not enough - it is written mid-build,
+    # so a crash (e.g. running outside the venv) can leave a half pack that still has it, and checking only that file
+    # would wrongly skip the rebuild, leaving START-GLM5.bat to fail with a missing vocab.json (reported 2026-10-12).
+    pack_done = (pack / "native_experts.txt").exists() and (pack / "tokenizer" / "vocab.json").exists()
+    if not pack_done:
+        ensure_pack_deps()
         print(f"building the pack {pack} from the GGUF (reads the headers and the dense tensors, about a minute)")
         pack.parent.mkdir(parents=True, exist_ok=True)
         r = subprocess.run([sys.executable, str(REPO / "tools" / "iq_pack.py"), "--gguf", str(gguf), "--out", str(pack)])
