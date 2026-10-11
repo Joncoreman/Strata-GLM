@@ -500,6 +500,41 @@ void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
     iq256_rows_v(iq256_variant(), type, w, row_bytes, n, act, nt, out, r0, r1);
 }
 
+// 2026-10-11: two rows per loop (iq_avx2_rows.inl, row_dot_pair) - the same bits as iq256_rows
+bool iq256_rows_pair_v(int variant, int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                       float* const* out, int r0, int r1) {
+    const bool g = (variant & kIq256Gather) != 0;
+#if STRATA_AVXVNNI
+    if (variant & kIq256Vnni)
+        return g ? vnni::dot_type_pair<true>(type, nt, w, row_bytes, n, act, out, r0, r1)
+                 : vnni::dot_type_pair<false>(type, nt, w, row_bytes, n, act, out, r0, r1);
+#endif
+    return g ? plain::dot_type_pair<true>(type, nt, w, row_bytes, n, act, out, r0, r1)
+             : plain::dot_type_pair<false>(type, nt, w, row_bytes, n, act, out, r0, r1);
+}
+
+bool iq256_gu_pair_v(int variant, int type, const uint8_t* blob, size_t row_bytes, size_t up_off, int n,
+                     const void* const* act, int nt, float* const* g_out, float* const* u_out, int r0, int r1) {
+    const bool g = (variant & kIq256Gather) != 0;
+#if STRATA_AVXVNNI
+    if (variant & kIq256Vnni)
+        return g ? vnni::gu_type_pair<true>(type, nt, blob, row_bytes, up_off, n, act, g_out, u_out, r0, r1)
+                 : vnni::gu_type_pair<false>(type, nt, blob, row_bytes, up_off, n, act, g_out, u_out, r0, r1);
+#endif
+    return g ? plain::gu_type_pair<true>(type, nt, blob, row_bytes, up_off, n, act, g_out, u_out, r0, r1)
+             : plain::gu_type_pair<false>(type, nt, blob, row_bytes, up_off, n, act, g_out, u_out, r0, r1);
+}
+
+bool iq256_rows_pair(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                     float* const* out, int r0, int r1) {
+    return iq256_rows_pair_v(iq256_variant(), type, w, row_bytes, n, act, nt, out, r0, r1);
+}
+
+bool iq256_gu_pair(int type, const uint8_t* blob, size_t row_bytes, size_t up_off, int n, const void* const* act, int nt,
+                   float* const* g_out, float* const* u_out, int r0, int r1) {
+    return iq256_gu_pair_v(iq256_variant(), type, blob, row_bytes, up_off, n, act, nt, g_out, u_out, r0, r1);
+}
+
 void iq4nl256_down_rows_v(int variant, const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
                           float* const* out, int r0, int r1) {
     const block_q8_0* y[8];

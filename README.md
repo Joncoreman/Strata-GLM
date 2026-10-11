@@ -2,7 +2,7 @@
 
 **GLM-5.3-Flash (320B-A18B, 157 GB) on one gaming PC**
 
-RTX 5090 + 128 GB RAM + NVMe: **28.7-30.1 tokens/s** on a short chat, **580 tokens/s** reading a 4,400-token prompt
+RTX 5090 + 128 GB RAM + NVMe: **31.3 tokens/s** on a short chat (median of 3; best 32.6), **580 tokens/s** reading a 4,400-token prompt
 (llama.cpp on the same PC: 7-10 and 42-55). Images and tool calls work; 262K context.
 
 **English** · [日本語](README.ja.md)
@@ -52,6 +52,14 @@ reasoning. With it off the short-chat answer is **20 tokens/s**; the prompt spee
   summary 20.6 (15-16), prompts unchanged (measured with Huihui's GLM-5.3-Flash abliterated UD-IQ4_XS, whose
   experts are byte-identical to unsloth's; expert skipping on). Which window first uses a swapped-in expert
   depends on the window count only.
+- **CPU experts, one token (afternoon).** A one-token window's CPU experts went to ggml's per-token dot instead of
+  the AVX-2/AVX-VNNI row kernels (a `max()` with the 2-token default); fixed - an IQ3_S gate/up expert 2.0x faster
+  on a P-core (`iq_avx2_parity --pair`). The gate and up rows now run side by side in one loop (the same bits,
+  checked for every kernel variant). The pool's phases end sooner: `STRATA_POOL_GUIDED=1` cuts the row ranges
+  smaller toward the end and `STRATA_POOL_ETAIL=6` leaves a phase's last 6 tasks to the P-cores (both in the
+  example settings; rows are computed alone, so neither changes a bit). Short chat **31.3 tokens/s** (median of 3,
+  best 32.6; 29.6 before), the follow-up 24.2 (23.1). After a long summary the speed swings with the experts the
+  text routes to (16-21 tokens/s run to run), so that scene does not rank settings.
 
 Quality: the prompt path and every decode optimisation except the skipping are bitwise the engine's exact path
 (checked token by token on a deterministic 4,400-token run after each change). The skipping is measured as the

@@ -19,6 +19,7 @@
   "--vram-reserve-mib", "3400"
  ],
  "env": {"STRATA_GLM5_GO": "1", "STRATA_GLM5_PREFILL": "4096", "STRATA_GLM5_PF_DIRECT": "1",
+         "STRATA_POOL_GUIDED": "1", "STRATA_POOL_ETAIL": "6",
          "STRATA_GLM5_SLOTS": "8", "STRATA_GLM5_SLOT_DIR": "<REPO>\\build-engine\\glm5-slots"},
  "cwd": "<REPO>",
  "tokenizer": "<DATA>\\packs\\glm53_iq4xs\\tokenizer",

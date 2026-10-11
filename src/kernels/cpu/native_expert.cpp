@@ -183,15 +183,26 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         const bool one = v ? v[0] == '1' : cpu_avxvnni_ok();
         return one ? 1 : 2;
     }();
-    if (f.swiglu_limit > 0.f && glm_mt && avx2 && !cpu512 && nt >= std::max(mt_min, glm_min) && nt <= 8 && iq256_supported(f.gu_type)) {
+    // 2026-10-11: glm_min alone unless STRATA_IQ_MT_MIN is set.  max(mt_min, glm_min) with mt_min's default 2 sent every
+    // one-token group (most CPU experts of a decode window) to ggml's dot, which is 2.7x slower per P-core here
+    // (iq_avx2_parity --bench: IQ3_S gate/up 0.441 -> 0.161 ms an expert)
+    static const bool mt_env = std::getenv("STRATA_IQ_MT_MIN") != nullptr;
+    const int glm_from = mt_env ? std::max(mt_min, glm_min) : glm_min;
+    // STRATA_GLM_PAIR=0: gate and up one after the other (iq256_rows) instead of side by side (the same bits)
+    static const bool glm_pair = [] { const char* v = std::getenv("STRATA_GLM_PAIR"); return !(v && v[0] == '0'); }();
+    if (f.swiglu_limit > 0.f && glm_mt && avx2 && !cpu512 && nt >= glm_from && nt <= 8 && iq256_supported(f.gu_type)) {
         thread_local std::vector<float> gb, ub;
         const size_t span = (size_t) r1;
         if (gb.size() < span * nt) { gb.resize(span * nt); ub.resize(span * nt); }
         float* gp[8];
         float* up[8];
         for (int t = 0; t < nt; ++t) { gp[t] = gb.data() + t * span; up[t] = ub.data() + t * span; }
-        iq256_rows(f.gu_type, blob, f.gu_row, (int) f.n_embd, act, nt, gp, r0, r1);
-        iq256_rows(f.gu_type, blob + f.up_off, f.gu_row, (int) f.n_embd, act, nt, up, r0, r1);
+        // one token only: at two the pair loop runs out of registers (P-core 1.38 -> 1.51 ms an expert; one: 1.18 -> 1.13)
+        if (!glm_pair || nt != 1 ||
+            !iq256_gu_pair(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, gp, up, r0, r1)) {
+            iq256_rows(f.gu_type, blob, f.gu_row, (int) f.n_embd, act, nt, gp, r0, r1);
+            iq256_rows(f.gu_type, blob + f.up_off, f.gu_row, (int) f.n_embd, act, nt, up, r0, r1);
+        }
         for (int t = 0; t < nt; ++t)
             for (int r = r0; r < r1; ++r) ff[t][r] = native_swiglu(gp[t][r], up[t][r], f.swiglu_limit);
         return;
@@ -237,9 +248,12 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         const bool one = v ? v[0] == '1' : cpu_avxvnni_ok();
         return one ? 1 : 2;
     }();
-    if (f.swiglu_limit > 0.f && glm_mt && !cpu512 && nt >= std::max(mt_min, glm_min) && iq256_supported(f.d_type) &&
+    static const int glm_from = std::getenv("STRATA_IQ_MT_MIN") ? std::max(mt_min, glm_min) : glm_min;   // as gate/up
+    static const bool glm_pair = [] { const char* v = std::getenv("STRATA_GLM_PAIR"); return !(v && v[0] == '0'); }();
+    if (f.swiglu_limit > 0.f && glm_mt && !cpu512 && nt >= glm_from && iq256_supported(f.d_type) &&
         std::getenv("STRATA_NO_IQ256") == nullptr) {
-        iq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        if (!glm_pair || nt != 1 || !iq256_rows_pair(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1))
+            iq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;

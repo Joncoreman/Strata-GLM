@@ -145,6 +145,118 @@ inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* con
     for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
 }
 
+// 2026-10-11: two rows in one loop (an expert's gate and up row, or two down rows).  A lone row's per-block integer
+// chain and gathers leave the core waiting; two independent rows interleaved fill those cycles.  Each row's ops are
+// row_dot's in row_dot's order (the same decode, int32 chain and float accumulation), so the bits are row_dot's.
+template <int TY, int NT> STRATA_ROWS_FN
+inline void row_dot_pair(const uint8_t* ra, const uint8_t* rb, int nblocks, const block_q8_K* const* y, float* resa,
+                         float* resb) {
+    const int pf = prefetch_distance();
+    __m256 fa[NT], fb[NT];
+    for (int t = 0; t < NT; ++t) { fa[t] = _mm256_setzero_ps(); fb[t] = _mm256_setzero_ps(); }
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* ba = ra + (size_t) i * Fmt32<TY>::bytes;
+        const uint8_t* bb = rb + (size_t) i * Fmt32<TY>::bytes;
+        rows_ahead(ba, pf);
+        rows_ahead(bb, pf);
+        __m256i ia[NT], ib[NT];
+        for (int t = 0; t < NT; ++t) { ia[t] = _mm256_setzero_si256(); ib[t] = _mm256_setzero_si256(); }
+        for (int j = 0; j < 4; ++j) {
+            for (int half = 0; half < 2; ++half) {
+                __m256i ga, sa, ca, gb, sb, cb;
+                Fmt32<TY>::decode(ba, j, half, ga, sa, ca);
+                Fmt32<TY>::decode(bb, j, half, gb, sb, cb);
+                const int off = 64 * j + 32 * half;
+                for (int t = 0; t < NT; ++t) {
+                    const __m256i yv = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + off));
+                    ia[t] = madd_add(ia[t], _mm256_maddubs_epi16(ga, _mm256_sign_epi8(yv, sa)), ca);
+                    ib[t] = madd_add(ib[t], _mm256_maddubs_epi16(gb, _mm256_sign_epi8(yv, sb)), cb);
+                }
+            }
+        }
+        const float dxa = h2f(u16(ba)) * Fmt32<TY>::K, dxb = h2f(u16(bb)) * Fmt32<TY>::K;
+        for (int t = 0; t < NT; ++t) {
+            fa[t] = _mm256_fmadd_ps(_mm256_set1_ps(dxa * y[t][i].d), _mm256_cvtepi32_ps(ia[t]), fa[t]);
+            fb[t] = _mm256_fmadd_ps(_mm256_set1_ps(dxb * y[t][i].d), _mm256_cvtepi32_ps(ib[t]), fb[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) { resa[t] = hsum8(fa[t]); resb[t] = hsum8(fb[t]); }
+}
+
+// rows r0..r1 two at a time (the odd last one alone); and the gate and up rows of an expert side by side
+template <int TY, int NT> STRATA_ROWS_FN
+void dot_rows_pair(const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0, int r1) {
+    const block_q8_K* y[NT];
+    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
+    float a[NT], b[NT];
+    int r = r0;
+    for (; r + 1 < r1; r += 2) {
+        row_dot_pair<TY, NT>(w + (size_t) r * row_bytes, w + (size_t) (r + 1) * row_bytes, n / QK_K, y, a, b);
+        for (int t = 0; t < NT; ++t) { out[t][r] = a[t]; out[t][r + 1] = b[t]; }
+    }
+    if (r < r1) {
+        row_dot<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, a);
+        for (int t = 0; t < NT; ++t) out[t][r] = a[t];
+    }
+}
+
+template <int TY, int NT> STRATA_ROWS_FN
+void gu_rows_pair(const uint8_t* blob, size_t row_bytes, size_t up_off, int n, const void* const* act, float* const* g,
+                  float* const* u, int r0, int r1) {
+    const block_q8_K* y[NT];
+    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
+    float a[NT], b[NT];
+    for (int r = r0; r < r1; ++r) {
+        row_dot_pair<TY, NT>(blob + (size_t) r * row_bytes, blob + up_off + (size_t) r * row_bytes, n / QK_K, y, a, b);
+        for (int t = 0; t < NT; ++t) { g[t][r] = a[t]; u[t][r] = b[t]; }
+    }
+}
+
+// the pair forms for one or two tokens (the formats row_dot serves; IQ2_XS keeps its own kernel): false = not served
+template <bool G> STRATA_ROWS_FN
+bool dot_type_pair(int type, int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act,
+                   float* const* out, int r0, int r1) {
+#define STRATA_PAIR_CASE(T, TG)                                                                   \
+    case T:                                                                                       \
+        if (nt == 1) dot_rows_pair<G ? TG : T, 1>(w, row_bytes, n, act, out, r0, r1);             \
+        else dot_rows_pair<G ? TG : T, 2>(w, row_bytes, n, act, out, r0, r1);                     \
+        return true;
+    if (nt < 1 || nt > 2) return false;
+    switch (type) {
+        STRATA_PAIR_CASE(18, 118)
+        STRATA_PAIR_CASE(21, 121)
+        STRATA_PAIR_CASE(22, 122)
+        case 23:
+            if (nt == 1) dot_rows_pair<23, 1>(w, row_bytes, n, act, out, r0, r1);
+            else dot_rows_pair<23, 2>(w, row_bytes, n, act, out, r0, r1);
+            return true;
+        default: return false;
+    }
+#undef STRATA_PAIR_CASE
+}
+
+template <bool G> STRATA_ROWS_FN
+bool gu_type_pair(int type, int nt, const uint8_t* blob, size_t row_bytes, size_t up_off, int n, const void* const* act,
+                  float* const* g, float* const* u, int r0, int r1) {
+#define STRATA_PAIR_CASE(T, TG)                                                                   \
+    case T:                                                                                       \
+        if (nt == 1) gu_rows_pair<G ? TG : T, 1>(blob, row_bytes, up_off, n, act, g, u, r0, r1);  \
+        else gu_rows_pair<G ? TG : T, 2>(blob, row_bytes, up_off, n, act, g, u, r0, r1);          \
+        return true;
+    if (nt < 1 || nt > 2) return false;
+    switch (type) {
+        STRATA_PAIR_CASE(18, 118)
+        STRATA_PAIR_CASE(21, 121)
+        STRATA_PAIR_CASE(22, 122)
+        case 23:
+            if (nt == 1) gu_rows_pair<23, 1>(blob, row_bytes, up_off, n, act, g, u, r0, r1);
+            else gu_rows_pair<23, 2>(blob, row_bytes, up_off, n, act, g, u, r0, r1);
+            return true;
+        default: return false;
+    }
+#undef STRATA_PAIR_CASE
+}
+
 template <int TY, int NT> STRATA_ROWS_FN
 inline void row_dot_any(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     if constexpr (TY == 17) row_dot_iq2xs<NT>(row, nblocks, y, res);

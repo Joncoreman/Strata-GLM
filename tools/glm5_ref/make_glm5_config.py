@@ -79,6 +79,7 @@ def main() -> int:
     ram = a.ram_gib if a.ram_gib else max(16, int(total_ram_gib()) - 30)
     workers = a.workers if a.workers else max(4, physical_cores() - 4)
     env = {"STRATA_GLM5_GO": "1", "STRATA_GLM5_PREFILL": "4096", "STRATA_GLM5_PF_DIRECT": "1",
+           "STRATA_POOL_GUIDED": "1", "STRATA_POOL_ETAIL": "6",
            "STRATA_GLM5_SLOTS": "8", "STRATA_GLM5_SLOT_DIR": str(REPO / "build-engine" / "glm5-slots")}
     if a.skip:
         env.update({"STRATA_GLM5_SKIP_KEEP": "2", "STRATA_GLM5_SKIP_MINW": "0.10"})

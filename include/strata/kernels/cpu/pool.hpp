@@ -289,6 +289,15 @@ private:
     ExpertJobMulti* mjobs_ = nullptr;
     int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H)
     int mtasks_ = 1;        // equal row ranges the phase is cut into
+    // 2026-10-11, the native phases' tail (each row is computed alone, so neither changes a bit):
+    //   STRATA_POOL_GUIDED=1 - the ranges shrink toward the end (linearly), so the last claims are short;
+    //   STRATA_POOL_ETAIL=n  - on a hybrid CPU an E-core worker leaves the phase's last n tasks to the P-cores and
+    //                          the host (an E-core takes ~1.7x a P-core's time on a range).
+    bool guided_ = false;
+    int etail_ = 0;
+    int p_workers_ = 0;     // workers 0 .. p_workers_ - 1 run on P-cores (the pool pins the P-cores first)
+    int64_t task_bound(int i) const;
+    int claim_keep(uint32_t epoch, int keep);
     // glm5-next: the native path's expert width comes from the layer's NativeFmt (GLM 2048, Qwen 640); the buffer
     // holds the widest.  The Q2_0 paths (modes 1-4) stay at FF.
     static constexpr int kPoolMaxFF = 2048;

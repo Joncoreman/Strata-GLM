@@ -454,6 +454,13 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     strata::core::diag_pool_fn().store(&diag_active_pool);
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
+    guided_ = [] { const char* v = std::getenv("STRATA_POOL_GUIDED"); return v && v[0] == '1'; }();
+    etail_ = [] { const char* v = std::getenv("STRATA_POOL_ETAIL"); return v ? (std::max)(0, std::atoi(v)) : 0; }();
+    // the workers take topo_.worker_cores in order, P-cores first on a hybrid CPU (the host has the first P-core)
+    p_workers_ = topo_.is_hybrid ? (std::min)(n_, (std::max)(0, topo_.p_cores - 1)) : n_;
+    if (guided_ || etail_ > 0)
+        std::fprintf(stderr, "strata: expert pool tail: guided ranges %s, the last %d tasks of a phase for the %d "
+                             "P-core workers and the host\n", guided_ ? "on" : "off", etail_, p_workers_);
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
         const int core = pin ? (i < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1) : -1;
@@ -547,6 +554,27 @@ int ExpertPool::claim(uint32_t epoch) {
     }
 }
 
+// claim(), but none of the batch's last `keep` jobs (an E-core worker, STRATA_POOL_ETAIL)
+int ExpertPool::claim_keep(uint32_t epoch, int keep) {
+    uint64_t h = head_.load(std::memory_order_acquire);
+    for (;;) {
+        if ((uint32_t) (h >> 32) != epoch) return -1;
+        const uint32_t n = (uint32_t) (h >> 16) & 0xffffu, i = (uint32_t) h & 0xffffu;
+        if (i + (uint32_t) keep >= n) return -1;
+        if (head_.compare_exchange_weak(h, h + 1, std::memory_order_acq_rel, std::memory_order_acquire))
+            return (int) i;
+    }
+}
+
+// the first row of task i of a native phase: equal ranges, or (STRATA_POOL_GUIDED) ranges shrinking linearly
+int64_t ExpertPool::task_bound(int i) const {
+    if (!guided_ || mtasks_ <= 1) return mrows_ * (int64_t) i / mtasks_;
+    if (i >= mtasks_) return mrows_;
+    const double f = (double) (mtasks_ - i) / (double) mtasks_;
+    const int64_t b = (int64_t) ((double) mrows_ * (1.0 - f * f) + 0.5);
+    return (std::min)(mrows_, (std::max)((int64_t) 0, b));
+}
+
 uint32_t ExpertPool::begin_batch(int n) {
     if (n < 0 || n > 0xffff) {
         std::fprintf(stderr, "strata: expert pool batch of %d jobs is out of range\n", n);
@@ -607,8 +635,10 @@ void ExpertPool::wait_done(int n) {
 
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     (void) id;
+    // STRATA_POOL_ETAIL: an E-core worker leaves the native phases' last tasks to the P-cores and the host
+    const bool keep_tail = etail_ > 0 && id >= p_workers_ && p_workers_ > 0 && mode_ >= 5;
     for (;;) {
-        const int ci = claim(epoch);
+        const int ci = keep_tail ? claim_keep(epoch, etail_) : claim(epoch);
         if (ci < 0) break;
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
@@ -628,7 +658,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows; the widths are the layer's (glm5-next:
             // 2048 / 4096, Qwen: 640 / 2560)
             const int per = mode_ == 5 ? (int) nfmt_->n_ff : (int) nfmt_->n_embd;
-            const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
+            const int64_t g0 = task_bound((int) i), g1 = task_bound((int) i + 1);
             for (int64_t r = g0; r < g1;) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));

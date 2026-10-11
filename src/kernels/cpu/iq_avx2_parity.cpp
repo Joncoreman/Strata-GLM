@@ -495,8 +495,139 @@ int bench(const std::vector<std::string>& pairs, const std::vector<int>& nts, in
 
 }  // namespace
 
+#if !defined(STRATA_IQ_PARITY_DISPATCH_ONLY)
+// 2026-10-11 --pair: GLM-5.3-Flash UD-IQ4_XS geometry (n_embd 4096, expert width 2048; IQ3_S gate/up, IQ4_XS down).
+// (1) iq256_gu_pair_v / iq256_rows_pair_v against two iq256_rows_v calls, every variant, 1 and 2 tokens: bit for bit;
+// (2) ms per expert on this thread over --mb MB of experts (DRAM, not L3): the row-by-row form against the pair form.
+int pair_check(int mb, int reps) {
+    const int H = 4096, FF = 2048, gu_t = 21, d_t = 23;
+    const int QKK = 256;   // ggml's QK_K
+    const size_t q8k = ggml_type_size(GGML_TYPE_Q8_K);
+    const size_t gu_row = (size_t) (H / QKK) * ggml_type_size((ggml_type) gu_t);
+    const size_t d_row = (size_t) (FF / QKK) * ggml_type_size((ggml_type) d_t);
+    const size_t up_off = gu_row * FF, down_off = 2 * up_off, ex = down_off + d_row * H;
+    uint64_t seed = 0x9a1e0001ull;
+    std::vector<std::vector<uint8_t>> qx(2, std::vector<uint8_t>(q8k * (H / QKK))),
+                                      qh(2, std::vector<uint8_t>(q8k * (FF / QKK)));
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> x(H), h(FF);
+    const void* ax[2];
+    const void* ah[2];
+    for (int t = 0; t < 2; ++t) {
+        for (auto& v : x) v = nd(rng);
+        for (auto& v : h) v = 0.05f * nd(rng);
+        cpu::q8k_quant_avx2(x.data(), qx[(size_t) t].data(), H);
+        cpu::q8k_quant_avx2(h.data(), qh[(size_t) t].data(), FF);
+        ax[t] = qx[(size_t) t].data();
+        ah[t] = qh[(size_t) t].data();
+    }
+    std::vector<uint8_t> one(ex);
+    fill_blocks(one.data(), down_off, gu_t, seed);
+    fill_blocks(one.data() + down_off, ex - down_off, d_t, seed);
+    int bad = 0;
+    std::vector<float> g0(2 * FF), u0(2 * FF), g1(2 * FF), u1(2 * FF), d0(2 * H), d1(2 * H);
+    for (int v : subsets(cpu::iq256_variants()))
+        for (int nt = 1; nt <= 2; ++nt) {
+            float* pg0[2] = {g0.data(), g0.data() + FF}; float* pu0[2] = {u0.data(), u0.data() + FF};
+            float* pg1[2] = {g1.data(), g1.data() + FF}; float* pu1[2] = {u1.data(), u1.data() + FF};
+            float* pd0[2] = {d0.data(), d0.data() + H};  float* pd1[2] = {d1.data(), d1.data() + H};
+            cpu::iq256_rows_v(v, gu_t, one.data(), gu_row, H, ax, nt, pg0, 0, FF);
+            cpu::iq256_rows_v(v, gu_t, one.data() + up_off, gu_row, H, ax, nt, pu0, 0, FF);
+            const bool okg = cpu::iq256_gu_pair_v(v, gu_t, one.data(), gu_row, up_off, H, ax, nt, pg1, pu1, 0, FF);
+            cpu::iq256_rows_v(v, d_t, one.data() + down_off, d_row, FF, ah, nt, pd0, 0, H);
+            const bool okd = cpu::iq256_rows_pair_v(v, d_t, one.data() + down_off, d_row, FF, ah, nt, pd1, 0, H);
+            const size_t ng = (size_t) nt * FF, nd_ = (size_t) nt * H;
+            const bool same = okg && okd && !std::memcmp(g0.data(), g1.data(), ng * 4) &&
+                              !std::memcmp(u0.data(), u1.data(), ng * 4) && !std::memcmp(d0.data(), d1.data(), nd_ * 4);
+            std::printf("  pair %-12s %d token%s: %s\n", variant_name(v).c_str(), nt, nt == 1 ? " " : "s",
+                        same ? "bit for bit" : "DIFFERENT");
+            bad += !same;
+        }
+    const size_t n_ex = std::max<size_t>(2, ((size_t) mb << 20) / ex);
+    std::vector<uint8_t> big(n_ex * ex);
+    for (size_t e = 0; e < n_ex; ++e) std::memcpy(big.data() + e * ex, one.data(), ex);   // DRAM-sized, the same bits
+    const int v = cpu::iq256_variant();
+    for (int nt = 1; nt <= 2; ++nt) {
+        float* pg[2] = {g0.data(), g0.data() + FF}; float* pu[2] = {u0.data(), u0.data() + FF};
+        float* pd[2] = {d0.data(), d0.data() + H};
+        std::vector<double> rg, rd, pgm, pdm, ggm, gdm;
+        const ggml_vec_dot_t gdot = traits_cpu(gu_t)->vec_dot, ddot = traits_cpu(d_t)->vec_dot;
+        for (int rep = 0; rep < reps; ++rep) {
+            {   // ggml-cpu's per-token dot (the engine's path below glm_from)
+                const auto t0 = Clock::now();
+                for (size_t e = 0; e < n_ex; ++e) {
+                    const uint8_t* b = big.data() + e * ex;
+                    for (int r = 0; r < FF; ++r)
+                        for (int t = 0; t < nt; ++t) {
+                            gdot(H, &pg[t][r], 0, b + (size_t) r * gu_row, 0, ax[t], 0, 1);
+                            gdot(H, &pu[t][r], 0, b + up_off + (size_t) r * gu_row, 0, ax[t], 0, 1);
+                        }
+                }
+                const auto t1 = Clock::now();
+                for (size_t e = 0; e < n_ex; ++e) {
+                    const uint8_t* b = big.data() + e * ex + down_off;
+                    for (int r = 0; r < H; ++r)
+                        for (int t = 0; t < nt; ++t) ddot(FF, &pd[t][r], 0, b + (size_t) r * d_row, 0, ah[t], 0, 1);
+                }
+                const auto t2 = Clock::now();
+                ggm.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count() / (double) n_ex);
+                gdm.push_back(std::chrono::duration<double, std::milli>(t2 - t1).count() / (double) n_ex);
+            }
+            for (int form = 0; form < 2; ++form) {
+                const auto t0 = Clock::now();
+                for (size_t e = 0; e < n_ex; ++e) {
+                    const uint8_t* b = big.data() + e * ex;
+                    if (form == 0) {
+                        cpu::iq256_rows_v(v, gu_t, b, gu_row, H, ax, nt, pg, 0, FF);
+                        cpu::iq256_rows_v(v, gu_t, b + up_off, gu_row, H, ax, nt, pu, 0, FF);
+                    } else cpu::iq256_gu_pair_v(v, gu_t, b, gu_row, up_off, H, ax, nt, pg, pu, 0, FF);
+                }
+                const auto t1 = Clock::now();
+                for (size_t e = 0; e < n_ex; ++e) {
+                    const uint8_t* b = big.data() + e * ex + down_off;
+                    if (form == 0) cpu::iq256_rows_v(v, d_t, b, d_row, FF, ah, nt, pd, 0, H);
+                    else cpu::iq256_rows_pair_v(v, d_t, b, d_row, FF, ah, nt, pd, 0, H);
+                }
+                const auto t2 = Clock::now();
+                const double gms = std::chrono::duration<double, std::milli>(t1 - t0).count() / (double) n_ex;
+                const double dms = std::chrono::duration<double, std::milli>(t2 - t1).count() / (double) n_ex;
+                (form == 0 ? rg : pgm).push_back(gms);
+                (form == 0 ? rd : pdm).push_back(dms);
+            }
+        }
+        auto med = [](std::vector<double> a) { std::sort(a.begin(), a.end()); return a[a.size() / 2]; };
+        const double gb = (double) ex / 1e6;
+        std::printf("  %d token%s, %s, %zu experts of %.2f MB: ms per expert gate/up + down = total (GB/s)\n", nt,
+                    nt == 1 ? "" : "s", variant_name(v).c_str(), n_ex, gb);
+        std::printf("    ggml  %.3f + %.3f = %.3f  (%.1f)\n", med(ggm), med(gdm), med(ggm) + med(gdm), gb / (med(ggm) + med(gdm)));
+        std::printf("    rows  %.3f + %.3f = %.3f  (%.1f)\n", med(rg), med(rd), med(rg) + med(rd), gb / (med(rg) + med(rd)));
+        std::printf("    pair  %.3f + %.3f = %.3f  (%.1f)\n", med(pgm), med(pdm), med(pgm) + med(pdm),
+                    gb / (med(pgm) + med(pdm)));
+    }
+    return bad;
+}
+#endif
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
+#if !defined(STRATA_IQ_PARITY_DISPATCH_ONLY)
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--pair") {
+            int pin = -1, mb = 256, reps = 5;
+            for (int k = 1; k + 1 < argc; ++k) {
+                if (std::string(argv[k]) == "--cpu") pin = std::atoi(argv[k + 1]);
+                if (std::string(argv[k]) == "--mb") mb = std::atoi(argv[k + 1]);
+                if (std::string(argv[k]) == "--reps") reps = std::max(1, std::atoi(argv[k + 1]));
+            }
+            if (pin >= 0 && !pin_to(pin)) std::printf("iq_avx2_parity: could not pin to CPU %d\n", pin);
+            ggml_cpu_init();
+            std::printf("iq_avx2_parity --pair: CPU %d, core type %02Xh\n", pin, core_type());
+            const int bad = pair_check(mb, reps);
+            std::printf("%s\n", bad ? "PAIR FAILED" : "PAIR OK");
+            return bad ? 1 : 0;
+        }
+#endif
     bool do_bench = false, dispatch_only = !kVariants;
     int pin = -1, mb = 256, reps = 5;
     std::vector<int> nts = {1, 2, 3, 4};

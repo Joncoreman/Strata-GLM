@@ -33,6 +33,18 @@ void iq256_gu_rows_v(int variant, int ggml_type, const uint8_t* blob, size_t gu_
 void iq256_rows_v(int variant, int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act,
                   int nt, float* const* out, int r0, int r1);
 
+/// 2026-10-11: iq256_rows two rows per loop, and an expert's gate and up rows side by side (g / u written
+/// separately), for one or two tokens - the same bits as iq256_rows.  False: not served (another format or nt > 2),
+/// nothing written.
+bool iq256_rows_pair(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                     float* const* out, int r0, int r1);
+bool iq256_gu_pair(int ggml_type, const uint8_t* blob, size_t row_bytes, size_t up_off, int n, const void* const* act,
+                   int nt, float* const* g, float* const* u, int r0, int r1);
+bool iq256_rows_pair_v(int variant, int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act,
+                       int nt, float* const* out, int r0, int r1);
+bool iq256_gu_pair_v(int variant, int ggml_type, const uint8_t* blob, size_t row_bytes, size_t up_off, int n,
+                     const void* const* act, int nt, float* const* g, float* const* u, int r0, int r1);
+
 /// ggml's quantize_row_q8_K (x86 runs the scalar reference), byte-identical, in AVX-2: n values -> n/256 block_q8_K.
 void q8k_quant_avx2(const float* x, void* y, int64_t n);
 
