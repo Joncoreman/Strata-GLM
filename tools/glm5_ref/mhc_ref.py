@@ -12,6 +12,7 @@ Formulas: llama.cpp b11461 src/models/glm5-next.cpp:445-538 and ggml-cuda/dsv4-h
 Run: python mhc_ref.py [dump.txt]  → prints the max difference vs the dump for layer 0.
 """
 import glob
+import os
 import sys
 
 import numpy as np
@@ -78,7 +79,9 @@ def hc_post(out, res, post, comb):
 
 
 def main():
-    dump_path = sys.argv[1] if len(sys.argv) > 1 else sorted(glob.glob(r"D:\AI\LLM\llamacpp-glm5\runs\dump_iq4xs_2026-??-??_??????.txt"))[-1]
+    runs = os.path.join(os.environ.get("LLAMA_CPP_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))), "llamacpp-glm5")), "runs")   # llama.cpp's dumps (gguf_load.py)
+    dump_path = sys.argv[1] if len(sys.argv) > 1 else sorted(glob.glob(os.path.join(runs, "dump_iq4xs_2026-??-??_??????.txt")))[-1]
     d = dumpparse.parse(dump_path)
     m = Model()
     eps_meta = float(m.field("glm5-next.attention.layer_norm_rms_epsilon")[0])

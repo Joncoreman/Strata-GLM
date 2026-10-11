@@ -2,9 +2,10 @@ import json
 import sys
 import time
 import urllib.request
+from pathlib import Path
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
-doc = open(r"D:\AI\LLM\strata-glm-gpu\docs\MODELS.md", encoding="utf-8").read()[:4200]
+doc = (Path(__file__).resolve().parents[2] / "docs" / "MODELS.md").read_text(encoding="utf-8")[:4200]
 cases = [
     ("chat", "Explain how a transformer language model generates text, step by step, for a high school student. "
              "Then write a short haiku about autumn in Japanese.", 400),

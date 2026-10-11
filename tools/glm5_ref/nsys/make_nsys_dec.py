@@ -1,15 +1,17 @@
-# Writes D:\AI\LLM\strata-glm-v041\build-engine\nsys\run_nsys_dec.bat: a short chat prompt, 64 tokens of decode under
-# Nsight Systems (CUDA trace, graph nodes), the DraftPad settings of 2026-10-10 (skip on, 20 workers).
+# Writes build-engine\nsys\run_nsys_dec.bat: a short chat prompt, 64 tokens of decode under
+# Nsight Systems (CUDA trace, graph nodes), the settings of 2026-10-10 (skip on, 20 workers).
 import subprocess, sys
 from pathlib import Path
 
-WT = Path(r"D:\AI\LLM\strata-glm-v041")
+WT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(WT / "tools" / "glm5_ref"))
+import _glm5_paths as P  # noqa: E402
 msg = "Explain in three short paragraphs why the sky is blue and why sunsets are red."
 ids = subprocess.run([sys.executable, str(WT / "tools" / "glm5_ref" / "tok_chat.py"), msg], capture_output=True,
                      text=True, check=True).stdout.strip()
 print("prompt tokens", ids.count(",") + 1)
-PACK = r"D:\AI\LLM\Strata-data\packs\glm53_iq4xs"
-NATIVE = r"D:\AI\LLM\GLM-5.3-Flash-GGUF\unsloth\GLM-5.3-Flash-GGUF\UD-IQ4_XS\GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"
+PACK = str(P.pack_dir())
+NATIVE = str(P.native_gguf())
 args = (f"--tokens {ids} --max-new 64 --pack {PACK} --native {NATIVE} --prefill auto --spec 6 --max-context 262144 "
         f"--pcie-frac 0 --mmap-experts --resident-budget-gib 98 --expert-profile {PACK}\\expert-profile-learned-2026-10-08b.bin "
         f"--expert-cache 0 --adapt-every 1 --adapt-swaps 64 --pool-workers 20 --vram-reserve-mib 3400")

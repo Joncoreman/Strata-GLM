@@ -11,6 +11,7 @@ File (little endian): int32 T, n, iters; float32 rms_eps, hc_eps; R[T*4*n]; then
   expected mixes[T*24] pre[T*4] post[T*4] comb[T*16] y[T*n] R'[T*4*n] exit_mean_of_R'[T*n]
 """
 import glob
+import os
 import struct
 import sys
 
@@ -18,7 +19,7 @@ import numpy as np
 
 import dumpparse
 import mhc_ref as R
-from gguf_load import Model
+from gguf_load import LLAMA_CPP, Model
 
 f32 = lambda a: np.ascontiguousarray(a, dtype=np.float32).tobytes()
 
@@ -53,7 +54,7 @@ def main(out_path):
     zeros_o, zeros_p, zeros_c = np.zeros((T, n)), np.zeros((T, 4)), np.zeros((T, 4, 4))
     a, yA, postA, combA = one(m, x, "attn", 0, False, zeros_o, zeros_p, zeros_c, hc_eps, iters)
 
-    dump = sorted(glob.glob(r"D:\AI\LLM\llamacpp-glm5\runs\dump_iq4xs_2026-??-??_??????.txt"))[-1]
+    dump = sorted(glob.glob(os.path.join(LLAMA_CPP, "runs", "dump_iq4xs_2026-??-??_??????.txt")))[-1]
     d = dumpparse.parse(dump)
     w, s, ds = dumpparse.compare(d["attn_norm-0"][0], yA)
     print(f"case A y vs llama.cpp attn_norm-0: max|diff| {w:.2e}  sum {s:.6f} vs {ds:.6f} (dump prints 4 decimals)")

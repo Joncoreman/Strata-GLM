@@ -7,12 +7,20 @@ import glob
 import os
 import sys
 
-sys.path.insert(0, r"D:\AI\LLM\llamacpp-glm5\gguf-py")
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# a llama.cpp checkout that knows glm5-next (b11461 or newer): LLAMA_CPP_DIR, else llamacpp-glm5 beside this repository
+LLAMA_CPP = os.environ.get("LLAMA_CPP_DIR", os.path.join(os.path.dirname(_REPO), "llamacpp-glm5"))
+sys.path.insert(0, os.path.join(LLAMA_CPP, "gguf-py"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np                      # noqa: E402
 from gguf import GGUFReader             # noqa: E402
 from gguf.quants import dequantize      # noqa: E402
 
-DEFAULT = r"D:\AI\LLM\GLM-5.3-Flash-GGUF\unsloth\GLM-5.3-Flash-GGUF\UD-IQ4_XS\GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"
+try:   # shard 1 of the GGUF: NATIVE, else strata-glm5.json's --native
+    import _glm5_paths                  # noqa: E402
+    DEFAULT = str(_glm5_paths.native_gguf())
+except Exception:
+    DEFAULT = os.environ.get("NATIVE", "")
 
 
 class Model:
