@@ -7,6 +7,8 @@ RTX 5090 + 128 GB RAM + NVMe: **28.7-30.1 tokens/s** on a short chat, **580 toke
 
 **English** · [日本語](README.ja.md)
 
+> **Unofficial fork, not affiliated with or endorsed by the Strata authors.**
+
 This is a fork of [Strata](https://github.com/Niko1221/Strata) (v0.1.41, MIT) that runs **GLM-5.3-Flash**
 (320 billion parameters, 18 billion active, unsloth's **UD-IQ4_XS** GGUF, 157 GB) on **one** PC with a single
 consumer GPU, the system RAM and an NVMe drive. Strata itself runs Qwen3.8-Flash-Next; everything GLM-specific

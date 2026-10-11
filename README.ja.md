@@ -7,6 +7,8 @@ RTX 5090＋RAM 128GB＋NVMe で、短い会話の生成 **28.7〜30.1 tok/s**、
 
 [English](README.md) · **日本語**
 
+> **非公式の改造版です。元の Strata の作者とは関係がなく、公認も受けていません。**
+
 [Strata](https://github.com/Niko1221/Strata)（v0.1.41・MIT）のフォークです。**GLM-5.3-Flash**（3,200億パラメータ・
 活性 180億・unsloth の **UD-IQ4_XS** GGUF・157GB）を、GPU 1枚＋システム RAM＋NVMe の **PC 1台**で動かします。
 Strata 本体は Qwen3.8-Flash-Next 用で、GLM 対応はこのフォークで 2026年10月に追加したものです。Strata 本体の説明＝[README-Strata.ja.md](README-Strata.ja.md)。
