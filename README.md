@@ -37,6 +37,27 @@ and the same day: prompts at 3-33 tokens/s (86-token prompt 28 s, 4,400 tokens 1
 The "writes" numbers above use **expert skipping** (below), which changes about one token in a hundred on long
 reasoning. With it off the short-chat answer is **20 tokens/s**; the prompt speeds do not depend on it.
 
+### Update 2026-10-13
+
+- **Fix: answers that were sometimes nothing but "!!!!" (please update).** A user reported that answers broke at
+  random and came out right with `STRATA_GLM5_PF_MMQ=0` - thank you. The development PC had shown the same thing on
+  2026-10-10 (3 answers in 16 were a run of "!"), left uninvestigated until now.
+  - **Cause.** The prompt path sent two small matrices of the KDA layers (`ssm_f_b` and `ssm_g_b`, 128 inputs a row)
+    through MMQ (llama.cpp's int8 tensor-core kernels). MMQ reads the weights 256 values at a time, so on a matrix's
+    last row it reads **past the matrix**, into VRAM nothing initialized. The activations it meets there are zero, so
+    this is usually harmless - but where those bytes happen to form an f16 Inf or NaN scale, the whole answer turns
+    into NaN and token 0 ("!") repeats. What lies past the matrix differs from run to run and from PC to PC, hence
+    the randomness.
+  - **Fix.** MMQ only when the row length is a multiple of 256; otherwise the cuBLAS path as before (the same rule as
+    Strata's own `Gemm::native_mmq`).
+  - **Checked** (RTX 5090, the example settings, the same 4 prompts): those matrices computed by MMQ from a copy
+    whose tail is 0xFF answered "!!!!" to all 4; a 0x00 or 0x3C tail answered all 4 correctly, and so did the fix.
+    The prompt time is unchanged (4,829 tokens: 11.6 s before, 11.1-12.1 s after).
+  - **`STRATA_GLM5_PF_MMQ=0` is no longer needed** (it also takes the routed experts off MMQ, which slows the prompt).
+  - **Open.** The report's other symptom - the prompt read so that the model answers a different question - did not
+    reproduce through this hole (a tail of finite values left the answers correct). If you can reproduce it, please
+    open an issue with the prompt.
+
 ### Update 2026-10-11
 
 - **Tokenizer fix (please update).** The pack's tokenizer split numbers one digit at a time (Qwen3.5's rule);

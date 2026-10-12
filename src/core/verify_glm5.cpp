@@ -1627,7 +1627,13 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     auto gemm_q8 = [&](const WeightRef* w, int64_t in, int64_t out, const float* X, int64_t rows, float* Y) -> bool {
         if (w->native_type != 8 || in % 32 != 0) { err = "verify glm5 prefill: a KDA projection is not Q8_0"; return false; }
         const size_t xqb = (mmq::q8_bytes(rows, in) + 255) & ~(size_t) 255;
-        if (mq && xqb + (size_t) (rows + 2) * 4 <= (size_t) WSCR * 4 && mmq::fits(8, out)) {
+        // 2026-10-13: MMQ only for in % 256 == 0.  MMQ loads the weights 256 values at a time, so a 128-value row (the
+        // KDA ssm_f_b / ssm_g_b) reads past its matrix's last row; those bytes times the zero-padded activations are
+        // zero unless a stray f16 scale is Inf/NaN, and then the whole answer turns into "!!!!" - at random, as the
+        // memory past the tensor differs run to run (seen here 2026-10-10 and by a user, fixed by turning MMQ off).
+        // The same rule as Gemm::native_mmq (src/prefill/gemm.cu).  Measured: the 128-wide matrices run from copies
+        // whose tail is 0xFF answered "!!!!" to all 4 test prompts; a 0x00 or 0x3C tail, and this rule, answered all 4.
+        if (mq && in % 256 == 0 && xqb + (size_t) (rows + 2) * 4 <= (size_t) WSCR * 4 && mmq::fits(8, out)) {
             uint8_t* xq = (uint8_t*) wscr;
             int32_t* bnd = (int32_t*) (xq + xqb);
             int32_t* ids = bnd + 2;
