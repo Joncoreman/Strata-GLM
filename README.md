@@ -54,9 +54,24 @@ reasoning. With it off the short-chat answer is **20 tokens/s**; the prompt spee
     whose tail is 0xFF answered "!!!!" to all 4; a 0x00 or 0x3C tail answered all 4 correctly, and so did the fix.
     The prompt time is unchanged (4,829 tokens: 11.6 s before, 11.1-12.1 s after).
   - **`STRATA_GLM5_PF_MMQ=0` is no longer needed** (it also takes the routed experts off MMQ, which slows the prompt).
-  - **Open.** The report's other symptom - the prompt read so that the model answers a different question - did not
-    reproduce through this hole (a tail of finite values left the answers correct). If you can reproduce it, please
-    open an issue with the prompt.
+- **Second fix (evening): saved prompt states are tied to the build (please update, and empty the slot folder
+  once).** The same user then reported that the "!!!!" answers were gone but the model still sometimes misread the
+  question - thank you again.
+  - **The likely cause.** With `STRATA_GLM5_SLOT_DIR` set (it is in the example settings: `build-engine\glm5-slots`), the server keeps a
+    prompt's state in files and reads them back after a restart. Those files were matched by model, pack and format,
+    **but not by build**: a state written by a build with the over-read above was read by the fixed build, wrong
+    numbers and all. Now a slot file of another build is not read, and the start says how many such files are left
+    (`... not read (safe to delete)`). We could not reproduce the misreading itself here, so this is the most likely
+    cause, not a proven one.
+  - **Also fixed.** When a prompt failed with "do not fit" or "page-locked", part of it was already in the state, but
+    the server still thought it held the previous conversation; the next request could go on from that. It now starts
+    that request over.
+  - **Checked** (RTX 5090, one slot folder): the old build wrote a 4,828-token slot; the new build said
+    "1 slot file(s) ... not read" and read the prompt again; a second start of the new build read its own slot
+    (4,828 tokens in 135 ms). All 12 answers correct.
+  - **Not the cause** (measured): CUDA 13.2 vs 12.8 and MMQ on vs off change the next-token probabilities no more
+    than running the same settings twice does (mean KL 0.018-0.028 vs 0.014-0.017).
+  - If the misreading still happens after this, please open an issue with the prompt.
 
 ### Update 2026-10-11
 

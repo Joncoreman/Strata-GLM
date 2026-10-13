@@ -12605,9 +12605,12 @@ int main(int argc, char** argv) {
             // on only where a folder is named: a benchmark or a test run never reads an earlier run's state by accident
             const std::string slot_dir = [] { const char* v = std::getenv("STRATA_GLM5_SLOT_DIR"); return std::string(v ? v : ""); }();
             const bool slots_on = slot_max > 0 && !slot_dir.empty() && gl_chain.empty();
-            const uint64_t slot_fp = [&] {   // the model, the pack and the latent format: a slot of another is never read
+            // the model, the pack, the latent format and the build: a slot of another is never read.  2026-10-13: the
+            // build too - a slot written by an engine with a prompt-path bug (the MMQ over-read fixed that day) would
+            // otherwise be read by the fixed one, its wrong state and all
+            const uint64_t slot_fp = [&] {
                 uint64_t hsh = 1469598103934665603ull;
-                const std::string id = "glm5-slot-2|" + o.native_preset + "|" + o.pack + "|" +
+                const std::string id = "glm5-slot-3|" __DATE__ " " __TIME__ "|" + o.native_preset + "|" + o.pack + "|" +
                                        (std::getenv("STRATA_GLM5_KV") ? std::getenv("STRATA_GLM5_KV") : "q4") + "|" +
                                        std::to_string(g.n_layers) + "|" + std::to_string(g.n_embd);
                 for (unsigned char c : id) { hsh ^= c; hsh *= 1099511628211ull; }
@@ -12616,15 +12619,20 @@ int main(int argc, char** argv) {
             if (slots_on) {
                 std::error_code ec;
                 std::filesystem::create_directories(slot_dir, ec);
+                int foreign = 0;
                 for (const auto& e : std::filesystem::directory_iterator(slot_dir, ec)) {
                     if (e.path().extension() != ".slot") continue;
                     Slot sl;
                     sl.path = e.path().string();
                     sl.prelude = e.path().filename().string().rfind("p_", 0) == 0;
                     if (strata::core::Verifier::glm5_slot_peek(sl.path, slot_fp, sl.toks)) slots.push_back(std::move(sl));
+                    else ++foreign;
                 }
                 std::fprintf(stderr, "strata serve: slots on disk: %zu in %s (up to %d; prompts of %lld tokens or more)\n",
                              slots.size(), slot_dir.c_str(), slot_max, (long long) slot_min);
+                if (foreign > 0)
+                    std::fprintf(stderr, "strata serve: %d slot file(s) there are from another model, pack or build and are "
+                                         "not read (safe to delete)\n", foreign);
             }
             const int32_t user_tok = 154827;   // <|user|>: where GLM-5.3's system part ends
             auto slot_save = [&](const std::vector<int32_t>& toks, bool prelude) {
@@ -13311,6 +13319,7 @@ int main(int argc, char** argv) {
                             std::fflush(stdout);
                             if (err.find("do not fit") == std::string::npos && err.find("page-locked") == std::string::npos) return 1;
                             err.clear();
+                            live.clear();   // the state holds part of this prompt now: the next request does not go on from it
                             continue;
                         }
                         if (!ver.wait_commit(err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
@@ -13323,6 +13332,7 @@ int main(int argc, char** argv) {
                         std::fflush(stdout);
                         if (err.find("do not fit") == std::string::npos && err.find("page-locked") == std::string::npos) return 1;
                         err.clear();
+                        live.clear();   // as above
                         continue;
                     }
                 } else {
